@@ -794,6 +794,8 @@ class Scheduler(
             enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
+            attn_cp_rank=self.attn_cp_rank,
+            attn_cp_size=self.attn_cp_size,
             chunked_prefill_size=effective_chunked_prefill_size,
             sliding_window_size=self.sliding_window_size,
         )
