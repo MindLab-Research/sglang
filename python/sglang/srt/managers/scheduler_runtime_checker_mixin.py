@@ -17,6 +17,7 @@ from sglang.srt.utils.watchdog import WatchdogRaw
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.observability.metrics_collector import SchedulerStats
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +104,17 @@ class PoolStats:
                 f"#token: {self.full_num_used}, token usage: {self.full_token_usage:.2f}"
             )
         return parts
+
+    def update_scheduler_stats(self, stats: SchedulerStats) -> None:
+        """Update pool-related fields on SchedulerStats."""
+        num_used, _ = self.get_kv_token_stats()
+        stats.num_used_tokens = num_used
+        stats.token_usage = round(self.get_max_pool_usage(), 2)
+        stats.full_token_usage = self.full_token_usage
+        if self.is_hybrid_swa:
+            stats.swa_token_usage = self.swa_token_usage
+        if self.is_hybrid_ssm:
+            stats.mamba_usage = self.mamba_usage
 
 
 class SchedulerRuntimeCheckerMixin:
@@ -405,15 +417,12 @@ class SchedulerRuntimeCheckerMixin:
             and time.perf_counter() > self.metrics_collector.last_log_time + 30
         ):
             # During idle time, also collect metrics every 30 seconds.
-            pool_stats = self.get_pool_stats()
-            num_used, _ = pool_stats.get_kv_token_stats()
+            self.get_pool_stats().update_scheduler_stats(self.stats)
 
             priority_enabled = self.enable_priority_scheduling
             self.stats.num_running_reqs = QueueCount.from_reqs(
                 self.running_batch.reqs, priority_enabled
             )
-            self.stats.num_used_tokens = num_used
-            self.stats.token_usage = round(pool_stats.get_max_pool_usage(), 2)
             self.stats.gen_throughput = 0
             self.stats.num_queue_reqs = QueueCount.from_reqs(
                 self.waiting_queue, priority_enabled
