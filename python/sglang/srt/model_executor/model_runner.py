@@ -362,7 +362,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.dflash_draft_num_layers = None
         if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
             # load draft config
-            draft_model_config = ModelConfig.from_server_args(
+            draft_model_config = self._build_model_config(
                 server_args,
                 model_path=(server_args.speculative_draft_model_path),
                 model_revision=server_args.speculative_draft_model_revision,
@@ -391,7 +391,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
             # Select target layers to capture for building DFlash context features.
-            draft_model_config = ModelConfig.from_server_args(
+            draft_model_config = self._build_model_config(
                 server_args,
                 model_path=(server_args.speculative_draft_model_path),
                 model_revision=server_args.speculative_draft_model_revision,
@@ -496,6 +496,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # For weight updates
         self._model_update_group = {}
         self._weights_send_group = {}
+
+    def _build_model_config(
+        self, server_args, model_path=None, model_revision=None, is_draft_model=False
+    ):
+        return ModelConfig.from_server_args(
+            server_args,
+            model_path=model_path,
+            model_revision=model_revision,
+            is_draft_model=is_draft_model,
+        )
 
     def init_mindspore_runner(self):
         # Init the mindspore runner
