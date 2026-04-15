@@ -299,6 +299,7 @@ class SessionAwareCache(BasePrefixCache):
         self._free_kv_aligned(req.req_pool_idx, target, req.kv_allocated_len)
         req.kv_allocated_len = min(req.kv_allocated_len, target)
         req.kv_committed_len = min(req.kv_committed_len, target)
+        req.swa_evicted_seqlen = min(req.swa_evicted_seqlen, target)
         req.output_ids = req.output_ids[:finished_len]
 
     def _free_kv_aligned(self, pool_idx: int, target: int, end: int):
