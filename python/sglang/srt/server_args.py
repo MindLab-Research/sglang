@@ -3494,18 +3494,15 @@ class ServerArgs:
                 )
 
         if self.speculative_adaptive:
-            if self.speculative_algorithm not in ("EAGLE", "EAGLE3"):
+            from sglang.srt.speculative.adaptive_spec_params import (
+                adaptive_unsupported_reason,
+            )
+
+            reason = adaptive_unsupported_reason(self)
+            if reason is not None:
                 logger.warning(
-                    "speculative_adaptive is only supported with EAGLE/EAGLE3 and topk=1. "
-                    f"Current algorithm={self.speculative_algorithm}. "
-                    "Falling back to static params."
-                )
-                self.speculative_adaptive = False
-            elif self.speculative_eagle_topk != 1:
-                logger.warning(
-                    "speculative_adaptive is only supported with topk=1. "
-                    f"Current topk={self.speculative_eagle_topk}. "
-                    "Falling back to static params."
+                    f"speculative_adaptive disabled: {reason}. "
+                    "Falling back to static speculative params."
                 )
                 self.speculative_adaptive = False
 
