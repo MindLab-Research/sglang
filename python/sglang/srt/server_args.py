@@ -410,7 +410,7 @@ class ServerArgs:
     crash_dump_folder: Optional[str] = None
     show_time_cost: bool = False
     enable_metrics: bool = False
-    metrics_http_port: Optional[int] = None
+    grpc_http_sidecar_port: Optional[int] = None
     enable_mfu_metrics: bool = False
     enable_metrics_for_all_schedulers: bool = False
     tokenizer_metrics_custom_labels_header: str = "x-custom-labels"
@@ -4717,12 +4717,12 @@ class ServerArgs:
             help="Enable log prometheus metrics.",
         )
         parser.add_argument(
-            "--metrics-http-port",
+            "--grpc-http-sidecar-port",
             type=int,
-            default=ServerArgs.metrics_http_port,
-            help="Port for the Prometheus metrics HTTP server. "
-            "Only used in gRPC mode (--grpc-mode); in HTTP mode, metrics are served on the main --port. "
-            "Defaults to --port + 1 when --enable-metrics is set.",
+            default=ServerArgs.grpc_http_sidecar_port,
+            help="Port for the HTTP sidecar server in gRPC mode (--grpc-mode). "
+            "Serves Prometheus metrics and profiling endpoints. "
+            "Defaults to --port + 1. Not used in HTTP mode.",
         )
         parser.add_argument(
             "--enable-mfu-metrics",
