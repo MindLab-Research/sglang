@@ -43,6 +43,7 @@ from sglang.srt.utils.common import (
     get_device_sm,
     get_nvidia_driver_version,
     get_quantization_config,
+    has_fp8_weights_in_checkpoint,
     human_readable_int,
     is_blackwell_supported,
     is_cpu,
@@ -1772,14 +1773,23 @@ class ServerArgs:
                     self.quantization is None
                     and not self._quantization_explicitly_unset
                 ):
-                    # Default DeepSeek V3/R1 native FP8 when not explicitly set,
-                    # Because we need this condition for an assertion in
-                    # flashinfer_trtllm MoE runner backend.
+                    # DeepSeek V3/R1 uses native FP8 MoE experts without
+                    # declaring it in quantization_config.  However, other
+                    # models that share the same architecture class (e.g.
+                    # Moonlight-16B-A3B) are purely BF16.  Check the actual
+                    # safetensors header instead of assuming FP8 by arch name.
                     if quant_method is None and model_arch in ["DeepseekV3ForCausalLM"]:
-                        self.quantization = "fp8"
-                        logger.info(
-                            "Quantization not specified, default to fp8 for DeepSeek on sm100"
-                        )
+                        if has_fp8_weights_in_checkpoint(self.model_path):
+                            self.quantization = "fp8"
+                            logger.info(
+                                "Detected FP8 expert weights in checkpoint, "
+                                "default to fp8 for DeepSeek on sm100"
+                            )
+                        else:
+                            logger.info(
+                                "No FP8 expert weights found in checkpoint, "
+                                "keeping bf16 for DeepSeek-arch model on sm100"
+                            )
                     else:
                         self.quantization = quant_method
                 if (
