@@ -42,11 +42,11 @@ export const DeepSeekV4Deployment = () => {
       name: "recipe",
       title: "Recipe",
       items: [
-        { id: "low-latency",    label: "Low-Latency",      default: true,  subtitle: "MTP 3/4" },
-        { id: "balanced",       label: "Balanced",         default: false, subtitle: "MTP 1/2 + DeepEP" },
-        { id: "max-throughput", label: "Max-Throughput",   default: false, subtitle: "DP + DeepEP" },
-        { id: "cp",             label: "Context-Parallel", default: false, subtitle: "long prompts" },
-        { id: "pd-disagg",      label: "PD-Disagg",        default: false, subtitle: "1P + 1D + router" },
+        { id: "low-latency",    label: "Low-Latency",      default: true  },
+        { id: "balanced",       label: "Balanced",         default: false },
+        { id: "max-throughput", label: "Max-Throughput",   default: false },
+        { id: "cp",             label: "Context-Parallel", default: false },
+        { id: "pd-disagg",      label: "PD-Disagg",        default: false },
       ],
     },
     reasoningParser: {
@@ -161,7 +161,16 @@ export const DeepSeekV4Deployment = () => {
   // pd-disagg is verified as a single unit (both prefill and decode together).
   const VERIFIED_RECIPES = new Set([
     "b200|small|low-latency",
+    "b200|small|balanced",
+    "b200|small|max-throughput",
+    "b200|small|cp",
     "b200|big|low-latency",
+    "b200|big|balanced",
+    "b200|big|max-throughput",
+    "b200|big|cp",
+    "h200|small|low-latency",
+    "h200|small|balanced",
+    "h200|small|max-throughput",
   ]);
   const BEING_VERIFIED_NOTE =
     "# NOTE: this recipe is being verified on the latest checkpoint";
@@ -352,13 +361,14 @@ export const DeepSeekV4Deployment = () => {
       flags.push("  --nsa-prefill-cp-mode round-robin-split");
       flags.push("  --chunked-prefill-size 16384");
       flags.push("  --mem-fraction-static 0.78");
-      flags.push("  --max-running-requests 1024");
+      // allinone _CP_FLAGS has --max-running-requests 1024; Blackwell big cp overrides
+      // to 256. Human directed (2026-04-24) to emit only one value — keep 256 override
+      // for big Blackwell, else the default 1024.
       if (isBig && hardware !== "h200") {
-        // Blackwell big cp: extra overrides. allinone emits these AFTER _CP_FLAGS,
-        // so two --mem-fraction-static appear — argparse last-wins (0.70 beats 0.78).
-        flags.push("  --mem-fraction-static 0.70");
         flags.push("  --cuda-graph-max-bs 256");
         flags.push("  --max-running-requests 256");
+      } else {
+        flags.push("  --max-running-requests 1024");
       }
       // H200 CP gates DEEPEP_LARGE_SMS_FLAG on !multinode; Blackwell always gets it.
       if (!multinode) flags.push(DEEPEP_LARGE_SMS_FLAG);
