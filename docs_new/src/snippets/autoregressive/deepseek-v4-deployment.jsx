@@ -172,6 +172,9 @@ export const DeepSeekV4Deployment = () => {
     "h200|small|low-latency",
     "h200|small|balanced",
     "h200|small|max-throughput",
+    "gb300|small|low-latency",
+    "gb300|small|balanced",
+    "gb300|small|max-throughput",
     "h200|small|cp",
     "h200|small|pd-disagg",
     // h200|big|pd-disagg: pending verification (needs 4-node H200 cluster with
