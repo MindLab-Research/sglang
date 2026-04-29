@@ -7106,18 +7106,24 @@ class ServerArgs:
     def modelexpress_source(self) -> bool:
         return self._parsed_modelexpress_config.get("source", False)
 
+    @property
+    def modelexpress_transport(self) -> str:
+        """Transport backend for modelexpress: 'transfer_engine' (default) or 'nixl'."""
+        return self._parsed_modelexpress_config.get("transport", "transfer_engine")
+
     def remote_instance_weight_loader_use_transfer_engine(self):
         # Use TransferEngine as seed backend.
         if self.remote_instance_weight_loader_start_seed_via_transfer_engine:
             return True
-        # ModelExpress source mode also needs TransferEngine init.
-        if self.modelexpress_source:
+        # ModelExpress source mode needs TransferEngine init only if transport is transfer_engine.
+        if self.modelexpress_source and self.modelexpress_transport == "transfer_engine":
             return True
         # Use TransferEngine as client backend.
         elif (
             self.load_format == "remote_instance"
             and self.remote_instance_weight_loader_backend
             in ("transfer_engine", "modelexpress")
+            and self.modelexpress_transport == "transfer_engine"
         ):
             return True
         else:
