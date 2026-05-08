@@ -51,6 +51,7 @@ from sglang.srt.utils.common import (
     is_flashinfer_available,
     is_hip,
     is_hopper_with_cuda_12_3,
+    is_host_cpu_arm64,
     is_mps,
     is_musa,
     is_no_spec_infer_or_topk_one,
@@ -1203,7 +1204,9 @@ class ServerArgs:
     def _handle_cpu_backends(self):
         if self.device == "cpu":
             if self.attention_backend is None:
-                self.attention_backend = "intel_amx"
+                self.attention_backend = (
+                    "torch_native" if is_host_cpu_arm64() else "intel_amx"
+                )
             self.sampling_backend = "pytorch"
 
     def _handle_npu_backends(self):
