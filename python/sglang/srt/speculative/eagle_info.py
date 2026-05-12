@@ -846,17 +846,26 @@ class EagleDraftExtendInput(SpecInput):
 
     @classmethod
     def hidden_size_for(cls, worker) -> int:
-        """Extend-phase `hidden_states` width: target verify output (EAGLE
-        paper's "feature"). Widened to `target.hidden_size * 3` for EAGLE-3
-        aux mode (low/mid/high features fused into a 3k-dim vector, reduced
-        by draft's FC)."""
+        """Extend-phase `hidden_states` width: target's `spec_hidden_size`,
+        widened to `num_aux * target_hidden` for EAGLE-3 aux mode."""
         target_cfg = worker.target_worker.model_runner.model_config
-        if (
+        if not (
             worker.speculative_algorithm.is_eagle3()
             and worker.eagle_use_aux_hidden_state
         ):
-            return target_cfg.hidden_size * 3
-        return target_cfg.spec_hidden_size
+            return target_cfg.spec_hidden_size
+
+        hf_config = target_cfg.hf_config
+
+        # `num_aux` resolution: explicit attr > eagle_config layer_ids > default 3.
+        num_aux = getattr(hf_config, "num_aux_hidden_states", None)
+        if num_aux is None:
+            eagle_config = getattr(hf_config, "eagle_config", None) or {}
+            layer_ids = eagle_config.get("eagle_aux_hidden_state_layer_ids")
+            num_aux = len(layer_ids) if layer_ids else 3
+
+        target_hidden = getattr(hf_config, "target_hidden_size", target_cfg.hidden_size)
+        return target_hidden * num_aux
 
     @classmethod
     def dtype_for(cls, worker) -> torch.dtype:
