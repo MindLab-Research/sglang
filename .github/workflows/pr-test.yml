@@ -780,23 +780,20 @@ jobs:
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Warmup DeepGEMM JIT Compilation
-        timeout-minutes: 25
+        # Per-model TP must match the test's launch in test/registered/ — see
+        # FALLBACK_ARGS in scripts/ci/cuda/warmup_deep_gemm.py for extra dp/ep
+        # flags. Only models that actually invoke DeepGEMM kernels at runtime
+        # are listed. Cold-cache ~13 min; warm-cache ≤30 s via marker file.
+        timeout-minutes: 60
         run: |
-          # Activate venv if available (GITHUB_ENV may have failed to propagate)
           [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/bin/activate" ] && source "${SGLANG_CI_VENV_PATH}/bin/activate"
           [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/env.sh" ] && source "${SGLANG_CI_VENV_PATH}/env.sh"
           python3 scripts/ci/cuda/warmup_deep_gemm.py \
             deepseek-ai/DeepSeek-V3-0324:8 \
-            deepseek-ai/DeepSeek-V3.2-Exp:8
-
-      - name: Warmup Server CUDA Graphs
-        timeout-minutes: 25
-        run: |
-          [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/bin/activate" ] && source "${SGLANG_CI_VENV_PATH}/bin/activate"
-          [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/env.sh" ] && source "${SGLANG_CI_VENV_PATH}/env.sh"
-          python3 scripts/ci/cuda/warmup_server.py \
-            deepseek-ai/DeepSeek-V3-0324:8 \
-            inclusionAI/Ring-2.5-1T:8
+            deepseek-ai/DeepSeek-V3.2:8 \
+            zai-org/GLM-5-FP8:8 \
+            XiaomiMiMo/MiMo-V2-Flash:4 \
+            XiaomiMiMo/MiMo-V2.5:8
 
       - name: Run test
         timeout-minutes: 30
@@ -998,7 +995,7 @@ jobs:
           [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/env.sh" ] && source "${SGLANG_CI_VENV_PATH}/env.sh"
           python3 scripts/ci/cuda/warmup_deep_gemm.py \
             deepseek-ai/DeepSeek-V3-0324:8 \
-            deepseek-ai/DeepSeek-V3.2-Exp:8
+            deepseek-ai/DeepSeek-V3.2:8
 
       - name: Warmup Server CUDA Graphs
         timeout-minutes: 25
