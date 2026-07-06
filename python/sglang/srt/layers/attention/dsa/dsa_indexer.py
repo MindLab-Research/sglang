@@ -26,6 +26,9 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     get_tc_piecewise_forward_context,
     is_in_tc_piecewise_cuda_graph,
 )
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
@@ -587,6 +590,12 @@ class Indexer(MultiPlatformOp):
             return
         dst.copy_(src)
 
+    # Run the DSA indexer's DeepGEMM fp8_paged_mqa_logits + topk eagerly on
+    # every cuda-graph replay (correct, live metadata) while the rest of the
+    # decode forward stays captured (fast). Fixes the per-position>0 garble
+    # where the captured kernel read stale capture-time state. No-op outside
+    # breakable cuda-graph capture (extend/prefill passthrough).
+    @eager_on_graph(True)
     def _get_topk_paged(
         self,
         forward_batch: ForwardBatch,

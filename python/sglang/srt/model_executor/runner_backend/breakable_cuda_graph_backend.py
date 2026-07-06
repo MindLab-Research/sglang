@@ -19,6 +19,7 @@ No torch.compile.
 from __future__ import annotations
 
 from contextlib import contextmanager
+import dataclasses
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 import torch
@@ -40,6 +41,7 @@ from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
         BaseCudaGraphRunner,
@@ -132,6 +134,22 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
     def _slice_output(self, output: Any, num_tokens: int) -> Any:
         if output is None:
             return None
+        # Handle LogitsProcessorOutput (the model forward's actual return type
+        # for some models, e.g. GLM-5.1-FP8 / glm_moe_dsa). Slice the leading
+        # (token) dim of each tensor field; leave non-tensor fields untouched.
+        if dataclasses.is_dataclass(output) and not torch.is_tensor(output):
+            from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+
+            if isinstance(output, LogitsProcessorOutput):
+                updates = {}
+                for f in dataclasses.fields(output):
+                    v = getattr(output, f.name, None)
+                    if torch.is_tensor(v) and v.shape and v.shape[0] >= 0:
+                        try:
+                            updates[f.name] = v[:num_tokens]
+                        except Exception:
+                            updates[f.name] = v
+                return dataclasses.replace(output, **updates)
         if torch.is_tensor(output):
             return output[:num_tokens]
         if isinstance(output, PPProxyTensors):
@@ -155,6 +173,25 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
         if torch.is_tensor(output) and torch.is_tensor(output_buffer):
             output_buffer[:num_tokens].copy_(output[:num_tokens])
             return
+        # Handle LogitsProcessorOutput (model forward return type for some
+        # models, e.g. GLM-5.1-FP8 / glm_moe_dsa): copy each tensor field's
+        # leading num_tokens slice into the buffer's corresponding field.
+        if (
+            dataclasses.is_dataclass(output)
+            and dataclasses.is_dataclass(output_buffer)
+            and not torch.is_tensor(output)
+        ):
+            from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+
+            if isinstance(output, LogitsProcessorOutput) and isinstance(
+                output_buffer, LogitsProcessorOutput
+            ):
+                for f in dataclasses.fields(output):
+                    src = getattr(output, f.name, None)
+                    dst = getattr(output_buffer, f.name, None)
+                    if torch.is_tensor(src) and torch.is_tensor(dst):
+                        dst[:num_tokens].copy_(src[:num_tokens])
+                return
         if isinstance(output, PPProxyTensors) and isinstance(
             output_buffer, PPProxyTensors
         ):
