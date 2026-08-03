@@ -128,6 +128,7 @@ class PrefetchOperation(StorageOperation):
         self.request_id = request_id
         self._lock = threading.Lock()
         self._terminated_flag = False
+        self._io_finished_event = threading.Event()
         self.start_time = time.monotonic()
         super().__init__(
             host_indices,
@@ -151,6 +152,12 @@ class PrefetchOperation(StorageOperation):
 
     def is_terminated(self) -> bool:
         return self._terminated_flag
+
+    def mark_io_finished(self) -> None:
+        self._io_finished_event.set()
+
+    def is_io_finished(self) -> bool:
+        return self._io_finished_event.is_set()
 
 
 class HybridCacheController(BaseHiCacheController):
@@ -585,6 +592,7 @@ class HybridCacheController(BaseHiCacheController):
         return operation.id
 
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
+        from sglang.srt.mem_cache.hicache_storage import PoolTransferResult
         hash_value = self.get_hash_str(
             operation.token_ids, operation.last_hash, page_size=self.page_size
         )
@@ -592,9 +600,9 @@ class HybridCacheController(BaseHiCacheController):
         extra_info = HiCacheStorageExtraInfo(
             prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None
         )
-        if operation.pool_transfers:
+        if getattr(operation, "pool_transfers", None):
             hit_result = self.storage_backend.batch_exists_v2(
-                hash_value, operation.pool_transfers, extra_info
+                hash_value, getattr(operation, "pool_transfers", None), extra_info
             )
         else:
             kv_hit_count = self.storage_backend.batch_exists(hash_value, extra_info)
@@ -603,6 +611,8 @@ class HybridCacheController(BaseHiCacheController):
             )
 
         kv_hit_pages = hit_result.kv_hit_pages
+        if not hasattr(operation, "pool_storage_result"):
+            operation.pool_storage_result = PoolTransferResult.empty()
         operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
 
         return (
@@ -617,9 +627,9 @@ class HybridCacheController(BaseHiCacheController):
             operation.host_indices, operation.device_indices
         )
         resolved_pool_transfers = None
-        if operation.pool_transfers:
+        if getattr(operation, "pool_transfers", None):
             resolved_pool_transfers = []
-            for transfer in operation.pool_transfers:
+            for transfer in getattr(operation, "pool_transfers", None) or []:
                 transfer_host_indices, transfer_device_indices = self.move_indices(
                     transfer.host_indices, transfer.device_indices
                 )
@@ -646,34 +656,34 @@ class HybridCacheController(BaseHiCacheController):
         # (IO failure, timeout, TP mismatch), skip extra IO entirely to avoid
         # data misalignment.
         kv_completed_pages = operation.completed_tokens // self.page_size
-        if operation.pool_transfers and kv_completed_pages == len(operation.hash_value):
+        if getattr(operation, "pool_transfers", None) and kv_completed_pages == len(operation.hash_value):
             self._sync_trailing_keys(
-                operation.pool_transfers, operation.hash_value, kv_completed_pages
+                getattr(operation, "pool_transfers", None), operation.hash_value, kv_completed_pages
             )
             self._resolve_sidecar_derived_pool_transfers(operation)
-            results = self.storage_backend.batch_get_v2(operation.pool_transfers)
+            results = self.storage_backend.batch_get_v2(getattr(operation, "pool_transfers", None))
             operation.pool_storage_result.update_extra_pool_hit_pages(results)
         operation.pool_transfers_done = True
 
     def _page_backup(self, operation):
         # Backup extra pools
-        if operation.pool_transfers:
+        if getattr(operation, "pool_transfers", None):
             self._resolve_sidecar_derived_pool_transfers(operation)
-            results = self.storage_backend.batch_set_v2(operation.pool_transfers)
+            results = self.storage_backend.batch_set_v2(getattr(operation, "pool_transfers", None))
             operation.pool_storage_result.update_extra_pool_hit_pages(results)
 
         # Backup kv pools
         super()._page_backup(operation)
 
     def _resolve_sidecar_derived_pool_transfers(self, operation):
-        for transfer in operation.pool_transfers:
+        for transfer in getattr(operation, "pool_transfers", None) or []:
             if transfer.indices_from_pool is None:
                 continue
             if transfer.indices_from_pool != PoolName.KV:
                 source = next(
                     (
                         t
-                        for t in operation.pool_transfers
+                        for t in getattr(operation, "pool_transfers", None) or []
                         if t.indices_from_pool is None
                         and t.name == transfer.indices_from_pool
                     ),

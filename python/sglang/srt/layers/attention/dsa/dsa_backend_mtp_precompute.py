@@ -13,6 +13,15 @@ import torch
 
 from sglang.srt.layers.attention.dsa.utils import compute_dsa_seqlens
 from sglang.srt.layers.attention.utils import seqlens_expand_triton
+from sglang.srt.layers.dcp.comm import (
+    dcp_enabled,
+    get_attention_dcp_rank,
+    get_attention_dcp_world_size,
+)
+from sglang.srt.layers.dcp.layout import (
+    get_page_dcp_lens,
+    localize_page_table_for_dcp_,
+)
 from sglang.srt.utils import is_cuda, is_hip
 
 if TYPE_CHECKING:
@@ -59,6 +68,34 @@ def compute_cu_seqlens(seqlens: torch.Tensor) -> torch.Tensor:
     assert seqlens.dtype == torch.int32
     return torch.nn.functional.pad(
         torch.cumsum(seqlens, dim=0, dtype=torch.int32), (1, 0)
+    )
+
+
+def _localize_precomputed_page_dcp(
+    cache_seqlens: torch.Tensor,
+    real_page_table: Optional[torch.Tensor],
+    seqlens_expanded: torch.Tensor,
+    dsa_index_topk: int,
+    page_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    dcp_size = get_attention_dcp_world_size()
+    dcp_rank = get_attention_dcp_rank()
+    if real_page_table is not None:
+        localize_page_table_for_dcp_(real_page_table, dcp_size, dcp_rank)
+
+    local_cache_seqlens = get_page_dcp_lens(
+        cache_seqlens, dcp_size, dcp_rank, page_size
+    ).to(torch.int32)
+    local_expanded = get_page_dcp_lens(
+        seqlens_expanded, dcp_size, dcp_rank, page_size
+    ).to(torch.int32)
+    local_dsa_seqlens = compute_dsa_seqlens(local_expanded, dsa_index_topk)
+    return (
+        local_cache_seqlens,
+        compute_cu_seqlens(local_cache_seqlens),
+        local_expanded,
+        local_dsa_seqlens,
+        compute_cu_seqlens(local_dsa_seqlens),
     )
 
 
@@ -163,6 +200,21 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
             seqlens_expanded = cache_seqlens
             seqlens_expanded_size = bs
 
+            if dcp_enabled():
+                (
+                    cache_seqlens,
+                    cu_seqlens_k,
+                    seqlens_expanded,
+                    dsa_cache_seqlens,
+                    dsa_cu_seqlens_k,
+                ) = _localize_precomputed_page_dcp(
+                    cache_seqlens,
+                    real_page_table,
+                    seqlens_expanded,
+                    self.dsa_index_topk,
+                    self.real_page_size,
+                )
+
             flashmla_metadata = None
             if self.dsa_decode_impl == "flashmla_kv":
                 flashmla_metadata = self._compute_flashmla_metadata(
@@ -206,6 +258,21 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
             real_page_table = self._transform_table_1_to_real(page_indices)
         else:
             real_page_table = None  # Will use page_indices directly
+
+        if dcp_enabled():
+            (
+                cache_seqlens,
+                cu_seqlens_k,
+                seqlens_expanded,
+                dsa_cache_seqlens,
+                dsa_cu_seqlens_k,
+            ) = _localize_precomputed_page_dcp(
+                cache_seqlens,
+                real_page_table,
+                seqlens_expanded,
+                self.dsa_index_topk,
+                self.real_page_size,
+            )
 
         # Compute FlashMLA metadata if needed
         flashmla_metadata = None
@@ -295,6 +362,21 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
                 next_n=self.speculative_num_draft_tokens,
             )
 
+            if dcp_enabled():
+                (
+                    cache_seqlens,
+                    cu_seqlens_k,
+                    seqlens_expanded,
+                    dsa_cache_seqlens,
+                    dsa_cu_seqlens_k,
+                ) = _localize_precomputed_page_dcp(
+                    cache_seqlens,
+                    real_page_table,
+                    seqlens_expanded,
+                    self.dsa_index_topk,
+                    self.real_page_size,
+                )
+
             flashmla_metadata = None
             if self.dsa_decode_impl == "flashmla_kv":
                 flashmla_metadata = self._compute_flashmla_metadata(
@@ -353,6 +435,21 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
             real_page_table = self._transform_table_1_to_real(page_indices)
         else:
             real_page_table = None
+
+        if dcp_enabled():
+            (
+                cache_seqlens,
+                cu_seqlens_k,
+                seqlens_expanded,
+                dsa_cache_seqlens,
+                dsa_cu_seqlens_k,
+            ) = _localize_precomputed_page_dcp(
+                cache_seqlens,
+                real_page_table,
+                seqlens_expanded,
+                self.dsa_index_topk,
+                self.real_page_size,
+            )
 
         # FlashMLA metadata
         flashmla_metadata = None

@@ -398,9 +398,9 @@ class MambaPool:
                 # mamba layers/slots share one contiguous byte buffer; conv and
                 # temporal are strided views into it (see mem_cache/layout/
                 # page_major.py). Only the standard CUDA Triton path is supported.
-                assert not _is_npu and not (
-                    _is_cpu and _cpu_has_amx_support
-                ), "envelope_layout mamba is only supported on the CUDA path"
+                assert not _is_npu and not (_is_cpu and _cpu_has_amx_support), (
+                    "envelope_layout mamba is only supported on the CUDA path"
+                )
                 max_slots = size + 1
                 entry_bytes = mamba_entry_bytes(
                     layer_num=num_mamba_layers,
@@ -942,9 +942,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 pass
             else:
                 mid = self.mamba_allocator.alloc(1)
-                assert (
-                    mid is not None
-                ), f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.mamba_pool.size=}, {self.mamba_allocator.available_size()=}, {len(reqs)=}"
+                assert mid is not None, (
+                    f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.mamba_pool.size=}, {self.mamba_allocator.available_size()=}, {len(reqs)=}"
+                )
                 req.mamba_pool_idx = mid[0]
                 req.mamba_needs_clear = True
                 # GDN ReplaySSM: a freshly (re)assigned slot starts an empty
@@ -958,13 +958,13 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 if req.mamba_ping_pong_track_buffer is None:
                     self._alloc_ping_pong_buffer(req)
                 mamba_ping_pong_track_buffers.append(req.mamba_ping_pong_track_buffer)
-        assert len(select_index) == len(
-            mamba_indices
-        ), "Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size."
+        assert len(select_index) == len(mamba_indices), (
+            "Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size."
+        )
         if self.enable_mamba_extra_buffer:
-            assert len(select_index) == len(
-                mamba_ping_pong_track_buffers
-            ), "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
+            assert len(select_index) == len(mamba_ping_pong_track_buffers), (
+                "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
+            )
         mamba_index_tensor = torch.stack(mamba_indices).to(dtype=torch.int32)
         self.req_index_to_mamba_index_mapping[select_index] = mamba_index_tensor
         if self.enable_mamba_extra_buffer:
@@ -1093,7 +1093,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 assert mamba_ping_pong_track_buffer_to_keep in [
                     0,
                     1,
-                ], f"mamba_ping_pong_track_buffer_to_keep must be 0 or 1, {mamba_ping_pong_track_buffer_to_keep=}"
+                ], (
+                    f"mamba_ping_pong_track_buffer_to_keep must be 0 or 1, {mamba_ping_pong_track_buffer_to_keep=}"
+                )
                 # Avoid Python-list advanced indexing on a device tensor.
                 # The ping-pong buffer size is either 2 (normal) or 1 (spec decode).
                 if self.mamba_ping_pong_track_buffer_size == 2:
@@ -1324,7 +1326,9 @@ class MHATokenToKVPool(KVCache):
         self.v_head_dim = (
             swa_v_head_dim
             if swa_v_head_dim is not None
-            else v_head_dim if v_head_dim is not None else head_dim
+            else v_head_dim
+            if v_head_dim is not None
+            else head_dim
         )
 
         # Layout: NHD (default) | HND (SGLANG_USE_HND_KVCACHE) | vectorized_5d (ROCm AITER).
@@ -1899,9 +1903,9 @@ class MHATokenToKVPool(KVCache):
         if N == 0:
             return
 
-        assert (
-            self._kv_copy_config is not None
-        ), "KV copy not initialized. Set enable_kv_cache_copy=True in __init__"
+        assert self._kv_copy_config is not None, (
+            "KV copy not initialized. Set enable_kv_cache_copy=True in __init__"
+        )
 
         cfg = self._kv_copy_config
         cap = int(cfg.get("num_locs_upper", 256))
@@ -2591,10 +2595,13 @@ class HybridLinearKVPool(KVCache):
         loc: torch.Tensor,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
+        forward_mode=None,
     ):
         assert self.use_mla, "set_mla_kv_buffer called when use_mla is False"
         with self._transfer_id_context(layer):
-            self.full_kv_pool.set_mla_kv_buffer(layer, loc, cache_k_nope, cache_k_rope)
+            self.full_kv_pool.set_mla_kv_buffer(
+                layer, loc, cache_k_nope, cache_k_rope, forward_mode
+            )
 
     def get_mla_kv_buffer(
         self,
@@ -2755,9 +2762,29 @@ class MLATokenToKVPool(KVCache):
         loc: torch.Tensor,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
+        forward_mode=None,
     ):
-        maybe_detect_oob(loc, 0, self.size + self.page_size, "set_mla_kv_buffer (MLA)")
         layer_id = layer.layer_id
+
+        # DCP uses whole-page round-robin ownership. The target allocator exposes
+        # a global virtual space of max_total*dcp_size slots, while each rank's
+        # physical pool stores max_total slots. Keep graph shapes static by
+        # routing non-owner writes to the scratch page instead of boolean masking.
+        if dcp_enabled():
+            _dws = get_attention_dcp_world_size()
+            _ps = self.page_size  # 64
+            _slot = (loc // (_ps * _dws)) * _ps + (loc % _ps)
+            _valid = loc >= 0
+            # Owner filter: each rank writes only its own pages. Both decode
+            # and target_verify/draft_extend_v2 use this — skipping it caused
+            # both ranks to write the same slot but each only has its 8 TP heads,
+            # leaving the other 8 as zero → trtllm reads 16 heads with 8 zero
+            # → garbled output (written=[0.0]*8).
+            _page_64 = loc // _ps
+            _owner = (_page_64 % _dws == get_attention_dcp_rank()) & _valid
+            loc = torch.where(_owner, _slot, torch.full_like(loc, self.size))
+
+        maybe_detect_oob(loc, 0, self.size + self.page_size, "set_mla_kv_buffer (MLA)")
 
         if _is_hip and self.use_dsa and self.dtype == fp8_dtype:
             # HIP FP8 path uses raw MLA KV layout (nope + rope) without per-block scales.
@@ -2962,6 +2989,7 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
         loc: torch.Tensor,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
+        forward_mode=None,
     ):
         maybe_detect_oob(
             loc, 0, self.size + self.page_size, "set_mla_kv_buffer (MLA-FP4)"
@@ -3055,13 +3083,13 @@ class DSATokenToKVPool(MLATokenToKVPool):
 
         if _is_hip:
             if aiter_can_use_preshuffle_paged_mqa():
-                assert (
-                    self.page_size % 16 == 0
-                ), f"HIP preshuffle requires page_size to be a multiple of 16, got {self.page_size}"
+                assert self.page_size % 16 == 0, (
+                    f"HIP preshuffle requires page_size to be a multiple of 16, got {self.page_size}"
+                )
             else:
-                assert (
-                    self.page_size == 1
-                ), f"HIP legacy DSA path requires page_size == 1, got {self.page_size}"
+                assert self.page_size == 1, (
+                    f"HIP legacy DSA path requires page_size == 1, got {self.page_size}"
+                )
         else:
             assert self.page_size == 64
         with (

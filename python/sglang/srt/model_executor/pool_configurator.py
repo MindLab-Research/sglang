@@ -134,6 +134,18 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         else:
             num_layers = mr.num_effective_layers
 
+        # CP layer-split: each rank only stores its owned layers + 1 transient slot,
+        # so the per-token KV cost is far below full num_layers.
+        from sglang.srt.layers.utils.cp_utils import (
+            cp_layersplit_local_layer_count,
+            is_cp_layersplit_active,
+        )
+
+        if is_cp_layersplit_active(mr.server_args, mr.attn_cp_rank):
+            num_layers = cp_layersplit_local_layer_count(
+                num_layers, mr.server_args.attn_cp_size, mr.attn_cp_rank
+            )
+
         self._cell_size = self._compute_cell_size(mr, num_layers)
 
         # EAGLE/STANDALONE: scale cell_size to account for draft model KV cache.
@@ -149,9 +161,19 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and int(eagle_draft_num_layers) > 0
                 and int(num_layers) > 0
             ):
+                # Target stores one page shard per DCP rank, while the unsharded
+                # draft must cover the target allocator's full virtual address
+                # space. Budget dcp_size copies of draft tokens per target
+                # physical token.
+                draft_token_multiplier = max(1, mr.dcp_size)
                 self._cell_size = int(
                     self._cell_size
-                    * (1 + int(eagle_draft_num_layers) / int(num_layers))
+                    * (
+                        1
+                        + int(eagle_draft_num_layers)
+                        / int(num_layers)
+                        * draft_token_multiplier
+                    )
                 )
 
         # DFLASH: scale cell_size to account for draft model KV cache
@@ -296,9 +318,9 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
 
         self._full_layers_num = len(model_config.full_attention_layer_ids)
         self._swa_layers_num = len(model_config.swa_attention_layer_ids)
-        assert (
-            self._swa_layers_num > 0
-        ), "Hybrid SWA model must have at least one SWA layer"
+        assert self._swa_layers_num > 0, (
+            "Hybrid SWA model must have at least one SWA layer"
+        )
 
         self._swa_full_tokens_ratio = mr.server_args.swa_full_tokens_ratio
 
@@ -319,12 +341,14 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         # EAGLE/STANDALONE draft KV pool inherits max_total tokens with its
         # full-attn layers; budget into the full term.
         self._draft_full_layers_num = 0
+        self._draft_token_multiplier = 1
         if (
             mr.spec_algorithm.is_eagle() or mr.spec_algorithm.is_standalone()
         ) and not mr.is_draft_worker:
             draft_layers = getattr(mr, "eagle_draft_num_layers", None)
             if draft_layers is not None and int(draft_layers) > 0:
                 self._draft_full_layers_num = int(draft_layers)
+                self._draft_token_multiplier = max(1, mr.dcp_size)
 
         # Bytes per token of max_total_num_tokens.
         #
@@ -338,12 +362,17 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         if self._full_layers_num == 0:
             self._cell_size = (
                 self._swa_per_token * self._swa_layers_num
-                + self._full_per_token * self._draft_full_layers_num
+                + self._full_per_token
+                * self._draft_full_layers_num
+                * self._draft_token_multiplier
             )
         else:
             self._cell_size = (
                 self._full_per_token
-                * (self._full_layers_num + self._draft_full_layers_num)
+                * (
+                    self._full_layers_num
+                    + self._draft_full_layers_num * self._draft_token_multiplier
+                )
                 + self._swa_full_tokens_ratio
                 * self._swa_per_token
                 * self._swa_layers_num
@@ -734,9 +763,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
-        assert (
-            page_size % 128 == 0
-        ), "page_size must be multiple of 128 for compressed attention"
+        assert page_size % 128 == 0, (
+            "page_size must be multiple of 128 for compressed attention"
+        )
 
         if self.requested_max_running_requests_per_worker is not None:
             c128_state_fixed_bytes = self._get_c128_state_fixed_bytes(
@@ -764,9 +793,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes_from_max_tokens(
         self, max_total_num_tokens: int, page_size: int
     ) -> MemoryPoolConfig:
-        assert (
-            page_size % 128 == 0
-        ), "page_size must be multiple of 128 for compressed attention"
+        assert page_size % 128 == 0, (
+            "page_size must be multiple of 128 for compressed attention"
+        )
         sizes = self._compute_dsv4_sizes(max_total_num_tokens, page_size)
         return self._to_config(sizes)
 

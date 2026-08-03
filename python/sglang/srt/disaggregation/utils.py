@@ -126,6 +126,25 @@ def _apply_metadata_gate(polls, decode_reqs, metadata_buffers, server_args) -> N
                 polls[i] = int(KVPoll.Transferring)
 
 
+
+def _padded_all_reduce_min(polls: list, gloo_group):
+    """All_reduce a variable-length uint8 list with size synchronization.
+
+    Different ranks may have different list lengths (different transfer queue
+    sizes). This pads to the max length across ranks (255 = neutral for MIN)
+    so gloo doesn't crash with size mismatch ("4 vs 1").
+    """
+    local_len = torch.tensor(len(polls), dtype=torch.int, device="cpu")
+    dist.all_reduce(local_len, op=dist.ReduceOp.MAX, group=gloo_group)
+
+    max_len = max(1, local_len.item())
+    polls_padded = list(polls) + [255] * (max_len - len(polls))
+    tensor_to_reduce = torch.tensor(polls_padded, dtype=torch.uint8, device="cpu")
+    dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=gloo_group)
+
+    return tensor_to_reduce.tolist()[:len(polls)]
+
+
 def poll_and_all_reduce(
     pollers,
     gloo_group: dist.ProcessGroup,
@@ -143,9 +162,7 @@ def poll_and_all_reduce(
         and server_args is not None
     ):
         _apply_metadata_gate(polls, decode_reqs, metadata_buffers, server_args)
-    tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
-    dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=gloo_group)
-    return tensor_to_reduce.tolist()
+    return _padded_all_reduce_min(polls, gloo_group)
 
 
 def poll_and_all_reduce_attn_cp_tp_group(
@@ -154,18 +171,18 @@ def poll_and_all_reduce_attn_cp_tp_group(
     attn_tp_cpu_group: dist.ProcessGroup,
 ):
     # First sync across attn-tp ranks so all TP participants for a given (dp, cp)
-    # shard observe the same status transitions.
-    polls = poll_and_all_reduce(pollers, attn_tp_cpu_group)
+    # shard observe the same status transitions. Use _padded_all_reduce_min to
+    # handle variable-length pollers lists (different ranks may have different
+    # numbers of inflight requests, causing tensor shape mismatch -> deadlock).
+    polls = _padded_all_reduce_min(
+        [int(poller.poll()) for poller in pollers], attn_tp_cpu_group
+    )
 
     # Then sync across attn-cp ranks, so all TPxCP participants in one DP shard
-    # converge to the same global status.
-    tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
-    dist.all_reduce(
-        tensor_to_reduce,
-        op=dist.ReduceOp.MIN,
-        group=attn_cp_cpu_group,
-    )
-    return tensor_to_reduce.tolist()
+    # converge to the same global status. Also use _padded_all_reduce_min for
+    # the same reason (candidates list length can differ across CP ranks).
+    polls = _padded_all_reduce_min(polls, attn_cp_cpu_group)
+    return polls
 
 
 def poll_and_all_reduce_with_staging(
@@ -194,9 +211,7 @@ def poll_and_all_reduce_with_staging(
     # Apply metadata gate on the decode requests to downgrade Success → Transferring for requests whose metadata hasn't landed.
     if metadata_buffers is not None and server_args is not None:
         _apply_metadata_gate(raw_polls, decode_reqs, metadata_buffers, server_args)
-    poll_tensor = torch.tensor(raw_polls, dtype=torch.uint8, device="cpu")
-    dist.all_reduce(poll_tensor, op=dist.ReduceOp.MIN, group=gloo_group)
-    return poll_tensor.tolist()
+    return _padded_all_reduce_min(raw_polls, gloo_group)
 
 
 #########################
@@ -661,15 +676,51 @@ def filter_kv_indices_for_cp_rank(
     return new_kv_indices, new_index_slice
 
 
+def filter_kv_indices_for_dcp_rank(
+    kv_indices: np.ndarray,
+    dcp_size: int,
+    dcp_rank: int,
+) -> np.ndarray:
+    """Reshard prefill KV indices for a DCP decode rank.
+
+    Prefill holds the **full** token set per owned layer (attn_tp_size=1, no head
+    shard). Under DCP, decode rank ``d`` owns only tokens whose position satisfies
+    ``pos % dcp_size == d``. Since ``kv_indices`` are logical token slots and the
+    allocator assigns global slots where ``slot == pos`` (DCP allocator size is
+    ``max_total * dcp_size``), the owner test reduces to ``slot % dcp_size == d``.
+
+    After filtering, the surviving global slots are compressed to local physical
+    slots via ``// dcp_size`` (global slot 0..max_total*N → local 0..max_total), so
+    the RDMA write lands in the decode rank's compacted physical buffer without
+    crossing into other ranks' shards.
+
+    Args:
+        kv_indices: prefill-side global logical page indices (full token set).
+        dcp_size: decode DCP world size (N).
+        dcp_rank: target decode rank's DCP rank (0..N-1).
+
+    Returns:
+        np.ndarray: only the pages owned by ``dcp_rank``, mapped to local physical
+        slots via ``// dcp_size``.
+    """
+    if dcp_size <= 1:
+        return kv_indices
+    kv_indices = np.asarray(kv_indices)
+    mask = kv_indices % dcp_size == dcp_rank
+    return kv_indices[mask] // dcp_size
+
+
 #########################
 # Misc
 #########################
 
 
 def is_mla_backend(target_kv_pool) -> bool:
+    from sglang.srt.mem_cache.cp_layersplit_pool import unwrap_cp_layersplit_kv_pool
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 
+    target_kv_pool = unwrap_cp_layersplit_kv_pool(target_kv_pool)
     return isinstance(target_kv_pool, (MLATokenToKVPool, DeepSeekV4TokenToKVPool))
 
 
@@ -704,11 +755,14 @@ def setup_state_kv_args(
     from sglang.srt.disaggregation.base.conn import StateType
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
     from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+    from sglang.srt.mem_cache.cp_layersplit_pool import unwrap_cp_layersplit_kv_pool
     from sglang.srt.mem_cache.memory_pool import (
         DSATokenToKVPool,
         HybridLinearKVPool,
         MiniMaxSparseKVPool,
     )
+
+    token_to_kv_pool = unwrap_cp_layersplit_kv_pool(token_to_kv_pool)
 
     kv_args.state_types = []
     kv_args.state_data_ptrs = []

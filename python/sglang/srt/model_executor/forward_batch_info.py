@@ -859,7 +859,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ret._compute_mrope_positions(model_runner, batch)
 
         # Init lora information
-        if model_runner.server_args.enable_lora:
+        if model_runner.server_args.enable_lora and not getattr(model_runner, 'is_draft_worker', False):
             # In the non-LoRA overlap loading case, we fetch LoRA adapters into the memory pool
             # as a batch, right before running the batch
             if not model_runner.server_args.enable_lora_overlap_loading:

@@ -626,6 +626,9 @@ class Envs:
         True, deprecated_name="SGLANG_NSA_FUSE_TOPK"
     )
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
+
+    # DCP debug logging (disabled by default; set SGLANG_DCP_DEBUG=1 to enable)
+    SGLANG_DCP_DEBUG = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvIntWithAlias(
         2048, deprecated_name="SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD"
@@ -649,6 +652,7 @@ class Envs:
     SGLANG_RETURN_ORIGINAL_LOGPROB = EnvBool(False)
     SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN = EnvBool(False)
     SGLANG_MOE_PADDING = EnvBool(False)
+    SGLANG_ENABLE_DSA_PREFILL_CP_LAYERSPLIT_UNEVEN = EnvBool(False)
     SGLANG_CUTLASS_MOE = EnvBool(False)
     HF_HUB_DISABLE_XET = EnvBool(False)
     DISABLE_OPENAPI_DOC = EnvBool(False)

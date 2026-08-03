@@ -4,6 +4,16 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
+_dcp_debug = None
+def _dcp_log(msg, *args, **kwargs):
+    global _dcp_debug
+    if _dcp_debug is None:
+        import os
+        _dcp_debug = os.environ.get("SGLANG_DCP_DEBUG", "").lower() in ("1", "true", "yes")
+    if _dcp_debug:
+        logger.warning(msg, *args, **kwargs)
+
+
 import torch
 
 from sglang.srt.compilation.compilation_config import register_split_op
@@ -573,25 +583,45 @@ class DeepseekMLAForwardMixin:
 
         # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [B, H, ROPE_DIM], q_nope_out [B, H, NOPE_DIM] gathered to [B, H * dcp_world_size, ROPE_DIM] [B, H * dcp_world_size, NOPE_DIM] for decode batch, and all gather k_pe, k_nope for extend batch.
         if dcp_enabled():
-            if forward_batch.forward_mode.is_decode():
-                # if forward_batch.forward_mode is decode, gather q
+            _dcp_meta = getattr(forward_batch, "attn_dcp_metadata", None)
+            if (
+                forward_batch.forward_mode.is_decode()
+                or forward_batch.forward_mode.is_target_verify()
+            ):
+                _q_pre = q_nope_out.shape
                 q_nope_out, q_pe = all_gather_q_for_mla_decode(
                     q_nope_out=q_nope_out,
                     q_pe=q_pe,
                 )
-            elif forward_batch.forward_mode.is_extend():
-                # for extend, gather kv
+                if not torch.cuda.is_current_stream_capturing():
+                    _dcp_log(
+                        f"[DCP-QAG] q_pre={_q_pre} q_post={q_nope_out.shape} "
+                        f"dcp_ws={get_attention_dcp_world_size()}"
+                    )
+            elif forward_batch.forward_mode.is_extend() and _dcp_meta is not None:
+                # for extend, gather kv — ONLY when DCP metadata was built for
+                # this batch (the eager-runner _execute_extend path does this).
+                # EAGLE target-verify extend and PD prebuilt-batch extend do NOT
+                # build attn_dcp_metadata (it is None); for those, the local KV
+                # shard is already in the pool, so plain (non-gathered) attention
+                # over the local shard is correct and avoids the None deref crash.
                 all_gather_kv_cache_for_mla_extend(
                     get_token_to_kv_pool(),
                     self.attn_mqa,
                     forward_batch.extend_prefix_lens_cpu,
-                    forward_batch.attn_dcp_metadata.dcp_local_prefix_kv_indices,
-                    forward_batch.attn_dcp_metadata.dcp_extend_prefix_lens_sum,
-                    forward_batch.attn_dcp_metadata.dcp_kv_buffer,
+                    _dcp_meta.dcp_local_prefix_kv_indices,
+                    _dcp_meta.dcp_extend_prefix_lens_sum,
+                    _dcp_meta.dcp_kv_buffer,
                     self.kv_lora_rank,
                     k_nope,
                     k_pe,
                 )
+            elif forward_batch.forward_mode.is_extend():
+                # DCP is on but no attn_dcp_metadata (EAGLE target-verify / PD
+                # prebuilt extend): fall through to normal path. The local KV
+                # shard suffices because target-verify only attends to recently
+                # drafted tokens whose KV each rank already wrote locally.
+                pass
             else:
                 logger.warning(
                     f"not supported forward_mode {forward_batch.forward_mode}"
@@ -726,7 +756,10 @@ class DeepseekMLAForwardMixin:
                         topk_indices=topk_indices,
                     )
                     attn_output = fusion_plan.attn_output_buf
-                elif forward_batch.forward_mode.is_decode() and dcp_enabled():
+                elif (
+                    forward_batch.forward_mode.is_decode()
+                    or forward_batch.forward_mode.is_target_verify()
+                ) and dcp_enabled():
                     # set return_lse=True to correct attn_output
                     attn_output, lse = self.attn_mqa_for_dcp_decode(
                         q_nope_out,
@@ -800,13 +833,39 @@ class DeepseekMLAForwardMixin:
             )
 
         # correct attn_output with respect to lse from other ranks
-        if forward_batch.forward_mode.is_decode() and dcp_enabled():
+        if (
+            forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_target_verify()
+        ) and dcp_enabled():
+            if not torch.cuda.is_current_stream_capturing():
+                _is_tuple = isinstance(attn_output, tuple)
+                _lse_ok = lse is not None if not _is_tuple else (attn_output[1] is not None)
+                _dcp_log(
+                        f"[DCP-LSE] is_tuple={_is_tuple} lse_defined={'lse' in dir() or _is_tuple} "
+                    f"dcp_ws={get_attention_dcp_world_size()} "
+                    f"out_type={type(attn_output).__name__} "
+                    f"out_shape={attn_output[0].shape if _is_tuple else attn_output.shape}"
+                )
+            if isinstance(attn_output, tuple):
+                attn_output, lse = attn_output
+            _pre_merge = attn_output.detach().clone()
             attn_output = attn_output.view(
                 -1,
                 self.num_local_heads * get_attention_dcp_world_size(),
                 self.kv_lora_rank,
             )
             attn_output = cp_lse_ag_out_rs_mla(attn_output, lse, get_dcp_group())
+            if not torch.cuda.is_current_stream_capturing():
+                _merge_nan = int(torch.isnan(attn_output).sum().item())
+                _merge_inf = int(torch.isinf(attn_output).sum().item())
+                _lse_zero = int((lse == 0).sum().item()) if lse is not None else -1
+                _lse_shape = tuple(lse.shape) if lse is not None else None
+                _dcp_log(
+                        f"[DCP-MERGE] pre_abs={float(_pre_merge.abs().mean()):.4f} "
+                    f"post_abs={float(attn_output.abs().mean()):.4f} "
+                    f"pre_shape={tuple(_pre_merge.shape)} post_shape={tuple(attn_output.shape)} "
+                    f"nan={_merge_nan} inf={_merge_inf} lse_zero={_lse_zero} lse_shape={_lse_shape}"
+                )
             attn_output = attn_output.transpose(0, 1)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 

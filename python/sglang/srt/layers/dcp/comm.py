@@ -20,6 +20,8 @@ PR #25090 vs #14194):
   - cp_lse_ag_out_rs_mla: Triton (log2/exp2) correction / reduce-scatter
 """
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Optional
 
 import torch
@@ -38,11 +40,29 @@ from sglang.srt.layers.dcp.kernels import CPTritonContext, correct_attn_out
 from sglang.srt.utils import is_cuda
 
 
+_dcp_force_disabled: ContextVar[bool] = ContextVar("dcp_force_disabled", default=False)
+
+
+@contextmanager
+def dcp_disabled():
+    """Temporarily disable DCP for an unsharded model in a DCP process.
+
+    EAGLE draft and target models execute in the same process, but only the
+    target KV pool is DCP-sharded. Context-local state keeps nested and
+    exceptional exits safe without changing the process-wide DCP group.
+    """
+    token = _dcp_force_disabled.set(True)
+    try:
+        yield
+    finally:
+        _dcp_force_disabled.reset(token)
+
+
 def dcp_enabled() -> bool:
     """
     only checks whether dcp enabled for cuda platform
     """
-    if get_dcp_group_no_assert() is None:
+    if _dcp_force_disabled.get() or get_dcp_group_no_assert() is None:
         return False
     if not is_cuda():
         return False

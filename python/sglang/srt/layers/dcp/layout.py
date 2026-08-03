@@ -42,6 +42,57 @@ def get_dcp_lens(
     return torch.clamp((remaining + dcp_size - 1) // dcp_size, min=0)
 
 
+def get_page_dcp_lens(
+    lens: torch.Tensor,
+    dcp_size: int,
+    dcp_rank: int,
+    page_size: int,
+) -> torch.Tensor:
+    """Return exact local lengths for round-robin ownership of whole pages.
+
+    Full pages are assigned by ``global_page % dcp_size``. A partial tail page
+    contributes only its valid tokens to its owner, preserving the distinct
+    causal length of every EAGLE verify node.
+    """
+    if dcp_size == 1:
+        return lens
+    if page_size <= 0:
+        raise ValueError(f"page_size must be positive, got {page_size}")
+    if not 0 <= dcp_rank < dcp_size:
+        raise ValueError(f"dcp_rank must be in [0, {dcp_size}), got {dcp_rank}")
+
+    full_pages = torch.div(lens, page_size, rounding_mode="floor")
+    tail_tokens = torch.remainder(lens, page_size)
+    local_full_pages = torch.div(full_pages, dcp_size, rounding_mode="floor")
+    local_full_pages = local_full_pages + (dcp_rank < full_pages % dcp_size)
+    owns_tail = full_pages % dcp_size == dcp_rank
+    return local_full_pages * page_size + torch.where(
+        owns_tail, tail_tokens, torch.zeros_like(tail_tokens)
+    )
+
+
+def localize_page_table_for_dcp_(
+    page_table: torch.Tensor,
+    dcp_size: int,
+    dcp_rank: int,
+) -> None:
+    """Localize a global page table in place for whole-page DCP ownership."""
+    if dcp_size == 1:
+        return
+    if not 0 <= dcp_rank < dcp_size:
+        raise ValueError(f"dcp_rank must be in [0, {dcp_size}), got {dcp_rank}")
+
+    local_pages = page_table[:, dcp_rank::dcp_size].clone()
+    valid = local_pages >= 0
+    local_pages = torch.where(
+        valid,
+        torch.div(local_pages, dcp_size, rounding_mode="floor"),
+        local_pages,
+    )
+    page_table.fill_(-1)
+    page_table[:, : local_pages.shape[1]].copy_(local_pages)
+
+
 def filter_dcp_local_kv_indices(kv_indices: torch.Tensor):
     if dcp_enabled():
         kv_indices = (

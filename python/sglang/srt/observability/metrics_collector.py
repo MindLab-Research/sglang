@@ -1554,8 +1554,13 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
                 60,
                 80,
                 100,
+                150,
                 200,
+                300,
                 400,
+                600,
+                800,
+                1200,
             ]
 
         if bucket_e2e_request_latency is None:

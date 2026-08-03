@@ -409,7 +409,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
             return False
-        if self.require_mlp_tp_gather:
+        if self.require_mlp_tp_gather and not forward_batch.forward_mode.is_target_verify():
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
                 if self.model_runner.spec_algorithm.is_eagle()
@@ -418,6 +418,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 else max(forward_batch.global_num_tokens_cpu)
             )
         else:
+            # target_verify: use the real request count (global_num_tokens_cpu is
+            # padded to max_running_requests → forces bs=max_bs → q_offset=64*ndt
+            # hits DeepGEMM's paged-MQA batch boundary).
             cuda_graph_bs = forward_batch.batch_size
 
         graph_key = cuda_graph_bs
@@ -937,7 +940,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         raw_bs = forward_batch.batch_size
         raw_num_token = raw_bs * self.num_tokens_per_bs
 
-        if self.require_mlp_tp_gather:
+        if self.require_mlp_tp_gather and not forward_batch.forward_mode.is_target_verify():
             max_num_tokens = max(forward_batch.global_num_tokens_cpu)
             max_batch_size = (
                 max_num_tokens / self.num_tokens_per_bs
@@ -948,6 +951,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
             bs = self._pad_to_bucket(int(max_batch_size), self.capture_bs)
         else:
+            # target_verify pads global_num_tokens_cpu to max_running_requests,
+            # which forces bs to max_bs (64) → q_offset = 64*ndt hits DeepGEMM's
+            # paged-MQA batch boundary → probabilistic garbling at high concurrency.
+            # Use the real request count instead.
             bs = self._pad_to_bucket(raw_bs, self.capture_bs)
 
         self.buffer_registry.fill_from(

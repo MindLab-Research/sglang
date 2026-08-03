@@ -13,6 +13,7 @@ from sglang.srt.lora.triton_ops import (
 )
 from sglang.srt.lora.utils import (
     LoRABatchInfo,
+    generate_sequence_lengths,
     get_lm_head_pruned_lens,
     merge_and_chunk_segments,
 )
@@ -255,17 +256,26 @@ class TritonLoRABackend(BaseLoRABackend):
             batch_info.bs = forward_batch.batch_size
             batch_info.num_segments = forward_batch.batch_size
         else:
-            max_len = (
-                # Calculate max_len from the CPU copy to avoid D2H transfer.
-                max(forward_batch.extend_seq_lens_cpu)
-                if forward_batch.forward_mode.is_extend()
-                else 1
-            )
-            seg_lens = (
-                forward_batch.extend_seq_lens
-                if forward_batch.forward_mode.is_extend()
-                else torch.ones(bs, dtype=torch.int32, device=self.device)
-            )
+            if forward_batch.forward_mode.is_target_verify():
+                seg_lens_cpu = generate_sequence_lengths(
+                    forward_batch, device=torch.device("cpu")
+                )
+                max_len = (
+                    int(seg_lens_cpu.max().item()) if seg_lens_cpu.numel() > 0 else 1
+                )
+                seg_lens = seg_lens_cpu.to(self.device, non_blocking=True)
+            else:
+                max_len = (
+                    # Calculate max_len from the CPU copy to avoid D2H transfer.
+                    max(forward_batch.extend_seq_lens_cpu)
+                    if forward_batch.forward_mode.is_extend()
+                    else 1
+                )
+                seg_lens = (
+                    forward_batch.extend_seq_lens
+                    if forward_batch.forward_mode.is_extend()
+                    else torch.ones(bs, dtype=torch.int32, device=self.device)
+                )
             seg_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device=self.device)
             seg_indptr[1:] = torch.cumsum(seg_lens, dim=0)
 

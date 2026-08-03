@@ -157,7 +157,7 @@ if _use_aiter:
 
 
 if _is_cuda:
-    from sgl_kernel import fp8_blockwise_scaled_mm, fp8_scaled_mm
+    from sgl_kernel import fp8_blockwise_scaled_grouped_mm as fp8_blockwise_scaled_mm, fp8_scaled_mm
 
     from sglang.srt.utils.patch_torch import register_fake_if_exists
 

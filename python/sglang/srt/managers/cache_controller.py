@@ -187,6 +187,7 @@ class PrefetchOperation(StorageOperation):
 
         self._lock = threading.Lock()
         self._terminated_flag = False
+        self._io_finished_event = threading.Event()
         self.start_time = time.monotonic()
 
         super().__init__(host_indices, token_ids, last_hash, prefix_keys=prefix_keys)
@@ -204,6 +205,12 @@ class PrefetchOperation(StorageOperation):
 
     def is_terminated(self) -> bool:
         return self._terminated_flag
+
+    def mark_io_finished(self) -> None:
+        self._io_finished_event.set()
+
+    def is_io_finished(self) -> bool:
+        return self._io_finished_event.is_set()
 
 
 class HiCacheController:
@@ -237,6 +244,11 @@ class HiCacheController:
 
         if isinstance(mem_pool_device, HybridLinearKVPool):
             mem_pool_device = mem_pool_device.full_kv_pool
+        from sglang.srt.mem_cache.cp_layersplit_pool import CpLayerSplitKVPool
+
+        self.is_cp_layersplit = isinstance(mem_pool_device, CpLayerSplitKVPool)
+        if self.is_cp_layersplit:
+            mem_pool_device = mem_pool_device.owned_pool
         self.mem_pool_device = mem_pool_device
         self.mem_pool_host = mem_pool_host
         self.write_policy = write_policy
@@ -621,6 +633,7 @@ class HiCacheController:
             tp_lcm_size=tp_lcm_size,
             should_split_heads=should_split_heads,
             extra_config=storage_backend_extra_config,
+            is_cp_layersplit=self.is_cp_layersplit,
         )
 
     def reset(self):
@@ -972,13 +985,25 @@ class HiCacheController:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
                 if operation is None:
                     continue
-                self._page_transfer(operation)
-                # operation terminated by controller, release pre-allocated memory
-                self.append_host_mem_release(
-                    operation.host_indices[operation.completed_tokens :]
-                )
             except Empty:
                 continue
+            try:
+                self._page_transfer(operation)
+            except Exception:
+                logger.exception(
+                    "Storage prefetch I/O failed for req=%s",
+                    operation.request_id,
+                )
+                operation.mark_terminate()
+            finally:
+                try:
+                    # The scheduler owns the completed prefix. The worker owns
+                    # and releases only the unfilled tail.
+                    self.append_host_mem_release(
+                        operation.host_indices[operation.completed_tokens :]
+                    )
+                finally:
+                    operation.mark_io_finished()
 
     def prefetch_rate_limited(self) -> bool:
         """
@@ -1026,40 +1051,52 @@ class HiCacheController:
         while (not self.storage_stop_event.is_set()) or not self.prefetch_queue.empty():
             try:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
-                if operation is None:
-                    continue
-                hash_value, storage_hit_count = self._storage_hit_query(operation)
-                storage_hit_count_tensor = torch.tensor(
-                    storage_hit_count, dtype=torch.int
-                )
-                self._all_reduce_prefetch_groups(
-                    storage_hit_count_tensor, torch.distributed.ReduceOp.MIN
-                )
-                storage_hit_count = storage_hit_count_tensor.item()
+            except Empty:
+                continue
+            if operation is None:
+                continue
+
+            try:
+                if operation.is_terminated():
+                    hash_value, storage_hit_count = [], 0
+                else:
+                    hash_value, storage_hit_count = self._storage_hit_query(operation)
 
                 if storage_hit_count < self.prefetch_threshold:
-                    # not to prefetch if not enough benefits
+                    operation.mark_terminate()
                     self.prefetch_revoke_queue.put(operation.request_id)
                     self.append_host_mem_release(operation.host_indices)
+                    operation.mark_io_finished()
                     logger.debug(
-                        f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
+                        "Revoking prefetch for request %s due to insufficient "
+                        "hits (%s).",
+                        operation.request_id,
+                        storage_hit_count,
                     )
                 else:
                     operation.hash_value = hash_value[
                         : (storage_hit_count // self.page_size)
                     ]
-                    # free the pre-allocated memory for pages that are not hit
+                    # Free pages that L3 did not report as hits.
                     self.append_host_mem_release(
                         operation.host_indices[storage_hit_count:]
                     )
                     operation.host_indices = operation.host_indices[:storage_hit_count]
                     logger.debug(
-                        f"Prefetching {len(operation.hash_value)} pages for request {operation.request_id}."
+                        "Prefetching %s pages for request %s.",
+                        len(operation.hash_value),
+                        operation.request_id,
                     )
                     self.prefetch_buffer.put(operation)
-
-            except Empty:
-                continue
+            except Exception:
+                logger.exception(
+                    "Storage prefetch query failed for req=%s",
+                    operation.request_id,
+                )
+                operation.mark_terminate()
+                self.prefetch_revoke_queue.put(operation.request_id)
+                self.append_host_mem_release(operation.host_indices)
+                operation.mark_io_finished()
 
     def write_storage(
         self,

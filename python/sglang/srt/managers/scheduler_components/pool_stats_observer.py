@@ -216,8 +216,11 @@ class SchedulerPoolStatsObserver:
     def _get_token_info(self) -> PoolStats:
         available_size = self.token_to_kv_pool_allocator.available_size()
         evictable_size = self.tree_cache.evictable_size()
-        num_used = self.max_total_num_tokens - (available_size + evictable_size)
-        token_usage = num_used / self.max_total_num_tokens
+        # DCP: allocator.size = max_total * dcp_size (virtual slots). Report
+        # usage over the virtual space so it's in [0, 1].
+        total = self.token_to_kv_pool_allocator.size
+        num_used = total - (available_size + evictable_size)
+        token_usage = num_used / total
         return PoolStats(
             full_num_used=num_used,
             full_token_usage=token_usage,

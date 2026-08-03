@@ -591,12 +591,6 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         )
         self.draft_extend_attn_backend.init_forward_metadata_out_graph(fb_view)
 
-        # Snapshot built -- the forward is done reading the shared pool. Publish
-        # a read-done event the scheduler's WAR barrier waits on.
-        read_done = self.device_module.Event()
-        read_done.record()
-        self.model_runner.war_fastpath_read_done_event = read_done
-
         self.raw_bs = raw_bs
         self.bs = bs
         shape_key = self._make_graph_key(bs)
@@ -609,6 +603,17 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         )
         with timer_ctx:
             out = self._replay_graph(shape_key, forward_batch)
+
+        # [FIX-EAGLE] Publish read-done AFTER graph replay. The WAR barrier
+        # must wait for the static-buffer reads inside _replay_graph, not just
+        # the pre-replay metadata snapshot. Publishing before replay lets the
+        # next batch's fill_input_buffers / result processing overwrite the
+        # shared static buffers while this batch's graph is still reading them
+        # -> probabilistic garbled output (concurrency-dependent: interleaved
+        # bs=1 batches widen the race window).
+        read_done = self.device_module.Event()
+        read_done.record()
+        self.model_runner.war_fastpath_read_done_event = read_done
 
         out = LogitsProcessorOutput(
             next_token_logits=out.next_token_logits[:num_tokens],

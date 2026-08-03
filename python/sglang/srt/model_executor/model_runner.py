@@ -379,8 +379,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.gpu_id = gpu_id
         self.tp_rank = tp_rank
         self.tp_size = tp_size
-        self.dcp_size = server_args.dcp_size
-        self.dcp_rank = self.tp_rank % self.dcp_size
+        # DCP shards only the TARGET's KV; draft must stay unsharded (dcp_size=1).
+        self.dcp_size = 1 if is_draft_worker else server_args.dcp_size
+        self.dcp_rank = 0 if is_draft_worker else (self.tp_rank % self.dcp_size)
         self.moe_ep_rank = moe_ep_rank
         self.moe_ep_size = moe_ep_size
         self.dp_rank = dp_rank
@@ -844,6 +845,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.memory_pool_config = memory_pool_config
 
         self.init_memory_pool(self.pre_model_load_memory)
+
+        # DCP: warm up the DCP group's NCCL communicator so the first
+        # all_gather during decode doesn't crash with ncclCommInitRankConfig.
+        if self.dcp_size > 1:
+            from sglang.srt.distributed.parallel_state import get_dcp_group
+            _warmup = torch.zeros(1, device=self.device)
+            get_dcp_group().all_reduce(_warmup)
+            torch.cuda.synchronize()
 
         # Must be called AFTER init_memory_pool so the pool object exists for
         # canary to monkey-patch, and BEFORE init_decode_cuda_graph so warmup
@@ -2267,6 +2276,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         from sglang.srt.lora.layers import FusedMoEWithLoRA
 
         max_bs = self.server_args.cuda_graph_config.decode.max_bs
+        if self.spec_algorithm.is_speculative():
+            sdt = self.server_args.speculative_num_draft_tokens
+            if sdt is not None and sdt > 1:
+                max_bs = max_bs * sdt
         max_loras = self.server_args.max_loras_per_batch
         for module in self.model.modules():
             if isinstance(module, FusedMoEWithLoRA):
@@ -2392,6 +2405,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.is_hybrid_swa:
             return self.full_max_total_num_tokens or self.swa_max_total_num_tokens
         else:
+            # DCP: allocator has max_total * dcp_size virtual slots; effective
+            # capacity = max_total * dcp_size (each rank stores 1/dcp of tokens).
+            if self.dcp_size > 1:
+                return self.max_total_num_tokens * self.dcp_size
             return self.max_total_num_tokens
 
     @property

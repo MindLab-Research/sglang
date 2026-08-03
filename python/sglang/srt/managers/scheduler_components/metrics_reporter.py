@@ -755,7 +755,11 @@ class SchedulerMetricsReporter:
         cache_hit_rate = 0.0
 
         if self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
-            msg += f"pre-allocated usage: {self.scheduler.disagg_decode_prealloc_queue.num_tokens_pre_allocated / self.scheduler.max_total_num_tokens:.2f}, "
+            # DCP: each rank stores 1/dcp_size of tokens, so the pre-allocated
+            # global token count must be normalized by max_total * dcp_size.
+            _dcp = getattr(self.scheduler.server_args, "dcp_size", 1) or 1
+            _norm = self.scheduler.max_total_num_tokens * _dcp
+            msg += f"pre-allocated usage: {self.scheduler.disagg_decode_prealloc_queue.num_tokens_pre_allocated / _norm:.2f}, "
             msg += f"#prealloc-req: {len(self.scheduler.disagg_decode_prealloc_queue.queue)}, "
             msg += f"#transfer-req: {len(self.scheduler.disagg_decode_transfer_queue.queue)}, "
             msg += f"#retracted-req: {len(self.scheduler.disagg_decode_prealloc_queue.retracted_queue)}, "

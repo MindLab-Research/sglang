@@ -27,6 +27,15 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
+
+_dcp_debug = None
+def _dcp_log(msg, *args, **kwargs):
+    global _dcp_debug
+    if _dcp_debug is None:
+        import os
+        _dcp_debug = os.environ.get("SGLANG_DCP_DEBUG", "").lower() in ("1", "true", "yes")
+    if _dcp_debug:
+        logger.warning(msg, *args, **kwargs)
 import numpy as np
 import torch
 from torch.distributed import ProcessGroup
@@ -61,6 +70,7 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.dcp.comm import dcp_enabled, get_attention_dcp_world_size, get_attention_dcp_rank
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
@@ -478,7 +488,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         return kv_manager
 
     def add(self, req: Req, is_retracted: bool = False) -> None:
-        """Add a request to the pending queue."""
+        """Add a request to the decode queue."""
         if self._check_if_req_exceed_kv_capacity(req):
             return
 
@@ -557,8 +567,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         return decode_req
 
     def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
-        if len(req.origin_input_ids) > self.max_total_num_tokens:
-            message = f"Request {req.rid} exceeds the maximum number of tokens: {len(req.origin_input_ids)} > {self.max_total_num_tokens}"
+        # DCP: allocator has max_total * dcp_size virtual slots, so effective
+        # capacity = max_total * dcp_size (each rank stores 1/dcp of tokens).
+        _capacity = self.max_total_num_tokens * getattr(
+            self.scheduler.server_args, "dcp_size", 1
+        )
+        if len(req.origin_input_ids) > _capacity:
+            message = f"Request {req.rid} exceeds the maximum number of tokens: {len(req.origin_input_ids)} > {_capacity}"
             logger.error(message)
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
             self.scheduler.output_streamer.stream_output([req], req.return_logprob)
@@ -623,6 +638,20 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if uses_swa_tail_prealloc and swa_required > swa_allocatable_tokens:
                 break
 
+            # Radix-aware resume: re-match + inc_lock_ref to balance the
+            # dec_lock_ref that release_req did during retract. MUST be after
+            # the break checks — only run when resume succeeds, otherwise
+            # repeated match+inc on failed resumes leaks locks (KV full crash).
+            if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
+                result = match_prefix_for_req(
+                    self.tree_cache,
+                    req,
+                    req.origin_input_ids,
+                    cow_mamba=self.tree_cache.supports_mamba(),
+                    include_req=True,
+                )
+                self.tree_cache.inc_lock_ref(result.last_device_node)
+
             resumed_reqs.append(req)
             indices_to_remove.add(i)
             req.is_retracted = False
@@ -649,15 +678,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             return
 
         # Still poll if any receiver was aborted, otherwise it stays stuck.
+        # Still poll if any receiver was aborted, otherwise it stays stuck.
         if all(decode_req.waiting_for_input for decode_req in self.queue) and not any(
             decode_req.kv_receiver.conclude_state == KVPoll.Failed
             for decode_req in self.queue
         ):
             return
 
-        polls = poll_and_all_reduce(
-            [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
-        )
+        # Local-only poll: no cross-rank all_reduce. Each rank's receivers
+        # connect to different prefill ranks, so handshake state is per-rank.
+        # The all_reduce here caused deadlocks when different ranks' prealloc
+        # queues diverged (some empty -> 0 all_reduce, others non-empty -> 1).
+        polls = [
+            decode_req.kv_receiver.poll()
+            for decode_req in self.queue
+        ]
 
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
@@ -725,7 +760,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 error_msg = f"Could not fetch prefill parallel info from {bootstrap_addr} after {count} attempts"
                 logger.error(error_msg)
                 for decode_req in reqs:
-                    decode_req.kv_receiver.abort()
+                    decode_req.kv_receiver.abort() if decode_req.kv_receiver is not None else None
                 del self._ensure_retry_count[bootstrap_addr]
                 del self._ensure_last_attempt_time[bootstrap_addr]
             else:
@@ -886,7 +921,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 # protocol's `decode_prefix_len`. The [prefix_len, total)
                 # gap is filled by HiCache loadback later.
                 prefix_len = prefix_match.l1_prefix_len
-                total_prefix_len = prefix_match.decode_prefix_len
+                # Exclude l3 from the prefill promise: query_storage_hit_length is
+                # optimistic (pages may be evicted between query and prefetch), so
+                # the actual load may fall short. By promising only l1+l2, prefill
+                # transfers [l1+l2, fill_len) which covers the l3 range too.
+                total_prefix_len = prefix_match.l1_prefix_len + prefix_match.l2_host_hit_length
 
                 fill_len = origin_input_len + max(len(decode_req.req.output_ids) - 1, 0)
                 required_alloc_tokens = self._required_alloc_tokens(
@@ -974,7 +1013,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 # SWA budget uses simple decrement (no radix cache eviction in
                 # the SWA pool, so page-rounding drift is negligible).
                 swa_allocatable_tokens -= swa_required
-            decode_req.req.cache_protected_len = total_prefix_len
+            # Protect the full prefix (including l3) from cache_unfinished_req
+            # overwrite. total_prefix_len = l1+l2 (l3 excluded from prefill promise
+            # so PD covers l3), but cache_protected_len must include l3_query to
+            # prevent cache_unfinished_req from replacing PD indices with tree data.
+            decode_req.req.cache_protected_len = (
+                prefix_match.decode_prefix_len
+                if prefix_match is not None
+                else total_prefix_len
+            )
 
             page_size = self.token_to_kv_pool_allocator.page_size
             kv_transfer_page_size = page_size
@@ -986,6 +1033,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     "hisparse_page_size",
                     page_size,
                 )
+            if dcp_enabled():
+                # DCP: use physical page_size (64) for PD transfer, not the
+                # allocator's page_size (128 = 64*dcp). PD transfer writes full
+                # 64-token pages in contiguous layout; inplace_shard_dcp in
+                # _commit_transfer_to_req converts to DCP layout after transfer.
+                # Must run AFTER hisparse check so it takes priority.
+                kv_transfer_page_size = self.token_to_kv_pool.page_size
                 # Must cast to int32 for ZMQ serialization -- from_zmq reads np.int32.
                 kv_indices = (
                     dst_kv_indices[: origin_input_len - prefix_len]
@@ -1092,6 +1146,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
             assert decode_req.metadata_buffer_index is not None
             page_indices = kv_to_page_indices(kv_indices, kv_transfer_page_size)
+            if dcp_enabled():
+                import logging as _lg
+                _lg.getLogger(__name__).warning(
+                    f"[DCP-PD-IDX] rid={decode_req.req.rid} prefix_len={total_prefix_len}"
+                    f" origin_len={origin_input_len} to_send={len(kv_indices)}"
+                    f" page_size={kv_transfer_page_size}"
+                    f" page_indices={page_indices.tolist()}"
+                    f" kv_indices[:8]={kv_indices[:8].tolist()}"
+                    f" kv_indices[-4:]={kv_indices[-4:].tolist()}"
+                )
+                # PD transfer with conn.py rank-filtering + //dcp mapping
+                # writes KV directly to DCP page layout. No inplace_shard_dcp
+                # needed — it would move data to page_idx//dcp//dcp (wrong).
+                decode_req.dcp_kv_shard_pages = None
+                decode_req.dcp_state_shard_pages = None
             decode_req.kv_receiver.send_metadata(
                 page_indices,
                 decode_req.metadata_buffer_index,
@@ -1508,7 +1577,47 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 ):
                     self.staging_handler.register_decode_req(dr.req.bootstrap_room, dr)
 
+    def _inplace_shard_dcp_kv(self, decode_req: DecodeRequest) -> None:
+        """Per-request reshard (kept for fallback). Use batch_shard_all for batch."""
+        self._shard_one(decode_req)
+
+    def _shard_one(self, decode_req: DecodeRequest) -> None:
+        """Shard one request's KV + index_k."""
+        from sglang.srt.layers.attention.dsa.triton_kernel import inplace_shard_dcp
+        pool = self.scheduler.tp_worker.model_runner.token_to_kv_pool
+        page_size = pool.page_size
+        dcp_rank = get_attention_dcp_rank()
+        dcp_size = get_attention_dcp_world_size()
+        kv_pages = getattr(decode_req, "dcp_kv_shard_pages", None)
+        if kv_pages is None or kv_pages.numel() == 0:
+            return
+        kv_dim = pool.kv_cache_dim
+        state_dim = 132
+        for layer_id in range(pool.layer_num):
+            buf = pool.kv_buffer[layer_id]
+            if buf.dtype != torch.uint8:
+                buf = buf.view(torch.uint8)
+            inplace_shard_dcp(buf, kv_pages, dcp_rank, dcp_size, page_size=page_size, dim=kv_dim)
+            state_buf = pool.get_index_k_with_scale_buffer(layer_id)
+            inplace_shard_dcp(state_buf.view(torch.uint8), kv_pages, dcp_rank, dcp_size, page_size=page_size, dim=state_dim)
+
+    def batch_shard_all(self, decode_reqs: list) -> None:
+        """Apply the legacy post-transfer reshard only when a request needs it.
+
+        The normal DCP Mooncake path writes both MLA KV and DSA index_k directly
+        into rank-local pages, so its shard-page marker is None and this is a
+        no-op. Never clear index_k here: the transferred prefix state is required
+        by the first decode step.
+        """
+        if not dcp_enabled() or not decode_reqs:
+            return
+        for decode_req in decode_reqs:
+            self._shard_one(decode_req)
+
     def _commit_transfer_to_req(self, decode_req: DecodeRequest):
+        if dcp_enabled():
+            pass  # Reshard deferred to batch_shard_all() after pop_transferred loop
+        _dcp_log(f"[DCP-COMMIT] req={decode_req.req.rid} dcp={dcp_enabled()}")
         idx = decode_req.metadata_buffer_index
         (
             output_id,
@@ -1661,17 +1770,30 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         kv_manager._staging_handler = self.staging_handler
 
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
+        _shard_reqs: List[DecodeRequest] = []  # collected for batch reshard
         if not self.queue:
+            from sglang.srt.disaggregation.utils import _padded_all_reduce_min
+            _padded_all_reduce_min([], self.gloo_group)
             return []
 
         if self.scheduler.enable_decode_hicache:
-            self._process_hicache_local_restores(
-                [
-                    decode_req
-                    for decode_req in self.queue
-                    if rids_to_check is None or decode_req.req.rid in rids_to_check
-                ]
-            )
+            try:
+                self._process_hicache_local_restores(
+                    [
+                        decode_req
+                        for decode_req in self.queue
+                        if rids_to_check is None or decode_req.req.rid in rids_to_check
+                    ]
+                )
+            except Exception:
+                logger.exception(
+                    "HiCache local restore failed; degrading to direct transfer"
+                )
+                # Ensure gloo all_reduce below is still reached: mark all
+                # PENDING restores as READY so they proceed to normal transfer.
+                for dr in self.queue:
+                    if dr.hicache_restore_status == HiCacheRestoreResult.PENDING:
+                        dr.hicache_restore_status = HiCacheRestoreResult.READY
 
         if self.enable_staging:
             polls = self._poll_with_staging()
@@ -1749,6 +1871,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 else:
                     transferred_reqs.append(decode_req.req)
+                    _shard_reqs.append(decode_req)
             elif poll in [
                 KVPoll.Bootstrapping,
                 KVPoll.WaitingForInput,
@@ -1776,6 +1899,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
 
+        # Batch reshard: process all committed requests' KV at once
+        # (150 kernel launches total instead of 150 per request)
+        # Sync ensures RDMA writes are visible to GPU before reshard reads
+        if _shard_reqs:
+            torch.cuda.synchronize()  # RDMA → GPU coherency
+            self.batch_shard_all(_shard_reqs)
+
         return transferred_reqs
 
     def release_memory_occupation(self):
@@ -1797,12 +1927,23 @@ class SchedulerDisaggregationDecodeMixin:
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             self.process_decode_queue()
+
+            # Iteration barrier: before _engine_paused so all ranks participate
+            _eb = torch.tensor(0, dtype=torch.int, device="cpu")
+            torch.distributed.all_reduce(_eb, op=torch.distributed.ReduceOp.MIN,
+                                         group=self.tp_cpu_group)
+
             if self._engine_paused:
                 continue
 
             # Get the next batch to run
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
+
+            # Log request boundaries for diff analysis
+            if batch and batch.reqs:
+                rids = [r.req.rid[:8] for r in batch.reqs]
+                logger.info(f"[DCP-BOUNDARY] ===== new decode batch rids={rids} =====")
 
             # Launch the current batch
             if batch:
@@ -1828,11 +1969,26 @@ class SchedulerDisaggregationDecodeMixin:
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+
+            # Iteration barrier: AFTER recv_requests broadcast, BEFORE
+            # process_decode_queue. All ranks must synchronize here before
+            # entering pop_transferred's _padded_all_reduce_min. This prevents
+            # cross-iteration collective drift: if one rank's zmq recv is
+            # slow/stalled, the barrier holds fast ranks here so they cannot
+            # race ahead into pop_transferred's all_reduce (same gloo group:
+            # tp_cpu_group == attn_tp_cpu_group when no attention CP) and desync
+            # the collective sequence. Moving the barrier before
+            # process_decode_queue ensures pop_transferred's all_reduce is always
+            # the Nth collective across all ranks, never shifted by recv_requests
+            # latency variance.
+            _eb = torch.tensor(0, dtype=torch.int, device="cpu")
+            torch.distributed.all_reduce(_eb, op=torch.distributed.ReduceOp.MIN,
+                                         group=self.tp_cpu_group)
+
             self.process_decode_queue()
+
             if self._engine_paused:
                 continue
-
-            self._apply_war_barrier()
 
             # Get the next batch to run
             batch = self.get_next_disagg_decode_batch_to_run()
@@ -1846,6 +2002,7 @@ class SchedulerDisaggregationDecodeMixin:
             # Launch the current batch
             if batch:
                 batch_result = self.run_batch(batch)
+                self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
@@ -1861,7 +2018,6 @@ class SchedulerDisaggregationDecodeMixin:
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             self.launch_batch_sample_if_needed(batch_result)
 
-            # Update last_batch
             self.last_batch = batch
 
     def _run_batch_prebuilt(
@@ -1958,6 +2114,12 @@ class SchedulerDisaggregationDecodeMixin:
         if len(can_run_list) == 0:
             return None
 
+        logger.info(
+            "[DEBUG-CAN] can_run=%s num_not_used=%s pool_avail=%s",
+            len(can_run_list), num_not_used_batch,
+            self.req_to_token_pool.available_size(),
+        )
+
         set_time_batch(can_run_list, "set_forward_entry_time")
 
         # construct a schedule batch with those requests and mark as decode
@@ -1970,6 +2132,10 @@ class SchedulerDisaggregationDecodeMixin:
             self.enable_overlap,
             self.spec_algorithm,
         )
+        logger.info(
+            "[DEBUG-INIT] init_new_reqs=%s can_run=%s",
+            len(new_batch.reqs), len(can_run_list),
+        )
 
         # construct fake completed prefill
         new_batch.prepare_for_prebuilt()
@@ -1979,7 +2145,10 @@ class SchedulerDisaggregationDecodeMixin:
 
     def process_decode_queue(self: Scheduler):
         if self.enable_decode_hicache:
-            self.tree_cache.check_hicache_events()
+            try:
+                self.tree_cache.check_hicache_events()
+            except Exception:
+                logger.exception("check_hicache_events failed; continuing")
 
         if self.server_args.disaggregation_decode_enable_offload_kvcache:
             self.decode_offload_manager.check_offload_progress()
@@ -1988,7 +2157,9 @@ class SchedulerDisaggregationDecodeMixin:
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
         self.waiting_queue.extend(resumed_reqs)
         if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
-            # if there are still retracted requests, we do not allocate new requests
+            # Compensate pop_transferred's _padded_all_reduce_min to keep ranks synced
+            from sglang.srt.disaggregation.utils import _padded_all_reduce_min
+            _padded_all_reduce_min([], self.disagg_decode_transfer_queue.gloo_group)
             return
 
         if not hasattr(self, "polling_count"):
@@ -2000,13 +2171,30 @@ class SchedulerDisaggregationDecodeMixin:
         self.polling_count = (self.polling_count + 1) % self.polling_interval
 
         if self.polling_count % self.polling_interval == 0:
-            req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
-            self.disagg_decode_transfer_queue.extend(req_conns)
+            # CRITICAL ORDERING: pop_transferred BEFORE pop_preallocated.
+            # pop_transferred's _padded_all_reduce_min is a gloo collective that
+            # all TP ranks must reach simultaneously. pop_preallocated's
+            # match_prefix has variable latency across ranks (HiCache L3 storage
+            # I/O, radix tree traversal). If match_prefix runs first, fast ranks
+            # reach the all_reduce while slow ranks are still in match_prefix,
+            # stalling the collective (looks like deadlock under watchdog).
+            # By polling the transfer queue first, the all_reduce completes
+            # before match_prefix starts. Newly preallocated requests are added
+            # to the transfer queue after pop_transferred, so they are polled
+            # in the next iteration (1-step delay, negligible).
             transferred_reqs = (
                 self.disagg_decode_transfer_queue.pop_transferred()
             )  # the requests which kv has arrived
-            if self.enable_hisparse:
-                for req in transferred_reqs:
-                    # Direct-to-host: KV data already in host pool, skip staging
-                    self.hisparse_coordinator.admit_request_direct(req)
-            self.waiting_queue.extend(transferred_reqs)
+            req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
+            self.disagg_decode_transfer_queue.extend(req_conns)
+        else:
+            # Compensate pop_transferred's _padded_all_reduce_min
+            from sglang.srt.disaggregation.utils import _padded_all_reduce_min
+            _padded_all_reduce_min([], self.disagg_decode_transfer_queue.gloo_group)
+            transferred_reqs = []
+
+        if self.enable_hisparse:
+            for req in transferred_reqs:
+                # Direct-to-host: KV data already in host pool, skip staging
+                self.hisparse_coordinator.admit_request_direct(req)
+        self.waiting_queue.extend(transferred_reqs)

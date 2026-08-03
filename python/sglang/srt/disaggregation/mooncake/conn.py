@@ -39,7 +39,7 @@ from sglang.srt.disaggregation.common.utils import (
 from sglang.srt.disaggregation.mooncake.utils import (
     check_mooncake_custom_mem_pool_enabled,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import DisaggregationMode, filter_kv_indices_for_dcp_rank
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
 from sglang.srt.observability.mooncake_trace import (
@@ -76,6 +76,10 @@ class TransferInfo:
     required_dst_info_num: int
     is_dummy: bool
     decode_prefix_len: Optional[int] = None
+    # DCP reshard (Phase 3): decode rank's dcp_size/dcp_rank, so prefill knows
+    # which token-shard (pos % dcp_size == dcp_rank) to extract per layer.
+    dcp_size: int = 1
+    dcp_rank: int = 0
     # Note: always put the optional staging field at the final (it will be set through 'STAGING_RSP' pkg when needed)
     staging: Optional[StagingTransferInfo] = None
 
@@ -91,6 +95,19 @@ class TransferInfo:
             dst_aux_index = int(msg[5].decode("ascii"))
             dst_state_indices = unpack_int_lists(msg[6], "i")
             is_dummy = False
+        # DCP fields (msg[9]/msg[10]) — absent in older prefill images → default 1/0.
+        _dcp_size = 1
+        _dcp_rank = 0
+        if len(msg) > 9 and msg[9] not in (b"", None):
+            try:
+                _dcp_size = int(msg[9].decode("ascii"))
+            except (ValueError, UnicodeDecodeError):
+                pass
+        if len(msg) > 10 and msg[10] not in (b"", None):
+            try:
+                _dcp_rank = int(msg[10].decode("ascii"))
+            except (ValueError, UnicodeDecodeError):
+                pass
         return cls(
             room=int(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
@@ -104,6 +121,8 @@ class TransferInfo:
             decode_prefix_len=(
                 int(msg[8].decode("ascii")) if len(msg) > 8 and msg[8] != b"" else None
             ),
+            dcp_size=_dcp_size,
+            dcp_rank=_dcp_rank,
         )
 
 
@@ -649,6 +668,9 @@ class MooncakeKVManager(CommonKVManager):
         def set_transfer_blocks(
             src_ptr: int, dst_ptr: int, item_len: int
         ) -> List[Tuple[int, int, int]]:
+            # DCP: prefill_kv_indices and dst_kv_indices are already filtered
+            # and mapped to physical slots by filter_kv_indices_for_dcp_rank
+            # in the transfer_worker loop. No additional //dcp needed here.
             transfer_blocks = []
             for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
                 src_addr = src_ptr + int(prefill_index[0]) * item_len
@@ -698,12 +720,13 @@ class MooncakeKVManager(CommonKVManager):
         dst_kv_ptrs: list[int],
         dst_kv_indices: npt.NDArray[np.int32],
         executor: concurrent.futures.ThreadPoolExecutor,
+        item_lens: Optional[list] = None,
     ):
         return self._send_kvcache_generic(
             mooncake_session_id=mooncake_session_id,
             src_data_ptrs=self.kv_args.kv_data_ptrs,
             dst_data_ptrs=dst_kv_ptrs,
-            item_lens=self.kv_args.kv_item_lens,
+            item_lens=item_lens if item_lens is not None else self.kv_args.kv_item_lens,
             prefill_data_indices=prefill_kv_indices,
             dst_data_indices=dst_kv_indices,
             executor=executor,
@@ -1019,6 +1042,17 @@ class MooncakeKVManager(CommonKVManager):
                     )
                 src_indices = list(indices)
                 dst_indices_local = list(dst_indices)
+
+                # DCP: filter state indices by decode-side page VALUE parity.
+                # Must match the KV DCP filter exactly (rank owns page_idx % dcp).
+                _dcp_size = getattr(req, "dcp_size", 1)
+                _dcp_rank = getattr(req, "dcp_rank", 0)
+                if _dcp_size > 1:
+                    _n = len(src_indices)
+                    _dst_arr = np.asarray(dst_indices_local, dtype=np.int32)
+                    _mask = (_dst_arr % _dcp_size) == _dcp_rank
+                    src_indices = [src_indices[i] for i in range(_n) if _mask[i]]
+                    dst_indices_local = [dst_indices_local[i] // _dcp_size for i in range(_n) if _mask[i]]
                 if (
                     st == StateType.C128_STATE
                     and len(src_indices) == 0
@@ -1293,22 +1327,50 @@ class MooncakeKVManager(CommonKVManager):
 
                         chunked_dst_kv_indice = req.dst_kv_indices[kv_chunk.index_slice]
 
-                        # NOTE: This is temporarily a workaround to deal with the case where the prefill_kv_indices
-                        # is mismatched with the dst_kv_indices when page size > 1, this should never happen.
-                        if len(chunked_dst_kv_indice) < len(
-                            kv_chunk.prefill_kv_indices
-                        ):
-                            logger.warning(
-                                f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
-                            )
-                            kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices[
-                                : len(chunked_dst_kv_indice)
-                            ]
-
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
-                        if len(kv_chunk.prefill_kv_indices) == 0:
+
+                        _transfer_indices = kv_chunk.prefill_kv_indices
+                        _dst_indices = chunked_dst_kv_indice
+
+                        _dcp_size = getattr(req, "dcp_size", 1)
+                        _dcp_rank = getattr(req, "dcp_rank", 0)
+                        if _dcp_size > 1:
+                            # DCP reshard: filter by decode-side page VALUE parity.
+                            # DCP rank owns page_idx % dcp_size == rank. Using the
+                            # value (not array position) is correct because:
+                            #   - chunk index_slice is PREPILL-local (CP interleave
+                            #     gives each rank 1/8 tokens -> 1 page), so slicing
+                            #     req.dst_kv_indices by it misaligns vs decode pages
+                            #   - decode allocator page indices are globally
+                            #     sequential (0,1,2,...), so value % dcp_size
+                            #     correctly alternates rank0/rank1
+                            _n = len(_transfer_indices)
+                            _mask = (_dst_indices % _dcp_size) == _dcp_rank
+                            _orig_len = _n
+                            _transfer_indices = _transfer_indices[_mask]
+                            _dst_indices = (_dst_indices[_mask] // _dcp_size).astype(np.int32)
+                            logger.info(
+                                f"[DCP-XFER] room={kv_chunk.room} dcp_rank={_dcp_rank}"
+                                f" dcp_size={_dcp_size} cp_rank={self.attn_cp_rank}"
+                                f" pages: {_orig_len}→{len(_transfer_indices)}"
+                                f" | all_src={_transfer_indices[:5].tolist() if _orig_len>0 else []}"
+                                f" all_dst={chunked_dst_kv_indice[:5].tolist()}"
+                                f" src[0:3]={_transfer_indices[:3].tolist()}"
+                                f" dst[0:3]={_dst_indices[:3].tolist()}"
+                                f" max_dst={int(_dst_indices.max()) if len(_dst_indices)>0 else -1}"
+                            )
+
+                        if len(chunked_dst_kv_indice) < len(_transfer_indices):
+                            logger.warning(
+                                f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(transfer_indices) = {len(_transfer_indices)}"
+                            )
+                            _transfer_indices = _transfer_indices[
+                                : len(chunked_dst_kv_indice)
+                            ]
+
+                        if len(_transfer_indices) == 0:
                             ret = 0
                         elif self.is_mla_backend or (
                             self.attn_tp_size
@@ -1316,9 +1378,9 @@ class MooncakeKVManager(CommonKVManager):
                         ):
                             ret = self.send_kvcache(
                                 req.mooncake_session_id,
-                                kv_chunk.prefill_kv_indices,
+                                _transfer_indices,
                                 target_rank_registration_info.dst_kv_ptrs,
-                                chunked_dst_kv_indice,
+                                _dst_indices,
                                 executor,
                             )
                         elif (
@@ -1343,7 +1405,7 @@ class MooncakeKVManager(CommonKVManager):
                         else:
                             ret = self.send_kvcache_slice(
                                 req.mooncake_session_id,
-                                kv_chunk.prefill_kv_indices,
+                                _transfer_indices,
                                 target_rank_registration_info.dst_kv_ptrs,
                                 chunked_dst_kv_indice,
                                 target_rank_registration_info.dst_tp_rank,
@@ -1525,9 +1587,12 @@ class MooncakeKVManager(CommonKVManager):
                     if room not in self.transfer_infos:
                         self.transfer_infos[room] = {}
 
-                    self.transfer_infos[room][mooncake_session_id] = (
-                        TransferInfo.from_zmq(waiting_req_bytes)
-                    )
+                    tinfo = TransferInfo.from_zmq(waiting_req_bytes)
+                    self.transfer_infos[room][mooncake_session_id] = tinfo
+                    # Track decode-side DCP so prefill.py can send token-level indices
+                    if tinfo.dcp_size > 1:
+                        self.decode_dcp_size = tinfo.dcp_size
+                        self.decode_dcp_rank = tinfo.dcp_rank
                     # NOTE: after bootstrapping we can mark the req as waiting for input
                     if len(self.transfer_infos[room]) == required_dst_info_num:
                         self.req_to_decode_prefix_len[room] = next(
@@ -1921,6 +1986,11 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         ),
                         str(self.required_dst_info_num).encode("ascii"),
                         str(decode_prefix_len or 0).encode("ascii"),
+                        # DCP reshard fields (Phase 3): decode tells prefill its
+                        # dcp_size and dcp_rank so prefill can reshard the full-token
+                        # KV into the correct pos%N shard. Defaults to 1/0 (no DCP).
+                        str(getattr(self.kv_mgr, "dcp_size", 1)).encode("ascii"),
+                        str(getattr(self.kv_mgr, "dcp_rank", 0)).encode("ascii"),
                     ]
                 )
         self.init_time = time.time()
