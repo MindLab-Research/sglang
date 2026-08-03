@@ -283,3 +283,7 @@ test/registered/xpu/test_nvidia_nemotron_3_nano.py
 artifacts/
 .claude/scheduled_tasks.lock
 .humanize/
+
+# Triton autotune config JSON (causes EAGLE degradation, pip-installed)
+python/sglang/srt/**/configs/
+python/sglang/srt/**/csgmv_configs/

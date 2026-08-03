@@ -40,10 +40,10 @@ def set_mla_kv_buffer_kernel(
         tl.extra.cuda.gdc_wait()
 
     loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
-    is_valid = loc % DCP_WORLD_SIZE == DCP_RANK
-    safe_loc = tl.where(is_valid, loc, 0)
-    safe_loc = safe_loc // DCP_WORLD_SIZE
-    dst_ptr = kv_buffer_ptr + safe_loc * buffer_stride + offs
+    # DCP mapping is already done in set_mla_kv_buffer (Python-side):
+    # owner tokens → loc // DCP_WORLD_SIZE, non-owner → self.size (padding).
+    # Do NOT remap here — that would double-divide and write to wrong slots.
+    dst_ptr = kv_buffer_ptr + loc * buffer_stride + offs
 
     # Three-way branch to handle boundary correctly while preserving fast path
     if base + BLOCK <= nope_dim:
@@ -78,7 +78,7 @@ def set_mla_kv_buffer_kernel(
 
         src = tl.where(is_nope, src_nope, src_rope)
 
-    tl.store(dst_ptr, src, mask=mask & is_valid)
+    tl.store(dst_ptr, src, mask=mask)
 
     if USE_GDC:
         tl.extra.cuda.gdc_launch_dependents()

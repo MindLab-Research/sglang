@@ -1299,7 +1299,15 @@ class Scheduler(
         if not self.enable_overlap:
             return
 
-        self.batch_record_buf = [None] * 2
+        # [FIX-EAGLE] 16-slot record ring: EAGLE V2 under PD decode interleaves
+        # bs=1 batches round-robin across running requests (each verify/draft_extend
+        # is one request). A request's next iteration can be N-1 batches later
+        # (4 concurrency -> 3 later batches, 8 -> 7). next_draft_input GPU tensors
+        # (topk_p/topk_index/hidden_states/dsa_topk_indices) are pinned here so the
+        # caching allocator does not recycle their memory before the next iteration
+        # reads them on fwd_stream. 2 slots was too short -> probabilistic garbled
+        # output (digit runs / reasoning loops) under concurrency.
+        self.batch_record_buf = [None] * 16
         self.batch_record_ct = 0
 
     def maybe_init_ngram_embedding(self):
@@ -1523,11 +1531,12 @@ class Scheduler(
             dispatch_event_loop(self)
 
     def _apply_war_barrier(self):
-        # Wait for the prev forward to finish reading the shared buffers this
-        # iter's schedule will overwrite. Fast path: wait on the read-done event
-        # the forward published after its snapshot (non-spec: decode graph;
-        # spec: draft_extend), then clear it. Else fall back to whole-forward
-        # wait_stream.
+        # Called after each launch to order subsequent schedule_stream work
+        # (result processing and next-iteration shared-buffer writes) after the
+        # current forward's shared-buffer reads. Fast path: wait on the read-done
+        # event published after its snapshot (non-spec: decode graph;
+        # spec: draft_extend), then clear it. Otherwise wait_stream on the whole
+        # forward stream.
         if not self._war_barrier_enabled:
             return
         runner = self.model_worker.war_fastpath_runner
@@ -1590,8 +1599,6 @@ class Scheduler(
             if self._engine_paused:
                 continue
 
-            self._apply_war_barrier()
-
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -1613,6 +1620,7 @@ class Scheduler(
             # Launch the current batch
             if batch:
                 batch_result = self.run_batch(batch)
+                self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
@@ -1797,6 +1805,11 @@ class Scheduler(
             enable_hisparse=self.enable_hisparse,
             full_tokens_per_layer=self.full_tokens_per_layer,
             swa_tokens_per_layer=self.swa_tokens_per_layer,
+            # DCP: pool = max_total * dcp (same as Phase 1). The pool holds
+            # max_total * dcp slots — each rank writes 1/dcp of tokens, so
+            # effective capacity = max_total * dcp (dcp× non-DCP). This is
+            # the same per-GPU memory as non-DCP, but holds dcp× more tokens
+            # by eliminating TP KV duplication (MLA has 1 KV head → TP=8 = 8x dup).
             max_total_num_tokens=self.max_total_num_tokens * self.server_args.dcp_size,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
@@ -2861,6 +2874,21 @@ class Scheduler(
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
+
+        # FIX(#30760): check prefetch progress ONCE per tick for the whole
+        # waiting queue, OUTSIDE the per-rank loop.  check_prefetch_progress
+        # fires a TP-group collective; calling it inside the loop makes the
+        # collective count depend on per-rank local state
+        # (get_num_allocatable_reqs / available_size), which can drift across
+        # ranks and cause a permanent call-count-mismatch NCCL deadlock.
+        prefetch_progress_map = None
+        if self.enable_hicache_storage and hasattr(
+            self.tree_cache, "bulk_check_prefetch_progress"
+        ):
+            prefetch_progress_map = self.tree_cache.bulk_check_prefetch_progress(
+                [req.rid for req in self.waiting_queue]
+            )
+
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
@@ -2882,7 +2910,16 @@ class Scheduler(
                 ):
                     break
 
-            if self.enable_hicache_storage:
+            if prefetch_progress_map is not None:
+                prefetch_done = prefetch_progress_map.get(req.rid, True)
+                if not prefetch_done:
+                    # skip staging requests that are ongoing prefetch
+                    continue
+                # Pop the number of tokens loaded from storage (L3 hits)
+                loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
+                if loaded_tokens > 0:
+                    req.storage_hit_length = loaded_tokens
+            elif self.enable_hicache_storage:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
@@ -3147,7 +3184,7 @@ class Scheduler(
         attr_snapshot = [
             getattr(batch, f.name, None) for f in dataclasses.fields(batch)
         ]
-        self.batch_record_ct = (self.batch_record_ct + 1) % 2
+        self.batch_record_ct = (self.batch_record_ct + 1) % len(self.batch_record_buf)
         # List (not tuple) so that workers can register additional refs via
         # GenerationBatchResult.extra_keep_alive_refs after forward returns.
         self.batch_record_buf[self.batch_record_ct] = [batch, attr_snapshot]
@@ -3554,8 +3591,29 @@ class Scheduler(
         # memory leak check (skipped for hisparse — pool counters intentionally
         # diverge during host-backup, see _get_swa_token_info clamp).
         if not self.enable_hisparse:
+            # HiCache load_back allocates device tokens via cache_controller
+            # that are not yet in the radix tree's evictable/protected counters
+            # (in-flight DMA in ongoing_load_back). Account for them as
+            # "uncached" so the invariant check balances.
+            uncached = 0
+            if (
+                getattr(self, "tree_cache", None) is not None
+                and getattr(self.tree_cache, "cache_controller", None) is not None
+                and getattr(self.tree_cache, "enable_storage", False)
+            ):
+                # Device tokens allocated by load_back but not yet committed
+                # to the tree: total allocated - available - tree-owned
+                cc = self.tree_cache.cache_controller
+                allocated = cc.mem_pool_device_allocator.size
+                available = cc.mem_pool_device_allocator.available_size()
+                tree_owned = (
+                    self.tree_cache.evictable_size()
+                    + self.tree_cache.protected_size()
+                )
+                uncached = max(0, allocated - available - tree_owned)
             has_leak, messages = self.invariant_checker._check_all_pools(
                 self.pool_stats_observer.get_pool_stats(),
+                uncached=uncached,
             )
             if has_leak:
                 self.invariant_checker._report_leak("pool", "\n".join(messages))

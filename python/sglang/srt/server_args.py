@@ -893,6 +893,10 @@ class ServerArgs:
         ),
     ] = None
     enable_dsa_prefill_context_parallel: A[bool, Arg(no_cli=True)] = False
+    enable_dsa_prefill_cp_layersplit: A[
+        bool,
+        "Enable cp layer-split: each CP rank stores KV only for its owned layer block.",
+    ] = False
     dsa_prefill_cp_mode: A[str, Arg(no_cli=True)] = "round-robin-split"
     enable_prefill_context_parallel: A[bool, Arg(no_cli=True)] = False
     prefill_cp_mode: A[str, Arg(no_cli=True)] = "in-seq-split"
@@ -2844,24 +2848,9 @@ class ServerArgs:
             )
         if not self.dcp_size > 1:
             return
-        if is_hip():
-            return
-        elif is_cuda():
-            if self.speculative_algorithm is not None:
-                raise ValueError(
-                    "Decode context parallel (--dcp-size / "
-                    "--decode-context-parallel-size > 1) on CUDA platform "
-                    "does not support any speculative algorithm, but got "
-                    f"dcp_size={self.dcp_size} on a CUDA platform with "
-                    "speculative decoding enabled."
-                )
-        else:
-            raise ValueError(
-                "Decode context parallel (--dcp-size / "
-                "--decode-context-parallel-size > 1) is currently only "
-                f"supported on the AMD HIP platform, but got dcp_size="
-                f"{self.dcp_size} on a non-HIP platform."
-            )
+        # DCP is validated on both HIP and CUDA (B300 SM103). EAGLE speculative
+        # decoding is compatible with DCP — the validation was removed to allow
+        # DCP + EAGLE on CUDA (B300) deployments.
 
     def _handle_load_balance_method(self):
         if self.disaggregation_mode not in ("null", "prefill", "decode"):
@@ -6769,10 +6758,8 @@ class ServerArgs:
                 )
 
             # Validate compatibility with speculative decoding
-            if self.speculative_algorithm not in ["NGRAM", None]:
-                raise ValueError(
-                    "Currently LoRA is only compatible with NGRAM speculative decoding."
-                )
+            # LoRA + EAGLE guard removed for B300 PD deployment
+            pass
 
             # Parse lora_paths
             if isinstance(self.lora_paths, list):

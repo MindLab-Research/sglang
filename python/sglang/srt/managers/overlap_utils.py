@@ -327,8 +327,11 @@ class FutureMap:
         self.new_seq_lens_buf[indices] = new_seq_lens.to(self.new_seq_lens_buf.dtype)
         # Only spec_v2 needs the event; it gates the seq_lens D2H on the private stream.
         if self.spec_algo.is_some():
+            device_module = torch.get_device_module(self.device)
             if self.publish_ready is None:
-                self.publish_ready = torch.get_device_module(self.device).Event()
+                self.publish_ready = device_module.Event()
+            else:
+                device_module.current_stream().wait_event(self.publish_ready)
             self.publish_ready.record()
 
     def stash(self, future_indices: torch.Tensor, payload: RelayPayload) -> None:

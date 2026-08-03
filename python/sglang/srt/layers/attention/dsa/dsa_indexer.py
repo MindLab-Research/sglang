@@ -24,6 +24,12 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_graph_dsa_split_op_surface,
 )
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
+from sglang.srt.layers.dcp.comm import (
+    dcp_enabled,
+    get_attention_dcp_rank,
+    get_attention_dcp_world_size,
+)
+from sglang.srt.layers.dcp.pd_debug import dcp_debug_enabled
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.utils import MultiPlatformOp
@@ -53,6 +59,12 @@ from sglang.srt.utils import (
 from sglang.srt.utils.custom_op import register_custom_op
 
 logger = logging.getLogger(__name__)
+
+
+def _dcp_log(msg, *args, **kwargs):
+    if dcp_debug_enabled():
+        logger.warning(msg, *args, **kwargs)
+
 
 global _use_multi_stream
 _is_cuda = is_cuda()
@@ -106,13 +118,16 @@ if is_npu():
 from sglang.srt.distributed import (
     get_attn_tp_group,
 )
-from sglang.srt.distributed.parallel_state import get_pp_group
+from sglang.srt.distributed.parallel_state import get_pp_group, get_dcp_group
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.communicator import ScatterMode
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
+from sglang.srt.mem_cache.cp_layersplit_pool import (
+    cp_layersplit_broadcast_prefix_if_needed,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
@@ -342,13 +357,34 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
         from sglang.jit_kernel.hadamard import hadamard_transform
 
     hidden_size = x.size(-1)
-    assert (
-        hidden_size & (hidden_size - 1)
-    ) == 0, "Hidden size must be a power of 2 for Hadamard transform."
+    assert (hidden_size & (hidden_size - 1)) == 0, (
+        "Hidden size must be a power of 2 for Hadamard transform."
+    )
     return hadamard_transform(x, scale=hidden_size**-0.5)
 
 
 class Indexer(MultiPlatformOp):
+    def _localize_index_k_cache_locs(
+        self, out_cache_loc: torch.Tensor
+    ) -> torch.Tensor:
+        """Map global virtual slots to this rank's whole-page DCP pool."""
+        if not dcp_enabled():
+            return out_cache_loc
+
+        pool = get_token_to_kv_pool()
+        dcp_size = get_attention_dcp_world_size()
+        dcp_rank = get_attention_dcp_rank()
+        page_size = pool.page_size
+        valid = out_cache_loc >= 0
+        global_page = out_cache_loc // page_size
+        owner = (global_page % dcp_size == dcp_rank) & valid
+        local_slot = (
+            (global_page // dcp_size) * page_size + out_cache_loc % page_size
+        )
+        return torch.where(
+            owner, local_slot, torch.full_like(out_cache_loc, pool.size)
+        )
+
     _MQA_LOGITS_BYTES_PER_ELEM = 4
     _MQA_LOGITS_STATIC_SKIP_ELEMS = 8_000_000
     _MQA_LOGITS_TOTAL_MEM_FRACTION = 0.3
@@ -668,7 +704,9 @@ class Indexer(MultiPlatformOp):
     ) -> None:
         if out_cache_loc is None:
             out_cache_loc = forward_batch.out_cache_loc
+
         pool = get_token_to_kv_pool()
+        out_cache_loc = self._localize_index_k_cache_locs(out_cache_loc)
         page_size = pool.page_size
         if (
             not _is_fp8_fnuz
@@ -703,6 +741,7 @@ class Indexer(MultiPlatformOp):
             key=key,
             act_quant=act_quant,
             out_cache_loc=out_cache_loc,
+            dcp_localized=True,
         )
 
     def _fused_q_prepare_and_store(
@@ -813,13 +852,13 @@ class Indexer(MultiPlatformOp):
         # NOTE(dark): blocksize = 64 is hardcoded in deep_gemm
         if _is_hip:
             if _use_aiter_preshuffle:
-                assert (
-                    page_size % 16 == 0
-                ), f"HIP preshuffle requires page_size to be a multiple of 16, got {page_size}"
+                assert page_size % 16 == 0, (
+                    f"HIP preshuffle requires page_size to be a multiple of 16, got {page_size}"
+                )
             else:
-                assert (
-                    page_size == 1
-                ), f"HIP legacy DSA path requires page_size == 1, got {page_size}"
+                assert page_size == 1, (
+                    f"HIP legacy DSA path requires page_size == 1, got {page_size}"
+                )
         else:
             assert page_size == 64, "only support page size 64"
         # NOTE(dark): this support extend/decode/decode+graph
@@ -827,6 +866,23 @@ class Indexer(MultiPlatformOp):
             block_tables = metadata.get_page_table_1()
         else:
             block_tables = metadata.get_page_table_64()
+
+        # DCP: index_k uses owner filter (same as KV cache). block_tables
+        # is DCP-localised real_page_table — indexer scans local pages only.
+        # No global override needed.
+
+        if (
+            dcp_enabled()
+            and dcp_debug_enabled()
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            _bt_valid = block_tables[block_tables >= 0]
+            _dcp_log(
+                f"[DCP-DIAG] indexer_block_tables: shape={tuple(block_tables.shape)} "
+                f"bt_valid={int((block_tables >= 0).sum())} "
+                f"bt_min={int(_bt_valid.min()) if _bt_valid.numel() > 0 else -1} "
+                f"bt_max={int(_bt_valid.max()) if _bt_valid.numel() > 0 else -1} "
+            )
 
         max_seq_len = block_tables.shape[1] * page_size
         kv_cache_fp8 = get_token_to_kv_pool().get_index_k_with_scale_buffer(
@@ -841,6 +897,17 @@ class Indexer(MultiPlatformOp):
             seqlens_32 = metadata.get_seqlens_expanded()
         else:
             seqlens_32 = metadata.get_seqlens_int32()
+        # DCP: index_k uses localised seqlens (same as KV cache).
+        if (
+            dcp_enabled()
+            and dcp_debug_enabled()
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            _dcp_log(
+                f"[DCP-INDEXER] mode={forward_batch.forward_mode} "
+                f"seqlens={seqlens_32.tolist()} "
+                f"rpt_first4={block_tables[0, :4].tolist()} "
+            )
         # Reuse pre-computed schedule metadata if available (from init_forward_metadata),
         # otherwise fall back to computing it here.
         schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
@@ -887,7 +954,10 @@ class Indexer(MultiPlatformOp):
         else:
             seqlens_32_2d = seqlens_32.unsqueeze(-1)
         if _is_cuda:
-            if schedule_metadata is None:
+            # DCP lengths and page ownership vary by rank and request. Rebuild
+            # the schedule from the current localized lengths instead of reusing
+            # graph-capture metadata.
+            if schedule_metadata is None or dcp_enabled():
                 schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32_2d, blocksize, self.sm_count
                 )
@@ -959,8 +1029,42 @@ class Indexer(MultiPlatformOp):
                 q_offset=q_offset,
             )
 
+        # DCP: After _inplace_shard_dcp_kv + _store_index_k_cache's global//dws
+        # mapping, each rank's index_k buffer contains ONLY that rank's owner
+        # tokens at every page — all logits are valid (no non-owner garbage).
+        #
+        # All-gather logits across DCP ranks and take per-page max so BOTH ranks
+        # select the same globally-optimal top-k pages. This ensures the sparse
+        # selection considers ALL tokens (from both ranks), not just the local
+        # rank's half. Each rank then attends to its own owner tokens within the
+        # selected pages; the LSE merge in forward_mla.py combines the outputs.
+        #
+        # PREVIOUS BUG: the old code applied page_id % dws == rank owner mask,
+        # which was designed for a pre-shard layout where pages alternated
+        # between ranks. After shard, ALL pages belong to the current rank, so
+        # the mask zeroed out half the VALID logits → wrong top-k in sparse mode.
+        # DCP: each rank independently selects its own top-k from its own
+        # index_k (owner tokens only). No all_gather+max needed — the LSE merge
+        # in forward_mla.py combines partial attention outputs correctly.
+
         # NOTE(dark): logits should be cleaned in topk_transform
         topk_result = metadata.topk_transform(logits, self.index_topk)
+        # No DCP remapping needed: topk_transform uses DCP-local real_page_table
+        # (attn_metadata.real_page_table), so it outputs DCP-local KV slots directly.
+        if (
+            dcp_enabled()
+            and dcp_debug_enabled()
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            _valid = topk_result >= 0
+            _dcp_log(
+                f"[DCP-DIAG] topk_result: shape={tuple(topk_result.shape)} "
+                f"valid={int(_valid.sum())} "
+                f"min={int(topk_result[_valid].min()) if _valid.any() else -1} "
+                f"max={int(topk_result[_valid].max()) if _valid.any() else -1} "
+                f"dws={get_attention_dcp_world_size()} "
+                f"pool_pages={get_token_to_kv_pool().size // 64}"
+            )
         # Restore possible padding exist in the hidden states.
         if not _is_hip and q_offset < q_fp8.shape[0]:
             pad_len = q_fp8.shape[0] - q_offset
@@ -1044,13 +1148,13 @@ class Indexer(MultiPlatformOp):
         page_size = get_token_to_kv_pool().page_size
         if _is_hip:
             if _use_aiter_preshuffle:
-                assert (
-                    page_size % 16 == 0
-                ), f"HIP preshuffle requires page_size to be a multiple of 16, got {page_size}"
+                assert page_size % 16 == 0, (
+                    f"HIP preshuffle requires page_size to be a multiple of 16, got {page_size}"
+                )
             else:
-                assert (
-                    page_size == 1
-                ), f"HIP legacy DSA path requires page_size == 1, got {page_size}"
+                assert page_size == 1, (
+                    f"HIP legacy DSA path requires page_size == 1, got {page_size}"
+                )
         else:
             assert page_size == 64, "only support page size 64"
 
@@ -1065,6 +1169,10 @@ class Indexer(MultiPlatformOp):
             block_tables = metadata.get_page_table_1()
         else:
             block_tables = metadata.get_page_table_64()
+
+        # DCP: block_tables (real_page_table) already localised by
+        # compact_dcp_kv_indices in _apply_cuda_graph_metadata. Do NOT //dcp
+        # again here (double-division → wrong page → garbled logits).
 
         assert (
             forward_batch.seq_lens_cpu is not None
@@ -1158,13 +1266,13 @@ class Indexer(MultiPlatformOp):
         if global_topk_offset is None:
             cu_seqlens_q_full = torch.ones(q_offset, dtype=torch.int32, device=device)
 
-        assert (
-            seq_lens_expanded.shape[0] == q_offset
-        ), f"seq_lens_expanded length mismatch: {seq_lens_expanded.shape[0]} != {q_offset}"
+        assert seq_lens_expanded.shape[0] == q_offset, (
+            f"seq_lens_expanded length mismatch: {seq_lens_expanded.shape[0]} != {q_offset}"
+        )
         if global_topk_offset is not None:
-            assert (
-                global_topk_offset.shape[0] >= q_offset
-            ), f"topk_indices_offset too short: {global_topk_offset.shape[0]} < {q_offset}"
+            assert global_topk_offset.shape[0] >= q_offset, (
+                f"topk_indices_offset too short: {global_topk_offset.shape[0]} < {q_offset}"
+            )
 
         start = 0
         while start < q_offset:
@@ -1554,6 +1662,7 @@ class Indexer(MultiPlatformOp):
         *,
         act_quant=None,  # fallback only
         out_cache_loc: Optional[torch.Tensor] = None,
+        dcp_localized: bool = False,
     ) -> None:
         """
         Store DSA indexer K cache for current step.
@@ -1566,6 +1675,8 @@ class Indexer(MultiPlatformOp):
 
         if out_cache_loc is None:
             out_cache_loc = forward_batch.out_cache_loc
+        if not dcp_localized:
+            out_cache_loc = self._localize_index_k_cache_locs(out_cache_loc)
 
         if (
             _is_cuda
@@ -1599,7 +1710,7 @@ class Indexer(MultiPlatformOp):
                 layer_id=layer_id
             )
             kv_cache = buf.view(-1, page_size, 132).view(fp8_dtype)
-            out_loc = forward_batch.out_cache_loc
+            out_loc = out_cache_loc
             if not out_loc.is_contiguous():
                 out_loc = out_loc.contiguous()
             indexer_k_quant_and_cache(
@@ -1882,6 +1993,8 @@ class Indexer(MultiPlatformOp):
                 weights = self._apply_q_scale_and_softmax_scale(weights, q_scale)
             else:
                 weights = self._get_logits_head_gate(x_for_gate, q_scale)
+
+        cp_layersplit_broadcast_prefix_if_needed(layer_id, forward_batch, "indexer")
 
         if _is_cuda or _is_hip:
             # In piecewise/breakable CUDA graph, any access to seq_lens_cpu

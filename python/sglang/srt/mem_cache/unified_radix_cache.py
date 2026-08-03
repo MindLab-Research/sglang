@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.events import KVCacheEventMixin
 from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
     PoolName,
     PoolTransfer,
     SidecarPoolSpec,
@@ -469,6 +470,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
         self.ongoing_prefetch: dict[str, _OngoingPrefetch] = {}
         self.ongoing_backup: dict[int, tuple[UnifiedTreeNode, DecLockRefParams]] = {}
+        self.aborted_prefetch_cleanup: set[str] = set()
 
         if self.cache_controller is not None:
             self.cache_controller.reset()
@@ -554,6 +556,40 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 enable_storage_metrics=self._enable_metrics_flag,
                 extra_metric_labels=self.extra_metric_labels,
             )
+
+
+    def query_storage_hit_length(
+        self,
+        last_host_node: TreeNode,
+        new_input_tokens: List[int],
+        last_hash: Optional[str] = None,
+        prefix_keys: Optional[List[str]] = None,
+    ) -> int:
+        from sglang.srt.managers.cache_controller import PrefetchOperation
+
+        if not self.enable_storage or self.cache_controller.prefetch_rate_limited():
+            return 0
+
+        prefetch_key = RadixKey(
+            new_input_tokens,
+            extra_key=last_host_node.key.extra_key,
+            is_bigram=self.is_eagle,
+        ).page_aligned(self.page_size)
+        if len(prefetch_key) < self.prefetch_threshold:
+            return 0
+
+        operation = PrefetchOperation(
+            "__storage_hit_query__",
+            self.cache_controller.mem_pool_host.get_dummy_flat_data_page()[:0],
+            prefetch_key,
+            last_hash,
+            prefix_keys,
+        )
+        hash_values, storage_hit_count = self.cache_controller._storage_hit_query(
+            operation
+        )
+        storage_hit_count = storage_hit_count - (storage_hit_count % self.page_size)
+        return storage_hit_count
 
     def register_sidecar_pool(self, spec: SidecarPoolSpec) -> None:
         self.sidecar_pool_specs.append(spec)
@@ -854,10 +890,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             new_indices[req.cache_protected_len :],
         )
 
-        self.dec_lock_ref(
-            req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
-        )
+        # Debug: log lock_ref before dec
+        def _get_lr(node):
+            from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
+            cd = node.component_data[ComponentType.FULL]
+            return cd.lock_ref if cd.value is not None else None
+        if req.last_node is not None:
+            logger.warning(
+                f"CACHE_UNFINISHED rid={req.rid} last_node={req.last_node.id} "
+                f"lock_ref={_get_lr(req.last_node)} cache_protected={req.cache_protected_len}"
+            )
+            self.dec_lock_ref(
+                req.last_node,
+                DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+            )
         lock_result = self.inc_lock_ref(new_last_node)
 
         # Update req fields
@@ -1045,6 +1091,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(child)
+        # The split replaced child with new_node in parent.children, which may
+        # have turned a previously-leaf parent into a non-leaf (it now has a
+        # child with data again). Re-evaluate the parent so stale leaf entries
+        # don't linger in evictable_host_leaves / evictable_device_leaves.
+        old_parent = new_node.parent
+        if old_parent is not None and old_parent is not self.root_node:
+            self._update_evictable_leaf_sets(old_parent)
         return new_node
 
     def _touch_node(self, node: UnifiedTreeNode):
@@ -1231,6 +1284,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 result.inserted_host_node = node
             return result
 
+        # Parent not backed up: drop this best-effort prefetch refill (free its host pages).
+        # PR #31902: prevents backed-up child under un-backed-up parent -> tree corruption
+        # (_remove_leaf_from_parent assert v == node crash during eviction).
+        if node is not self.root_node and not node.backuped:
+            self.cache_controller.mem_pool_host.free(host_value)
+            return result
+
         new_node = UnifiedTreeNode(self.tree_components, priority=node.priority)
         new_node.parent = node
         new_node.key = key
@@ -1299,6 +1359,27 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def _remove_leaf_from_parent(self, node: UnifiedTreeNode):
         key = node.key.child_key(self.page_size)
         v = node.parent.children.pop(key, None)
+        if v is None:
+            # Stale node: already removed from parent (e.g. by _split_node
+            # which replaced parent.children[key] with a new_node, or by a
+            # prior _iteratively_delete_tombstone_leaf cascade). The node's
+            # KV has already been freed by the caller, so this is a no-op.
+            import logging
+            logging.getLogger("sglang").warning(
+                "REMOVE_LEAF_STALE node.id=%s already detached from parent %s; skipping",
+                getattr(node, "id", "?"),
+                getattr(node.parent, "id", "?"),
+            )
+            return
+        if v is not node:
+            import logging
+            logging.getLogger("sglang").error(
+                "REMOVE_LEAF_MISMATCH node.id=%s v.id=%s node.parent.id=%s "
+                "node.evicted=%s node.backuped=%s",
+                getattr(node, "id", "?"), getattr(v, "id", None),
+                getattr(node.parent, "id", "?"),
+                node.evicted, node.backuped,
+            )
         assert v == node
 
     def _evict_component_and_detach_lru(
@@ -1422,6 +1503,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             for child in node.children.values()
         ):
             return False
+        # Guard against stale references: node must still be the current
+        # child of its parent (a _split_node may have replaced it).
+        if node.parent is not None and node.parent is not self.root_node:
+            key = node.key.child_key(self.page_size)
+            if node.parent.children.get(key) is not node:
+                return False
         return True
 
     def _is_host_leaf(self, node: UnifiedTreeNode) -> bool:
@@ -1437,6 +1524,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return False
         if len(node.children) > 0:
             return False
+        # Guard against stale references: node must still be the current
+        # child of its parent (a _split_node may have replaced it).
+        if node.parent is not None and node.parent is not self.root_node:
+            key = node.key.child_key(self.page_size)
+            if node.parent.children.get(key) is not node:
+                return False
         return True
 
     def _update_evictable_leaf_sets(self, node: UnifiedTreeNode) -> None:
@@ -1488,6 +1581,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             ):
                 written = self.write_backup(node, write_back=True)
                 if written == 0:
+                    # write_backup failed (host pool full and evict_host
+                    # could not free enough). Fallback: evict device data
+                    # directly without backup. This sacrifices cache hit
+                    # rate but prevents a deadlock where device cannot be
+                    # evicted because host is full.
+                    self._record_remove_event(node, medium=StorageMedium.GPU)
+                    for comp in self._components_tuple:
+                        self._evict_component_and_detach_lru(
+                            node, comp, target=EvictLayer.ALL, tracker=tracker
+                        )
+                    self.evictable_device_leaves.discard(node)
+                    parent = node.parent
+                    self._remove_leaf_from_parent(node)
+                    self._update_evictable_leaf_sets(parent)
+                    self._iteratively_delete_tombstone_leaf(node, tracker)
                     return
                 self.writing_check(write_back=True)
                 self._evict_to_host(node, tracker)
@@ -1961,6 +2069,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
 
     def can_terminate_prefetch(self, operation: PrefetchOperation) -> bool:
+        # Local-only: no cross-rank all_reduce. Prefetch is per-rank (each rank
+        # loads its own KV), so each rank can independently decide to terminate.
+        # The all_reduce caused deadlocks when check_prefetch_progress (called
+        # inside pop_transferred) and _padded_all_reduce_min diverged across ranks.
         if self.prefetch_stop_policy == "best_effort":
             return True
 
@@ -1987,50 +2099,158 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             can_terminate = False
 
         operation_terminated = operation.is_terminated()
-        states = torch.tensor(
-            [1 - int(can_terminate), int(operation_terminated)],
-            dtype=torch.int,
-        )
-        self._all_reduce_attn_groups(states, torch.distributed.ReduceOp.MAX)
-        can_terminate = states[0].item() == 0
-        operation_terminated = states[1].item() == 1
         return can_terminate or operation_terminated
 
     def check_prefetch_progress(self, req_id: str) -> bool:
-        if req_id not in self.ongoing_prefetch:
-            return True
+        info = self.ongoing_prefetch.get(req_id)
+        has_local_prefetch = info is not None
+        local_pending = False
+        local_io_active = False
+        extra_pool_names = tuple(
+            pool_name for pool_name in PoolName if pool_name != PoolName.KV
+        )
+        all_pages_pools = set()
+        trailing_pools = set()
+        local_completed_tokens = 0
+        if info is not None:
+            operation = info.operation
+            local_pending = (
+                operation.host_indices is not None
+                and not self.can_terminate_prefetch(operation)
+            )
+            local_io_active = not operation.is_io_finished()
+            local_completed_tokens = operation.completed_tokens
+            all_pages_pools = {
+                transfer.name
+                for transfer in operation.pool_transfers or ()
+                if transfer.name != PoolName.KV
+                and transfer.hit_policy == PoolHitPolicy.ALL_PAGES
+            }
+            trailing_pools = {
+                transfer.name
+                for transfer in operation.pool_transfers or ()
+                if transfer.name != PoolName.KV
+                and transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES
+            }
 
-        (
-            last_host_node,
-            prefetch_key,
-            host_indices,
-            operation,
-            anchor_lock_params,
-            comp_xfers,
-        ) = self.ongoing_prefetch[req_id]
-        if operation.host_indices is None:
+        # This collective is unconditional for every rank scheduling this request.
+        # A local cache miss/no-op is part of the consensus instead of returning
+        # early and allowing only a subset of TP/CP ranks to enter model forward.
+        states = torch.tensor(
+            [
+                int(has_local_prefetch),
+                int(not has_local_prefetch),
+                int(local_pending),
+                int(local_io_active),
+                local_completed_tokens,
+            ]
+            + [
+                int(pool_name in all_pages_pools)
+                for pool_name in extra_pool_names
+            ]
+            + [
+                int(pool_name in trailing_pools)
+                for pool_name in extra_pool_names
+            ],
+            dtype=torch.int,
+            device="cpu",
+        )
+        self._all_reduce_attn_groups(states, torch.distributed.ReduceOp.MAX)
+        any_prefetch = states[0].item() != 0
+        any_missing = states[1].item() != 0
+        any_pending = states[2].item() != 0
+        any_io_active = states[3].item() != 0
+        max_completed_tokens = int(states[4].item())
+
+        if not any_prefetch:
             return True
-        if not self.can_terminate_prefetch(operation):
+        if any_pending and not any_missing:
             return False
 
-        completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
-            operation
-        )
-        min_completed_tokens = completed_tokens
-        hit_pages = operation.pool_storage_result.extra_pool_hit_pages
-        if self.tp_world_size > 1:
-            # Reduce full completed tokens together with the sidecar pools that
-            # this prefetch actually transferred, in one all_reduce.
-            sidecar_pools = [t.name for xfers in comp_xfers.values() for t in xfers]
-            packed = torch.tensor(
-                [completed_tokens] + [hit_pages.get(p, 0) for p in sidecar_pools],
-                dtype=torch.int,
-            )
-            self._all_reduce_attn_groups(packed, torch.distributed.ReduceOp.MIN)
-            min_completed_tokens = int(packed[0].item())
-            for i, p in enumerate(sidecar_pools, start=1):
-                hit_pages[p] = int(packed[i].item())
+        # Stop every local operation before fallback/finalization. Buffer release
+        # is deferred until the next consensus observes all I/O workers quiescent.
+        if info is not None and not info.operation.is_terminated():
+            info.operation.mark_terminate()
+        if any_io_active:
+            return False
 
+        if info is not None:
+            (
+                last_host_node,
+                prefetch_key,
+                host_indices,
+                operation,
+                anchor_lock_params,
+                comp_xfers,
+            ) = info
+            completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
+                operation
+            )
+            hit_pages = operation.pool_storage_result.extra_pool_hit_pages
+        else:
+            last_host_node = None
+            prefetch_key = None
+            host_indices = None
+            operation = None
+            anchor_lock_params = None
+            comp_xfers = {}
+            completed_tokens = 0
+            hash_value = []
+            hit_pages = {}
+
+        # Fixed pool order keeps collective shapes identical. Missing operations
+        # and missing ALL_PAGES sidecars contribute zero, forcing a common safe
+        # prefix rather than admitting rank-distinct cache state.
+        packed = torch.tensor(
+            [completed_tokens]
+            + [
+                hit_pages.get(pool_name, hit_pages.get(pool_name.value, 0))
+                for pool_name in extra_pool_names
+            ],
+            dtype=torch.int,
+            device="cpu",
+        )
+        self._all_reduce_attn_groups(packed, torch.distributed.ReduceOp.MIN)
+        min_completed_tokens = int(packed[0].item())
+        num_extra_pools = len(extra_pool_names)
+        has_trailing_pool = False
+        for i, pool_name in enumerate(extra_pool_names, start=1):
+            synced_hit_pages = int(packed[i].item())
+            hit_pages[pool_name] = synced_hit_pages
+            if states[4 + i].item() != 0:
+                min_completed_tokens = min(
+                    min_completed_tokens,
+                    synced_hit_pages * self.page_size,
+                )
+            has_trailing_pool |= (
+                states[4 + num_extra_pools + i].item() != 0
+            )
+        if (
+            has_trailing_pool
+            and max_completed_tokens != int(packed[0].item())
+        ):
+            # Trailing state is keyed relative to each rank's local KV tail.
+            # Different completed lengths therefore refer to different pages.
+            min_completed_tokens = 0
+
+        if min_completed_tokens <= 0:
+            if info is not None:
+                self.cache_controller.append_host_mem_release(
+                    host_indices=host_indices[:completed_tokens],
+                    extra_pools=[
+                        transfer
+                        for transfers in comp_xfers.values()
+                        for transfer in transfers
+                    ],
+                )
+                self.dec_host_lock_ref(last_host_node, anchor_lock_params)
+                del self.ongoing_prefetch[req_id]
+                self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
+                assert self.cache_controller.prefetch_tokens_occupied >= 0
+            self.prefetch_loaded_tokens_by_reqid[req_id] = 0
+            return True
+
+        assert info is not None
         fetched_key = prefetch_key[:min_completed_tokens]
         insert_result = self._insert_helper_host(
             last_host_node,
@@ -2039,11 +2259,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             hash_value[: min_completed_tokens // self.page_size],
         )
 
-        for ct, xfers in comp_xfers.items():
+        for ct, transfers in comp_xfers.items():
             self.components[ct].commit_hicache_transfer(
                 last_host_node,
                 CacheTransferPhase.PREFETCH,
-                xfers,
+                transfers,
                 insert_result=insert_result,
                 pool_storage_result=operation.pool_storage_result,
             )
@@ -2061,7 +2281,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         loaded_from_storage = min_completed_tokens - insert_result.prefix_len
         self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
         logger.info(
-            "HiCache prefetch success req=%s completed_local=%d completed_synced=%d matched=%d loaded=%d tail_release=%d occupied=%d",
+            "HiCache prefetch success req=%s completed_local=%d "
+            "completed_synced=%d matched=%d loaded=%d tail_release=%d occupied=%d",
             req_id,
             completed_tokens,
             min_completed_tokens,
@@ -2070,9 +2291,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             completed_tokens - min_completed_tokens,
             self.cache_controller.prefetch_tokens_occupied,
         )
-        if self.enable_storage_metrics and self.storage_metrics_collector is not None:
-            self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
+        if (
+            self.enable_storage_metrics
+            and self.storage_metrics_collector is not None
+        ):
+            self.storage_metrics_collector.log_prefetched_tokens(
+                loaded_from_storage
+            )
         return True
+
 
     def terminate_prefetch(self, req_id: str) -> None:
         if req_id not in self.ongoing_prefetch:
@@ -2087,29 +2314,38 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def release_aborted_request(self, rid: str) -> None:
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
-        if rid not in self.ongoing_prefetch:
+        info = self.ongoing_prefetch.get(rid)
+        if info is None:
             return
+        operation = info.operation
+        operation.mark_terminate()
+        self.aborted_prefetch_cleanup.add(rid)
+        self._cleanup_quiesced_aborted_prefetches()
 
-        (
-            last_host_node,
-            prefetch_key,
-            host_indices,
-            operation,
-            anchor_lock_params,
-            comp_xfers,
-        ) = self.ongoing_prefetch[rid]
-        if operation.host_indices is None:
-            return
+    def _cleanup_quiesced_aborted_prefetches(self) -> None:
+        for rid in tuple(self.aborted_prefetch_cleanup):
+            info = self.ongoing_prefetch.get(rid)
+            if info is None:
+                self.aborted_prefetch_cleanup.discard(rid)
+                continue
+            operation = info.operation
+            if not operation.is_io_finished():
+                continue
 
-        completed_tokens, _ = self.cache_controller.terminate_prefetch(operation)
-        self._barrier_attn_groups()
-        self.dec_host_lock_ref(last_host_node, anchor_lock_params)
-        del self.ongoing_prefetch[rid]
-        self.cache_controller.append_host_mem_release(
-            host_indices=host_indices[:completed_tokens],
-            extra_pools=[x for xfers in comp_xfers.values() for x in xfers],
-        )
-        self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
+            completed_tokens, _ = self.cache_controller.terminate_prefetch(operation)
+            self.dec_host_lock_ref(info.anchor_node, info.anchor_lock_params)
+            del self.ongoing_prefetch[rid]
+            self.cache_controller.append_host_mem_release(
+                host_indices=info.host_indices[:completed_tokens],
+                extra_pools=[
+                    transfer
+                    for transfers in info.comp_xfers.values()
+                    for transfer in transfers
+                ],
+            )
+            self.cache_controller.prefetch_tokens_occupied -= len(info.prefetch_key)
+            assert self.cache_controller.prefetch_tokens_occupied >= 0
+            self.aborted_prefetch_cleanup.discard(rid)
 
     def _drain_storage_control_queues_impl(
         self,
@@ -2221,12 +2457,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 for pool_name in extra_pool_names
             ],
         ]
-        qsizes = torch.tensor(
-            local_qsize_list,
-            dtype=torch.int,
-        )
-        self._all_reduce_attn_groups(qsizes, torch.distributed.ReduceOp.MIN)
-        qsize_list = list(map(int, qsizes.tolist()))
+        # Use local values directly without TP all_reduce.
+        # The original code called _all_reduce_attn_groups (NCCL) here, but
+        # when L3 storage is enabled, a background prefetch thread also does
+        # all_reduce via gloo. Two threads doing collectives that both need
+        # all 8 ranks simultaneously causes a permanent deadlock:
+        #   Rank A (main thread) → NCCL all_reduce, waiting for Rank B
+        #   Rank B (prefetch thread) → gloo all_reduce, waiting for Rank A
+        # Since each rank independently reads its own queues and the values
+        # are per-rank, using local values is correct and avoids the deadlock.
+        qsize_list = local_qsize_list
         n_revoke, n_backup, n_release = qsize_list[:3]
         extra_release_counts = {
             pool_name: count
@@ -2333,10 +2573,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def writing_check(self, write_back: bool = False) -> None:
         """Poll write-through completions."""
         cc = self.cache_controller
-        if cc is None:
-            return
-
-        if write_back:
+        # Every rank must enter the all_reduce below; cc can diverge across ranks.
+        if cc is not None and write_back:
             # Blocking: wait for all pending write-backs
             while self.ongoing_write_through:
                 for _, finish_event, ack_list in cc.ack_write_queue:
@@ -2351,17 +2589,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # Every rank must enter the all_reduce below; ongoing_write_through can
         # diverge across ranks (e.g. write_backup returning 0 on a subset).
         finish_count = 0
-        if self.pp_rank == 0:
+        if cc is not None and self.pp_rank == 0:
             for _, finish_event, ack_list in cc.ack_write_queue:
                 if not finish_event.query():
                     break
                 finish_count += 1
 
-        finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
-        self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
-        finish_count = finish_count_tensor.item()
-
-        # Process completed acks
+        # Process completed acks (local finish_count only, no cross-rank sync)
         while finish_count > 0:
             _, finish_event, ack_list = cc.ack_write_queue.pop(0)
             finish_event.synchronize()
@@ -2372,20 +2606,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def loading_check(self) -> None:
         """Poll load-back completions."""
         cc = self.cache_controller
-        if cc is None:
-            return
         # Every rank must enter the all_reduce below; ongoing_load_back can
         # diverge across ranks.
         finish_count = 0
-        if self.pp_rank == 0:
+        if cc is not None and self.pp_rank == 0:
             for _, finish_event, ack_list in cc.ack_load_queue:
                 if not finish_event.query():
                     break
                 finish_count += 1
-        finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
-        self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
-        finish_count = finish_count_tensor.item()
-
+        # Process completed acks (local finish_count only, no cross-rank sync)
         while finish_count > 0:
             _, finish_event, ack_list = cc.ack_load_queue.pop(0)
             finish_event.synchronize()
@@ -2458,6 +2687,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.loading_check()
         if self.enable_storage:
             self.drain_storage_control_queues()
+            self._cleanup_quiesced_aborted_prefetches()
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
             self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
@@ -2472,6 +2702,31 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.cache_controller is not None:
             return self.cache_controller.start_loading()
         return 0
+
+    def is_load_back_event_done(self, consumer_index: int) -> bool:
+        """Return True after the local load-back event is complete.
+
+        Required by decode HiCache restore state machine. Without this method,
+        _process_hicache_local_restores returns early and hicache_restore_status
+        stays PENDING forever, causing a permanent loop in HiCacheRestoreGatedKVReceiver.poll().
+        """
+        if consumer_index < 0:
+            return True
+        cc = self.cache_controller
+        if cc is None or not hasattr(cc, "layer_done_counter"):
+            return True
+        if consumer_index >= len(cc.layer_done_counter.events):
+            return True
+        finish_event = cc.layer_done_counter.events[consumer_index].finish_event
+        if not finish_event.query():
+            return False
+        # Do NOT call loading_check() here — it does a gloo all_reduce that
+        # must be called the same number of times on every rank. Since each
+        # rank's load-back event completes at a different time, calling it
+        # conditionally here causes gloo call-count divergence → crash.
+        # loading_check() is already called uniformly in check_hicache_events()
+        # which runs on every scheduler step for all ranks.
+        return True
 
     # ---- Query / Inspection APIs ----
     # These APIs exist for compatibility with other RadixTree implementations.

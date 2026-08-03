@@ -28,6 +28,7 @@ from sglang.srt.disaggregation.base.conn import (
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     filter_kv_indices_for_cp_rank,
+    filter_kv_indices_for_dcp_rank,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.environ import envs
@@ -75,6 +76,10 @@ class PrefillServerInfo:
     page_size: Optional[int]
     kv_cache_dtype: Optional[str]
     follow_bootstrap_room: bool
+    # DCP: decode-side dcp_size (defaults to 1). Prefill learns the decode
+    # DCP shard count via bootstrap so it can reshard KV per decode rank.
+    dcp_size: int = 1
+    dcp_enabled: bool = False
 
     # Pre-computed rank mapping (set by try_ensure_parallel_info on decode side)
     target_tp_rank: Optional[int] = None
@@ -142,6 +147,22 @@ class CommonKVManager(BaseKVManager):
         self.enable_all_cp_ranks_for_transfer = (
             envs.SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.get()
         )
+        self.is_cp_layersplit = getattr(server_args, "enable_dsa_prefill_cp_layersplit", False)
+
+        # DCP (Decode Context Parallel): decode-side KV is sharded across N ranks
+        # by pos % N. Prefill must reshard its full-token KV into per-shard slices
+        # before RDMA. These attrs are read by _prepare_send_indices (prefill) and
+        # set per-request from decode metadata (see send_metadata / DstKVInfo).
+        # dcp_size>1 only on decode side; prefill sees it via DstKVInfo.dcp_*.
+        self.dcp_size = getattr(server_args, "dcp_size", 1)
+        self.dcp_enabled = self.dcp_size > 1
+        # Prefill-side: learned from first DCP TransferInfo (decode's dcp_size).
+        # Prefill checks this to decide token-level vs page-level KV transfer.
+        self.decode_dcp_size = 1
+        # decode rank's DCP rank = tp_rank % dcp_size; prefill learns the *target*
+        # decode rank's dcp_rank from per-request metadata (DstKVInfo), not from
+        # its own rank (which is a prefill rank, not a decode rank).
+        self.dcp_rank = self.attn_tp_rank % self.dcp_size if self.dcp_enabled else 0
 
         # bind zmq socket
         self._zmq_ctx = zmq.Context()
@@ -158,10 +179,12 @@ class CommonKVManager(BaseKVManager):
         self.failure_lock = threading.Lock()
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            # When SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER is True, all CP ranks
-            # participate in KV transfer; Otherwise only CP rank 0 sends.
+            # When SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER is True, or when
+            # cp-layersplit is active (every rank owns distinct layers), all CP
+            # ranks participate in KV transfer; otherwise only CP rank 0 sends.
             self.is_dummy_cp_rank = (
                 not self.enable_all_cp_ranks_for_transfer
+                and not self.is_cp_layersplit
                 and self.attn_cp_size > 1
                 and self.attn_cp_rank != 0
             )
@@ -340,6 +363,23 @@ class CommonKVManager(BaseKVManager):
             else:
                 required_prefill_response_num *= info.attn_cp_size // self.attn_cp_size
 
+        # DCP mapping: decode shards KV across dcp_size ranks (pos % dcp == rank).
+        # Each prefill rank must send a distinct token-shard to each decode DCP rank.
+        # info.dcp_size is the decode-side dcp world size (set on decode CommonKVManager
+        # from server_args.dcp_size; defaults to 1 for prefill / non-DCP decode).
+        _decode_dcp_size = getattr(info, "dcp_size", 1) or 1
+        info.dcp_size = _decode_dcp_size
+        info.dcp_enabled = _decode_dcp_size > 1
+        # The decode rank issuing this request has dcp_rank = its_tp_rank % dcp_size.
+        # Stored on the per-request DstKVInfo (mooncake/conn.py) at metadata time.
+        # Here we just record the total for logging; per-request mapping happens in
+        # _prepare_send_indices via DstKVInfo.dcp_rank.
+        if info.dcp_enabled:
+            logger.info(
+                f"[DCP-PD] decode dcp_size={_decode_dcp_size}: each prefill rank will "
+                f"send 1/{_decode_dcp_size} token-shard to each of {_decode_dcp_size} decode ranks"
+            )
+
         # PP rank mapping — decode pp size should be equal to prefill pp size or 1
         assert self.pp_size == info.pp_size or self.pp_size == 1, (
             f"Decode pp size ({self.pp_size}) should be equal to prefill pp size ({info.pp_size}) or 1",
@@ -356,6 +396,27 @@ class CommonKVManager(BaseKVManager):
         info.target_pp_ranks = target_pp_ranks
         info.required_dst_info_num = required_dst_info_num
         info.required_prefill_response_num = required_prefill_response_num
+
+    def _should_filter_cp_indices(self) -> bool:
+        """Return True when per-rank CP index filtering should apply.
+
+        Under cp-layersplit every CP rank owns distinct layers and sends its own
+        pages unfiltered, so filtering is not applicable.
+
+        Under cp-interleave (attn_cp_size > 1), each CP rank already holds only
+        its own 1/N token portion — the page list is already per-rank, so
+        filtering would incorrectly split this small list across N CP ranks,
+        discarding most ranks' KV (only CP0 gets pages, CP1..N-1 get nothing).
+
+        Filtering is only needed when all participating ranks hold the SAME
+        full KV (attn_cp_size == 1, i.e. pure TP with no CP), and
+        enable_all_cp_ranks_for_transfer causes every rank to send.
+        """
+        if self.is_cp_layersplit:
+            return False
+        if self.attn_cp_size > 1:
+            return False
+        return self.enable_all_cp_ranks_for_transfer
 
     def _sync_bootstrap_port_across_nodes(self, local_port: int) -> int:
         """Broadcast world-rank-0's bootstrap port to all prefill ranks.
@@ -549,10 +610,19 @@ class CommonKVManager(BaseKVManager):
 
         # Regular MLA PP slicing
         start_layer = self.kv_args.prefill_start_layer
-        end_layer = start_layer + len(src_kv_ptrs)
-        # Decode pp size should be equal to prefill pp size or 1
-        sliced_dst_kv_ptrs = dst_kv_ptrs[start_layer:end_layer]
-        return src_kv_ptrs, sliced_dst_kv_ptrs, len(src_kv_ptrs)
+        prefill_end_layer = getattr(self.kv_args, "prefill_end_layer", None)
+
+        if prefill_end_layer is not None:
+            num_main = prefill_end_layer - start_layer + 1
+            num_draft = len(src_kv_ptrs) - num_main
+            sliced_dst = list(dst_kv_ptrs[start_layer : start_layer + num_main])
+            if num_draft > 0:
+                sliced_dst += list(dst_kv_ptrs[len(dst_kv_ptrs) - num_draft :])
+        else:
+            end_layer = start_layer + len(src_kv_ptrs)
+            sliced_dst = dst_kv_ptrs[start_layer:end_layer]
+
+        return src_kv_ptrs, sliced_dst, len(src_kv_ptrs)
 
     def _mla_slice_ptrs_for_pp(
         self,
@@ -876,12 +946,22 @@ class CommonKVSender(BaseKVSender):
         self.curr_idx += len(kv_indices)
         is_last_chunk = self.curr_idx == self.num_kv_indices
 
-        if self.kv_mgr.enable_all_cp_ranks_for_transfer:
+        if self.kv_mgr._should_filter_cp_indices():
+            _pre_len = len(kv_indices)
             kv_indices, index_slice = filter_kv_indices_for_cp_rank(
                 self.kv_mgr,
                 kv_indices,
                 index_slice,
                 total_pages=self.num_kv_indices,
+            )
+            _post_len = len(kv_indices)
+            import logging as _lg
+            _lg.getLogger(__name__).info(
+                f"[DCP-CP-FILTER] cp_rank={self.kv_mgr.attn_cp_rank}"
+                f" total_pages={self.num_kv_indices}"
+                f" chunk=({index_slice.start},{index_slice.stop})"
+                f" pre={_pre_len} post={_post_len}"
+                f" kv_indices={kv_indices[:5].tolist()}"
             )
         elif self.kv_mgr.is_dummy_cp_rank:
             if not is_last_chunk:
@@ -889,6 +969,13 @@ class CommonKVSender(BaseKVSender):
             else:
                 self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Success)
                 return kv_indices, index_slice, is_last_chunk, True
+
+        # NOTE: DCP reshard is NOT done here. Under DCP, one prefill rank sends
+        # a DIFFERENT token-shard to each of N decode ranks (pos%N==rank). But
+        # kv_chunk.prefill_kv_indices is computed once per send() call and shared
+        # across all TransferInfo in transfer_infos[room]. The per-rank reshard
+        # therefore happens in the transfer worker loop (MooncakeKVManager), which
+        # has access to each TransferInfo.dcp_rank.
 
         return kv_indices, index_slice, is_last_chunk, False
 
@@ -964,12 +1051,14 @@ class CommonKVReceiver(BaseKVReceiver):
 
     def init(self, prefill_dp_rank: int):
         if self.bootstrap_addr not in self.kv_mgr.prefill_info_table:
-            self.kv_mgr.record_failure(
-                self.bootstrap_room,
-                f"Prefill server with bootstrap_addr: {self.bootstrap_addr} is healthy before, but now it is down. Request (bootstrap_room: {self.bootstrap_room}) has been marked as failed.",
-            )
-            self.conclude_state = KVPoll.Failed
-            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+            # Prefill info not yet available — don't fail, just mark as
+            # Bootstrapping so poll_and_all_reduce(MIN) keeps the request
+            # in queue across all ranks. _resolve_pending_reqs will retry
+            # init() when prefill_info becomes available.
+            # Previously this set KVPoll.Failed (value=0), which via
+            # all_reduce(MIN) forced ALL ranks to abort the request even
+            # though only one rank hadn't resolved prefill_info yet.
+            self.conclude_state = KVPoll.Bootstrapping
             return
 
         # Read pre-computed rank mapping from prefill_info (computed in try_ensure_parallel_info)
@@ -1385,6 +1474,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                     if self.follow_bootstrap_room is not None
                     else True
                 ),
+                dcp_size=getattr(self, "dcp_size", 1),
+                dcp_enabled=getattr(self, "dcp_enabled", False),
             )
             return web.json_response(dataclasses.asdict(info), status=200)
 

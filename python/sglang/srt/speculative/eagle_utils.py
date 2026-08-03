@@ -782,16 +782,28 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
 
     page_size = batch.token_to_kv_pool_allocator.page_size
     double_alloc = get_alloc_reserve_per_decode()
+    from sglang.srt.server_args import get_global_server_args
 
     cur_kv_lens = [0] * bs
     nxt_kv_lens = [0] * bs
     num_needed_tokens = 0
     for i, r in enumerate(batch.reqs):
         cur = r.kv_allocated_len
-        # max(cur, ...) clamps so adaptive downswitch cannot make nxt < cur.
-        # kv_committed_len is honest (bonus committed in resolve, not here),
-        # so it lags batch.seq_lens by ~1 verify in overlap; 2*alloc absorbs.
-        nxt = max(cur, r.kv_committed_len + double_alloc)
+        # [FIX-EAGLE] kv_committed_len lags seq_lens by up to 2 iterations under
+        # interleaved bs=1 batches (result processing runs after the next
+        # run_batch), so kv_committed_len + double_alloc can be < seq_lens +
+        # next_n. verify's draft-token KV write (out_cache_loc =
+        # seq_lens..seq_lens+next_n) then overruns the reserved range and
+        # corrupts a neighbor request's KV -> probabilistic garbled output
+        # (digit runs / reasoning loops), worsening with concurrency.
+        # Reserve at least actual_len + next_n + slack so the write never
+        # overruns.
+        actual_len = len(r.origin_input_ids) + len(r.output_ids)
+        nxt = max(
+            cur,
+            r.kv_committed_len + double_alloc,
+            actual_len + get_global_server_args().speculative_num_draft_tokens + 2,
+        )
         cur_kv_lens[i] = cur
         nxt_kv_lens[i] = nxt
         num_needed_tokens += nxt - cur

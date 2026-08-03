@@ -37,6 +37,7 @@ class HiCacheStorageConfig:
     tp_lcm_size: Optional[int] = None
     should_split_heads: bool = False
     extra_config: Optional[dict] = None
+    is_cp_layersplit: bool = False
 
 
 @dataclass
@@ -131,9 +132,14 @@ class PoolTransferResult:
         self.kv_hit_pages = max(self.kv_hit_pages, kv_hit_pages)
 
     def update_extra_pool_hit_pages(self, results: dict[str, List[bool]]) -> None:
-        """Record actual load/write success counts per extra pool."""
+        """Record leading contiguous successful pages per extra pool."""
         self.extra_pool_hit_pages.update(
-            {name: sum(rs) for name, rs in results.items()}
+            {
+                name: next(
+                    (i for i, succeeded in enumerate(rs) if not succeeded), len(rs)
+                )
+                for name, rs in results.items()
+            }
         )
 
 
@@ -340,9 +346,13 @@ class HiCacheFile(HiCacheStorage):
             self.config_suffix += f"_{tp_rank}_{tp_size}"
         if enable_pp:
             self.config_suffix += f"_{pp_size}_{pp_rank}"
-        # Under NSA context parallel each CP rank holds a disjoint slice of every
-        # page, so give each rank its own file key to avoid a cross-rank write race.
-        if attn_cp_size > 1:
+        # Give each CP rank its own key when it holds rank-distinct payload under
+        # the same token content hash: NSA context parallel (disjoint page slice
+        # per rank) or CP layer-split (different owned-layer block per rank). Since
+        # layer-split always runs with attn_cp_size > 1, the two conditions overlap;
+        # OR them into one suffix so the key is namespaced exactly once (both MHA
+        # and MLA; MLA otherwise has no rank component and two CP ranks would collide).
+        if attn_cp_size > 1 or storage_config.is_cp_layersplit:
             self.config_suffix += f"_cp{attn_cp_rank}_{attn_cp_size}"
 
         if not os.path.exists(self.file_path) and tp_rank == 0 and attn_cp_rank == 0:
@@ -362,6 +372,12 @@ class HiCacheFile(HiCacheStorage):
             is_mla_model=is_mla_model,
             extra_config=storage_config.extra_config,
         )
+
+        # Fault-tolerance bound: per-call cap on how many target files we are
+        # willing to stat in one probe. Beyond this we degrade to a miss instead
+        # of stalling (the prefetch thread shares the GIL with the main thread's
+        # gloo/NCCL collectives, so a long probe can deadlock cross-rank sync).
+        self._max_probe_files = 1024
 
     def _get_suffixed_key(self, key: str) -> str:
         return key + self.config_suffix
@@ -483,11 +499,28 @@ class HiCacheFile(HiCacheStorage):
             for key in keys:
                 target_files.add(f"{self._get_component_key(key, transfer.name)}.bin")
 
+        # Fault-tolerance: if a single batch queries an unreasonable number of
+        # target files (e.g. pathological long context with many pools), skip
+        # the probe and report a miss rather than stalling the prefetch thread
+        # (which shares the GIL with the main thread's gloo/NCCL collectives).
+        if len(target_files) > self._max_probe_files:
+            logger.warning(
+                "HiCache probe target set too large (%d > %d); degrading to miss",
+                len(target_files),
+                self._max_probe_files,
+            )
+            return set()
+
+        # Directly probe only the target files instead of scanning the whole
+        # directory.  The directory can grow to ~10^6 files (each KV component
+        # is one file); a full ``os.scandir`` there holds the GIL for seconds
+        # and stalls the main thread's gloo/NCCL collectives (cross-rank
+        # deadlock).  Probing O(len(target_files)) files is semantically
+        # identical (we return the same set of existing target files).
         existing_files = set()
-        with os.scandir(self.file_path) as entries:
-            for entry in entries:
-                if entry.is_file() and entry.name in target_files:
-                    existing_files.add(entry.name)
+        for name in target_files:
+            if os.path.exists(os.path.join(self.file_path, name)):
+                existing_files.add(name)
         return existing_files
 
     def batch_exists_v2(

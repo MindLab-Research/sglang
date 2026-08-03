@@ -61,6 +61,7 @@ from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
     release_kv_cache,
 )
+from sglang.srt.mem_cache.cp_layersplit_pool import unwrap_cp_layersplit_kv_pool
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
@@ -154,11 +155,12 @@ class PrefillBootstrapQueue:
         kv_args.engine_rank = self.tp_rank
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.ps.dp_rank
-        kv_args.prefill_start_layer = self.token_to_kv_pool.start_layer
-        kv_args.prefill_end_layer = getattr(self.token_to_kv_pool, "end_layer", None)
+        token_to_kv_pool = unwrap_cp_layersplit_kv_pool(self.token_to_kv_pool)
+        kv_args.prefill_start_layer = token_to_kv_pool.start_layer
+        kv_args.prefill_end_layer = getattr(token_to_kv_pool, "end_layer", None)
         kv_args.mla_compression_ratios = None
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
-            self.token_to_kv_pool.get_contiguous_buf_infos()
+            token_to_kv_pool.get_contiguous_buf_infos()
         )
 
         if self.draft_token_to_kv_pool is not None:
@@ -277,6 +279,14 @@ class PrefillBootstrapQueue:
         num_kv_indices_to_send = num_kv_indices - decode_prefix_len
         num_pages = kv_to_page_num(
             num_kv_indices_to_send, self.token_to_kv_pool.page_size
+        )
+        import logging as _lg
+        _lg.getLogger(__name__).info(
+            f"[DCP-PD-INIT] num_kv_indices={num_kv_indices}"
+            f" decode_prefix_len={decode_prefix_len}"
+            f" to_send={num_kv_indices_to_send}"
+            f" pool_page_size={self.token_to_kv_pool.page_size}"
+            f" num_pages={num_pages}"
         )
         req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
         req.pending_bootstrap = False
@@ -509,10 +519,9 @@ class SchedulerDisaggregationPrefillMixin:
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
+
             if self._engine_paused:
                 continue
-
-            self._apply_war_barrier()
 
             # Get the next batch to run
             batch = self.get_next_disagg_prefill_batch_to_run()
@@ -523,6 +532,7 @@ class SchedulerDisaggregationPrefillMixin:
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
                 batch_result = self.run_batch(batch)
+                self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
@@ -613,7 +623,6 @@ class SchedulerDisaggregationPrefillMixin:
             optimistic_polls = {
                 idx: poll for (idx, _), poll in zip(optimistic_reqs, polls)
             }
-
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):

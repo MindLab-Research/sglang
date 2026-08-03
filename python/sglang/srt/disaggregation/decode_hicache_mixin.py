@@ -81,12 +81,21 @@ class DecodeHiCachePreallocMixin:
                     if self.tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )
-                l3_storage_hit_length = self.tree_cache.query_storage_hit_length(
-                    last_host_node,
-                    suffix_tokens,
-                    last_hash,
-                    prefix_keys,
-                )
+                try:
+                    l3_storage_hit_length = self.tree_cache.query_storage_hit_length(
+                        last_host_node,
+                        suffix_tokens,
+                        last_hash,
+                        prefix_keys,
+                    )
+                except Exception:
+                    logger.warning(
+                        "L3 storage hit query failed for rid=%s; "
+                        "falling back to L2-only restore",
+                        req.rid,
+                        exc_info=True,
+                    )
+                    l3_storage_hit_length = 0
 
         return DecodePrefixMatch(
             prefix_indices=prefix_indices,
@@ -192,7 +201,14 @@ class DecodeHiCacheTransferMixin:
         if pm.l3_storage_hit_length > 0:
             if not self.tree_cache.check_prefetch_progress(dr.req.rid):
                 return False
-            self.tree_cache.pop_prefetch_loaded_tokens(dr.req.rid)
+            loaded_from_storage = self.tree_cache.pop_prefetch_loaded_tokens(
+                dr.req.rid
+            )
+            # PD covers the l3 range (total_prefix_len = l1+l2 in decode.py).
+            # Clear l3 so load_back only handles L2 (if any). This avoids
+            # the L3 query/actual mismatch that causes garble and leak.
+            # Prefetch host data remains in the host tree for future L2 hits.
+            pm.l3_storage_hit_length = 0
 
         # Re-match: req.last_node / prefix_indices updated to current device state.
         rematch = match_prefix_for_req(
@@ -294,15 +310,52 @@ class DecodeHiCacheTransferMixin:
         if prefix_match is None or not prefix_match.needs_local_restore:
             return
 
+        # Debug: log lock_ref state before commit
+        A = prefix_match.last_device_node
+        B = decode_req.hicache_restored_node
+        def _get_lock_ref(node):
+            from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
+            cd = node.component_data[ComponentType.FULL]
+            return cd.lock_ref if cd.value is not None else None
+        logger.warning(
+            f"COMMIT rid={decode_req.req.rid} A.id={A.id} A.lock_ref={_get_lock_ref(A)} "
+            f"B.id={B.id} B.lock_ref={_get_lock_ref(B)} "
+            f"B_is_child_of_A={B.parent is A} needs_restore={prefix_match.needs_local_restore} "
+            f"l1={prefix_match.l1_prefix_len} l2={prefix_match.l2_host_hit_length} l3={prefix_match.l3_storage_hit_length}"
+        )
         self.tree_cache.dec_lock_ref(prefix_match.last_device_node)
+        self.tree_cache.inc_lock_ref(decode_req.hicache_restored_node)
+        restored_len = len(decode_req.hicache_restored_kv_indices)
+
+        # With total_prefix_len = l1+l2 (PD covers l3), _pre_alloc wrote PD
+        # indices at req_to_token[l1+l2 : fill_len]. L2 load_back may load
+        # more than l2 (L3 prefetch put data in host tree, inflating host_hit).
+        # The extra HiCache indices overlap with PD indices at
+        # [l1+l2 : l1+restored_len]. Free the overwritten PD indices first
+        # to prevent orphaned allocations (leak).
+        total_prefix_len = getattr(decode_req.req, "cache_protected_len", 0)
+        restore_end = prefix_match.l1_prefix_len + restored_len
+        if total_prefix_len < restore_end:
+            overlap_indices = self.tree_cache.req_to_token_pool.req_to_token[
+                decode_req.req.req_pool_idx
+            ][total_prefix_len:restore_end]
+            self.tree_cache.token_to_kv_pool_allocator.free(overlap_indices)
 
         self.tree_cache.req_to_token_pool.write(
             (
                 decode_req.req.req_pool_idx,
-                slice(prefix_match.l1_prefix_len, prefix_match.decode_prefix_len),
+                slice(prefix_match.l1_prefix_len, restore_end),
             ),
             decode_req.hicache_restored_kv_indices,
         )
+
+        # Update cache_protected_len to cover the full restored range.
+        # This prevents cache_finished_req's insert from freeing HiCache
+        # indices as duplicates of tree values (load_back already committed
+        # them to the tree). Without this, insert would free them while the
+        # tree retains them → double count → leak.
+        decode_req.req.cache_protected_len = restore_end
+
         decode_req.req.prefix_indices = torch.cat(
             [prefix_match.prefix_indices, decode_req.hicache_restored_kv_indices]
         )

@@ -1436,10 +1436,13 @@ class HiRadixCache(RadixCache):
         return time.monotonic() - operation.start_time > timeout
 
     def can_terminate_prefetch(self, operation: PrefetchOperation):
-        can_terminate = True
-
+        # Local-only: no cross-rank all_reduce. Prefetch is per-rank (each rank
+        # loads its own KV), so each rank can independently decide to terminate.
+        # The all_reduce caused deadlocks when check_prefetch_progress (called
+        # inside pop_transferred) and _padded_all_reduce_min diverged across ranks.
+        # (matches upstream unified_radix_cache.py)
         if self.prefetch_stop_policy == "best_effort":
-            return can_terminate
+            return True
 
         if len(operation.hash_value) == 0:
             completed = False
@@ -1464,48 +1467,86 @@ class HiRadixCache(RadixCache):
             can_terminate = False
 
         operation_terminated = operation.is_terminated()
-        states = torch.tensor(
-            [1 - int(can_terminate), int(operation_terminated)],
-            dtype=torch.int,
-        )
-        self._all_reduce_attn_groups(states, torch.distributed.ReduceOp.MAX)
-        can_terminate = states[0].item() == 0
-        operation_terminated = states[1].item() == 1
-        # the operation should be terminated if it is already terminated on any TP worker
-        # or it meets the termination condition on all TP workers
-        can_terminate = can_terminate or operation_terminated
-        return can_terminate
+        return can_terminate or operation_terminated
 
     def check_prefetch_progress(self, req_id: str) -> bool:
-        if req_id not in self.ongoing_prefetch:
-            # there is no ongoing prefetch for this request or it has been revoked
+        # FIX(#30760/#33029): this collective must be UNCONDITIONAL for every
+        # rank scheduling this request.  A local cache miss/no-op is part of the
+        # consensus instead of returning early and allowing only a subset of
+        # TP/CP ranks to enter the collective -> call-count-mismatch deadlock.
+        info = self.ongoing_prefetch.get(req_id)
+        has_local_prefetch = info is not None
+        local_pending = False
+        local_io_active = False
+        local_completed_tokens = 0
+        if info is not None:
+            last_host_node, prefetch_key, host_indices, operation = info
+            local_pending = (
+                operation.host_indices is not None
+                and not self.can_terminate_prefetch(operation)
+            )
+            local_io_active = not operation.is_io_finished()
+            local_completed_tokens = operation.completed_tokens
+
+        # Unconditional cross-rank consensus (matches unified_radix_cache.py).
+        states = torch.tensor(
+            [
+                int(has_local_prefetch),
+                int(not has_local_prefetch),
+                int(local_pending),
+                int(local_io_active),
+                local_completed_tokens,
+            ],
+            dtype=torch.int,
+            device="cpu",
+        )
+        self._all_reduce_attn_groups(states, torch.distributed.ReduceOp.MAX)
+        any_prefetch = states[0].item() != 0
+        any_missing = states[1].item() != 0
+        any_pending = states[2].item() != 0
+        any_io_active = states[3].item() != 0
+        max_completed_tokens = int(states[4].item())
+
+        if not any_prefetch:
             return True
-
-        # todo: more policies for prefetch progress such as timeout
-        # the current policy is to prefetch with best effort and terminate when queuing is over
-        last_host_node, prefetch_key, host_indices, operation = self.ongoing_prefetch[
-            req_id
-        ]
-
-        if operation.host_indices is None:
-            # prefetch has not been issued due to insufficient host memory
-            return True
-
-        if not self.can_terminate_prefetch(operation):
+        if any_pending and not any_missing:
             return False
 
-        completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
-            operation
-        )
-        logger.debug(f"Prefetch {req_id} completed with {completed_tokens} tokens")
+        # Stop every local operation before fallback/finalization.
+        if info is not None and not operation.is_terminated():
+            operation.mark_terminate()
+        if any_io_active:
+            return False
 
-        min_completed_tokens = completed_tokens
-        # Synchronize workers before mutating host cache tree state.
-        completed_tokens_tensor = torch.tensor(min_completed_tokens, dtype=torch.int)
-        self._all_reduce_attn_groups(
-            completed_tokens_tensor, torch.distributed.ReduceOp.MIN
-        )
-        min_completed_tokens = completed_tokens_tensor.item()
+        if info is not None:
+            completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
+                operation
+            )
+        else:
+            completed_tokens = 0
+            hash_value = []
+            last_host_node = None
+            prefetch_key = None
+            host_indices = None
+
+        # Fixed-order collective keeps shapes identical.  Missing operations
+        # contribute zero, forcing a common safe prefix.
+        packed = torch.tensor([completed_tokens], dtype=torch.int, device="cpu")
+        self._all_reduce_attn_groups(packed, torch.distributed.ReduceOp.MIN)
+        min_completed_tokens = int(packed[0].item())
+
+        if min_completed_tokens <= 0:
+            if info is not None:
+                self.cache_controller.append_host_mem_release(
+                    host_indices=host_indices[:completed_tokens]
+                )
+                last_host_node.release_host()
+                del self.ongoing_prefetch[req_id]
+                self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
+            self.prefetch_loaded_tokens_by_reqid[req_id] = 0
+            return True
+
+        assert info is not None
         fetched_key = prefetch_key[:min_completed_tokens]
         written_indices = host_indices[:min_completed_tokens]
         matched_length = self._insert_helper_host(
@@ -1540,6 +1581,31 @@ class HiRadixCache(RadixCache):
         if operation.host_indices is None:
             return
         operation.mark_terminate()
+
+    def bulk_check_prefetch_progress(self, req_ids: list) -> dict:
+        """Check prefetch progress for a whole (already broadcast) waiting
+        queue in one shot, OUTSIDE the per-rank scheduler loop.
+
+        ``check_prefetch_progress`` internally fires a TP-group collective
+        (``_all_reduce_attn_groups``).  If it is called from inside the
+        ``for req in self.waiting_queue`` loop whose trip count depends on
+        per-rank local state (``get_num_allocatable_reqs`` / KV-pool
+        ``available_size``), different TP ranks can fire the collective a
+        different number of times in the same scheduler tick -> permanent
+        NCCL call-count-mismatch deadlock (upstream #30760 / fix #33029).
+
+        By calling this ONCE per tick with the full request-id list, every
+        rank fires the same number of collectives (== len(req_ids), which is
+        identical across ranks because the waiting queue is broadcast), so
+        collective ordering stays in sync.  The scheduler loop body then only
+        does a local ``dict.get()``.
+        """
+        if not self.enable_storage:
+            return {}
+        result = {}
+        for rid in req_ids:
+            result[rid] = self.check_prefetch_progress(rid)
+        return result
 
     def pop_prefetch_loaded_tokens(self, req_id: str) -> int:
         """

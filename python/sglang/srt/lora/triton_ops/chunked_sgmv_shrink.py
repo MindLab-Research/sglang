@@ -8,7 +8,12 @@ from sglang.srt.utils import cached_triton_kernel
 
 
 @cached_triton_kernel(
-    lambda _, kwargs: (kwargs["K"], kwargs["NUM_SLICES"], kwargs["BLOCK_M"])
+    lambda _, kwargs: (
+        kwargs["K"],
+        kwargs["NUM_SLICES"],
+        kwargs["BLOCK_M"],
+        kwargs["SPLIT_K"],
+    )
 )
 @triton.jit(do_not_specialize=["num_segs"])
 def _chunked_lora_shrink_kernel(
@@ -29,6 +34,7 @@ def _chunked_lora_shrink_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    SPLIT_K: tl.constexpr,
 ):
     """
     Computes a chunked SGMV for LoRA shrink operations.
@@ -37,6 +43,13 @@ def _chunked_lora_shrink_kernel(
     stores the product of the input `x` and the LoRA weights for the corresponding
     sequence. This implies that when rank is 0, the kernel is essentially a no-op,
     as output[seg_start:seg_start + seg_len, :0] is trivially correct (empty).
+
+    SPLIT_K>1 splits the K (input) dimension across multiple CTAs. Each CTA
+    computes a partial sum over its K-slice and atomically accumulates into the
+    output. This is essential on Blackwell (SM103): with a single decode token
+    the grid is otherwise (1, num_segs) — one CTA per segment, leaving 147 of
+    148 SMs idle. SPLIT_K=4..8 maps K=6144 onto 4-8 CTAs per (segment, N-block),
+    raising SM occupancy by that factor.
 
     Args:
         x (torch.Tensor): The input activations tensor of shape `(s, K)`, where `s`
@@ -55,11 +68,13 @@ def _chunked_lora_shrink_kernel(
     output_stride_0: tl.constexpr = N
     output_stride_1: tl.constexpr = 1
 
+    pid = tl.program_id(0)
     pid_s = tl.program_id(1)
     if pid_s >= num_segs:
         return
 
-    pid_n = tl.program_id(0)
+    pid_sk = pid % SPLIT_K
+    pid_n = pid // SPLIT_K
 
     seg_start = tl.load(seg_indptr + pid_s)
     seg_end = tl.load(seg_indptr + pid_s + 1)
@@ -85,7 +100,7 @@ def _chunked_lora_shrink_kernel(
     )
 
     n_offset = tl.arange(0, BLOCK_N) + pid_n * BLOCK_N
-    k_offset = tl.arange(0, BLOCK_K)
+    k_offset = pid_sk * BLOCK_K + tl.arange(0, BLOCK_K)
     x_ptrs = x + (
         s_offset_physical[:, None] * x_stride_0 + k_offset[None, :] * x_stride_1
     )
@@ -95,22 +110,23 @@ def _chunked_lora_shrink_kernel(
 
     # Iterate to compute the block in output matrix
     partial_sum = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_K)):
+    for k in range(0, tl.cdiv(K, BLOCK_K * SPLIT_K)):
+        k_global = (k * SPLIT_K + pid_sk) * BLOCK_K + tl.arange(0, BLOCK_K)
         x_tile = tl.load(
             x_ptrs,
             mask=(s_offset_logical[:, None] < seg_end)
-            & (k_offset[None, :] < K - k * BLOCK_K),
+            & (k_global[None, :] < K),
             other=0.0,
         )
         w_tile = tl.load(
             w_ptrs,
-            mask=(k_offset[:, None] < K - k * BLOCK_K) & (n_offset[None, :] < cur_n),
+            mask=(k_global[:, None] < K) & (n_offset[None, :] < cur_n),
             other=0.0,
         )
         partial_sum += tl.dot(x_tile, w_tile)
 
-        x_ptrs += BLOCK_K * x_stride_1
-        w_ptrs += BLOCK_K * w_stride_2
+        x_ptrs += BLOCK_K * SPLIT_K * x_stride_1
+        w_ptrs += BLOCK_K * SPLIT_K * w_stride_2
 
     # Store result to output matrix
     partial_sum = partial_sum.to(x.dtype.element_ty)
@@ -119,7 +135,29 @@ def _chunked_lora_shrink_kernel(
         + n_offset[None, :] * output_stride_1
     )
     output_mask = (s_offset_logical[:, None] < seg_end) & (n_offset[None, :] < cur_n)
-    tl.store(output_ptr, partial_sum, mask=output_mask)
+    if SPLIT_K == 1:
+        tl.store(output_ptr, partial_sum, mask=output_mask)
+    else:
+        tl.atomic_add(output_ptr, partial_sum, mask=output_mask, sem="relaxed")
+
+
+def _pick_split_k(M: int, N: int, K: int, num_segs: int, block_m: int) -> int:
+    """Choose SPLIT_K so the total CTA count reaches a Blackwell-worthy occupancy.
+
+    On SM103 (148 SMs), a decode batch of one token produces grid =
+    (cdiv(N,BLOCK_N) * SPLIT_K, num_segs). With N=16, BLOCK_N=16, num_segs=1
+    that is just (SPLIT_K, 1) — we want SPLIT_K to fill as many SMs as useful.
+    We cap at 8 to avoid atomic_add contention on tiny (16,16) tiles; the K
+    loop then still covers 6144/8 = 768 per CTA.
+    """
+    # effective number of tokens handled by the kernel
+    effective_tokens = max(1, min(M, num_segs * block_m))
+    if effective_tokens >= 64:
+        # enough parallelism from BLOCK_M alone
+        return 1
+    # small batch: parallelize over K. Split into at most 8 chunks.
+    block_k_min = 64
+    return min(8, max(1, K // block_k_min))
 
 
 def chunked_sgmv_lora_shrink_forward(
@@ -161,8 +199,9 @@ def chunked_sgmv_lora_shrink_forward(
         if batch_info.use_cuda_graph
         else num_segments
     )
+    SPLIT_K = _pick_split_k(S, N, K, segment_grid, BLOCK_M)
     grid = (
-        triton.cdiv(N, BLOCK_N),
+        SPLIT_K * triton.cdiv(N, BLOCK_N),
         segment_grid,
     )
 
@@ -173,7 +212,7 @@ def chunked_sgmv_lora_shrink_forward(
     if "num_stages" in config:
         extra_kwargs["num_stages"] = config["num_stages"]
 
-    output = torch.empty((S, N), device=x.device, dtype=x.dtype)
+    output = torch.zeros((S, N), device=x.device, dtype=x.dtype)
     _chunked_lora_shrink_kernel[grid](
         x=x,
         weights=weights,
@@ -190,6 +229,7 @@ def chunked_sgmv_lora_shrink_forward(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
+        SPLIT_K=SPLIT_K,
         **extra_kwargs,
     )
 

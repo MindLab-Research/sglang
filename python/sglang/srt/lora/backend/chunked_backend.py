@@ -188,6 +188,9 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
             if forward_batch.forward_mode.is_extend()
             else forward_batch.batch_size
         )
+        if num_tokens is None:
+            # EAGLE target-verify capture batches may have extend_num_tokens unset.
+            num_tokens = forward_batch.batch_size or 0
         return self._determine_chunk_size_for_tokens(num_tokens)
 
     def _determine_chunk_size_for_tokens(self, num_tokens: int) -> int:
