@@ -126,21 +126,18 @@ def can_cp_split(seq_len: int, cp_size: int, forward_batch):
     # fallback would have masked the bug -- raise instead. Per-sequence
     # radix-cache prefix is supported: prefix is baked into kv_len_prev/next
     # via prefix_offsets[s] inside prepare_context_parallel_metadata.
-    #
-    # IMPORTANT: this guard MUST NOT read forward_batch.extend_seq_lens_cpu.
-    # Under HiCache local-only prefetch the per-rank radix-tree prefix hits
-    # diverge, so extend_seq_lens_cpu differs across CP ranks.  A per-rank
-    # decision makes some ranks enter CP collectives (cp_layersplit
-    # broadcast / CP all_gather) while others skip them -> permanent NCCL
-    # call-count mismatch -> 600 s watchdog -> SIGABRT.  seq_len
-    # (len_input_ids) is global and identical on every rank; use it.
+    extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
+    if extend_lens is None:
+        return True
+
     cp_min = cp_size * 2
-    if seq_len < cp_min:
-        # A sub-threshold batch cannot be zigzag-split into 2*cp_size
-        # blocks; fall back to a normal (non-CP) prefill for this batch
-        # instead of failing. Happens e.g. when a radix-cache prefix hit
-        # leaves only a few unique extend tokens.
-        return False
+    for L in extend_lens:
+        if L < cp_min:
+            # A sub-threshold request cannot be zigzag-split into 2*cp_size
+            # blocks; fall back to a normal (non-CP) prefill for this batch
+            # instead of failing. Happens e.g. when a radix-cache prefix hit
+            # leaves only a few unique extend tokens.
+            return False
 
     return True
 
