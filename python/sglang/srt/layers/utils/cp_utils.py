@@ -565,12 +565,24 @@ def is_cp_layersplit_active(server_args, attn_cp_rank) -> bool:
 
 
 def cp_layersplit_should_broadcast_prefix(forward_batch) -> bool:
-    """Gate for prefix gather: cp-layersplit enabled + extend (non-speculative) + has prefix."""
+    """Rank-invariant gate for prefix gather.
+
+    Every condition here is evaluated identically on ALL CP ranks.  Per-rank
+    conditions — ``extend_prefix_lens_cpu is not None`` and
+    ``any(extend_prefix_lens_cpu)`` — MUST NOT appear here.  HiCache prefetch
+    is a local-only radix-tree operation, so prefix-match results can diverge
+    across ranks (some ranks see a prefix, others see None or all-zeros).  A
+    per-rank gate makes some ranks enter the NCCL broadcast while others skip
+    → permanent NCCL call-count mismatch → 600 s watchdog → SIGABRT.
+
+    None / empty prefix is handled inside ``broadcast_owner_layer_prefix``:
+    a None guard at entry normalises to an all-zeros tensor, then the
+    size-broadcast protocol (all ranks broadcast the owner's element count;
+    n==0 → all ranks return consistently) guarantees collective alignment.
+    """
     return (
         get_global_server_args().enable_dsa_prefill_cp_layersplit
         and forward_batch.forward_mode.is_extend_without_speculative()
-        and forward_batch.extend_prefix_lens_cpu is not None
-        and any(forward_batch.extend_prefix_lens_cpu)
     )
 
 

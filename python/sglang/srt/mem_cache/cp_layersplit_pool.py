@@ -169,6 +169,14 @@ class CpLayerSplitKVPool:
         req_pool_indices = forward_batch.req_pool_indices
         prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
 
+        # None guard: gate no longer checks ``is not None`` (that check was
+        # per-rank and caused deadlocks).  Normalise to all-zeros so the
+        # size-broadcast protocol below handles it uniformly across ranks.
+        if prefix_lens_cpu is None:
+            prefix_lens_cpu = torch.zeros(
+                len(req_pool_indices), dtype=torch.int32
+            )
+
         prefix_slots_list = []
         for i, plen in enumerate(prefix_lens_cpu):
             if plen > 0:
