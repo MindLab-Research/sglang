@@ -211,13 +211,20 @@ def can_dsa_cp_split(seq_len: int, cp_size: int, use_dsa: bool, forward_batch):
         # Note: (self.cp_size * 2) To achieve load balancing for seq computation,
         # the seq data needs to be divided and recombined at twice the size of cp_size.
         cur_cp_seq_len = seq_len // (cp_size * 2)
+    # NOTE: the per-seq guard MUST NOT use forward_batch.extend_seq_lens_cpu.
+    # Under HiCache local-only prefetch, per-rank radix-tree prefix hits
+    # diverge, so extend_seq_lens_cpu differs across CP ranks.  A per-rank
+    # decision makes some ranks enter CP collectives (CP all_gather,
+    # cp_layersplit broadcast) while others skip them -> permanent NCCL
+    # call-count mismatch -> 600 s watchdog -> SIGABRT.  seq_len
+    # (len_input_ids) is global and identical on every rank; use it.
     if (
         cur_cp_seq_len != 0
         and cp_size > 1
         and use_dsa
         and forward_batch.forward_mode.is_context_parallel_extend()
         and is_dsa_enable_prefill_cp()
-        and sum(forward_batch.extend_seq_lens_cpu) >= cp_size
+        and seq_len >= cp_size
     ):
         return True
     else:
