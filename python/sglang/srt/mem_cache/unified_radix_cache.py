@@ -2101,6 +2101,253 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         operation_terminated = operation.is_terminated()
         return can_terminate or operation_terminated
 
+    def bulk_check_prefetch_progress(self, req_ids: list) -> dict:
+        """Check prefetch progress for all requests in ONE collective round.
+
+        This is the rank-safe replacement for calling ``check_prefetch_progress``
+        per-request inside the scheduler's batch-formation loop.  The original
+        per-request path fires 1–2 TP/CP ``all_reduce`` collectives *per
+        request*; when the per-rank number of schedulable requests drifts
+        (HiCache local-only prefetch, ``get_num_allocatable_reqs`` / 
+        ``available_size`` differences), the collective count diverges across
+        ranks → a rank stuck in ``all_reduce`` while peers have moved on to the
+        ``maybe_prepare_mlp_sync_batch`` ``all_gather`` → permanent
+        cross-collective deadlock → 600 s watchdog SIGABRT (FIX #30760).
+
+        Strategy: gather the local state vector for *every* request, batch them
+        into a single 2-D tensor, run one ``all_reduce(MAX)`` across the attn
+        groups, then replay the same terminate / finalize / insert logic that
+        ``check_prefetch_progress`` uses — but driven from the consensus result
+        rather than a fresh per-request collective.
+        """
+        if not req_ids:
+            return {}
+
+        extra_pool_names = tuple(
+            pool_name for pool_name in PoolName if pool_name != PoolName.KV
+        )
+        num_extra = len(extra_pool_names)
+        # Per-request state vector layout (must match check_prefetch_progress):
+        #   [0] has_local_prefetch
+        #   [1] not has_local_prefetch (any_missing)
+        #   [2] local_pending
+        #   [3] local_io_active
+        #   [4] local_completed_tokens
+        #   [5 : 5+num_extra]        all_pages_pools flags
+        #   [5+num_extra : 5+2*num]   trailing_pools flags
+        vec_len = 5 + 2 * num_extra
+
+        local_infos = []
+        local_states = []
+        for rid in req_ids:
+            info = self.ongoing_prefetch.get(rid)
+            has_local_prefetch = info is not None
+            local_pending = False
+            local_io_active = False
+            all_pages_pools = set()
+            trailing_pools = set()
+            local_completed_tokens = 0
+            if info is not None:
+                operation = info.operation
+                local_pending = (
+                    operation.host_indices is not None
+                    and not self.can_terminate_prefetch(operation)
+                )
+                local_io_active = not operation.is_io_finished()
+                local_completed_tokens = operation.completed_tokens
+                all_pages_pools = {
+                    transfer.name
+                    for transfer in operation.pool_transfers or ()
+                    if transfer.name != PoolName.KV
+                    and transfer.hit_policy == PoolHitPolicy.ALL_PAGES
+                }
+                trailing_pools = {
+                    transfer.name
+                    for transfer in operation.pool_transfers or ()
+                    if transfer.name != PoolName.KV
+                    and transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES
+                }
+            local_infos.append(info)
+            local_states.append(
+                [
+                    int(has_local_prefetch),
+                    int(not has_local_prefetch),
+                    int(local_pending),
+                    int(local_io_active),
+                    local_completed_tokens,
+                ]
+                + [int(pool_name in all_pages_pools) for pool_name in extra_pool_names]
+                + [int(pool_name in trailing_pools) for pool_name in extra_pool_names]
+            )
+
+        states_tensor = torch.tensor(
+            local_states, dtype=torch.int, device="cpu"
+        )
+        # One all_reduce for all requests — collective count is now independent
+        # of per-rank batch composition.
+        self._all_reduce_attn_groups(states_tensor, torch.distributed.ReduceOp.MAX)
+        states_np = states_tensor.tolist()
+
+        # First pass: determine consensus for each request and handle the
+        # early-return cases (any_prefetch / any_pending / any_io_active).
+        # For requests that need the second all_reduce (finalize path), collect
+        # their indices so we can batch that collective too.
+        results: dict = {}
+        finalize_indices: list = []
+        for i, rid in enumerate(req_ids):
+            s = states_np[i]
+            any_prefetch = s[0] != 0
+            any_missing = s[1] != 0
+            any_pending = s[2] != 0
+            any_io_active = s[3] != 0
+
+            if not any_prefetch:
+                results[rid] = True
+                continue
+            if any_pending and not any_missing:
+                results[rid] = False
+                continue
+
+            info = local_infos[i]
+            if info is not None and not info.operation.is_terminated():
+                info.operation.mark_terminate()
+            if any_io_active:
+                results[rid] = False
+                continue
+
+            # Needs the second collective (finalize / insert path).
+            finalize_indices.append(i)
+
+        if not finalize_indices:
+            return results
+
+        # Second collective: batch the "packed" vector (completed_tokens +
+        # extra_pool hit_pages) for all requests that reached the finalize
+        # path.  Same MIN all_reduce as check_prefetch_progress.
+        finalize_packed = []
+        for i in finalize_indices:
+            rid = req_ids[i]
+            info = local_infos[i]
+            if info is not None:
+                (
+                    last_host_node,
+                    prefetch_key,
+                    host_indices,
+                    operation,
+                    anchor_lock_params,
+                    comp_xfers,
+                ) = info
+                completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
+                    operation
+                )
+                hit_pages = operation.pool_storage_result.extra_pool_hit_pages
+            else:
+                last_host_node = None
+                prefetch_key = None
+                host_indices = None
+                operation = None
+                anchor_lock_params = None
+                comp_xfers = {}
+                completed_tokens = 0
+                hash_value = []
+                hit_pages = {}
+
+            packed = torch.tensor(
+                [completed_tokens]
+                + [
+                    hit_pages.get(pool_name, hit_pages.get(pool_name.value, 0))
+                    for pool_name in extra_pool_names
+                ],
+                dtype=torch.int,
+                device="cpu",
+            )
+            finalize_packed.append((packed, info, last_host_node, prefetch_key,
+                                     host_indices, anchor_lock_params, comp_xfers,
+                                     completed_tokens, hit_pages, hash_value))
+
+        packed_tensor = torch.stack([fp[0] for fp in finalize_packed])
+        self._all_reduce_attn_groups(packed_tensor, torch.distributed.ReduceOp.MIN)
+        packed_np = packed_tensor.tolist()
+
+        for j, i in enumerate(finalize_indices):
+            rid = req_ids[i]
+            (
+                _packed,
+                info,
+                last_host_node,
+                prefetch_key,
+                host_indices,
+                anchor_lock_params,
+                comp_xfers,
+                completed_tokens,
+                hit_pages,
+                hash_value,
+            ) = finalize_packed[j]
+            packed = packed_np[j]
+
+            s = states_np[i]
+            max_completed_tokens = s[4]
+            min_completed_tokens = int(packed[0])
+            num_extra = len(extra_pool_names)
+            has_trailing_pool = False
+            for k, pool_name in enumerate(extra_pool_names, start=1):
+                synced_hit_pages = int(packed[k])
+                hit_pages[pool_name] = synced_hit_pages
+                if s[4 + k] != 0:
+                    min_completed_tokens = min(
+                        min_completed_tokens,
+                        synced_hit_pages * self.page_size,
+                    )
+                has_trailing_pool |= (
+                    s[4 + num_extra + k] != 0
+                )
+            if has_trailing_pool and max_completed_tokens != int(packed[0]):
+                min_completed_tokens = 0
+
+            if min_completed_tokens <= 0:
+                if info is not None:
+                    self.cache_controller.append_host_mem_release(
+                        host_indices=host_indices[:completed_tokens],
+                        extra_pools=[
+                            transfer
+                            for transfers in comp_xfers.values()
+                            for transfer in transfers
+                        ],
+                    )
+                    self.dec_host_lock_ref(last_host_node, anchor_lock_params)
+                    del self.ongoing_prefetch[rid]
+                    self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
+                    assert self.cache_controller.prefetch_tokens_occupied >= 0
+                self.prefetch_loaded_tokens_by_reqid[rid] = 0
+                results[rid] = True
+                continue
+
+            assert info is not None
+            fetched_key = prefetch_key[:min_completed_tokens]
+            insert_result = self._insert_helper_host(
+                fetched_key,
+                min_completed_tokens,
+                hash_value[:min_completed_tokens],
+            )
+            loaded_from_storage = insert_result.loaded_from_storage
+            self.prefetch_loaded_tokens_by_reqid[rid] = loaded_from_storage
+
+            self.cache_controller.append_host_mem_release(
+                host_indices=host_indices[completed_tokens:],
+                extra_pools=[
+                    transfer
+                    for transfers in comp_xfers.values()
+                    for transfer in transfers
+                ],
+            )
+            self.dec_host_lock_ref(last_host_node, anchor_lock_params)
+            del self.ongoing_prefetch[rid]
+            self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
+            assert self.cache_controller.prefetch_tokens_occupied >= 0
+            results[rid] = True
+
+        return results
+
     def check_prefetch_progress(self, req_id: str) -> bool:
         info = self.ongoing_prefetch.get(req_id)
         has_local_prefetch = info is not None
