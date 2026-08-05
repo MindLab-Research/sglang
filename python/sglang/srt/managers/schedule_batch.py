@@ -2023,6 +2023,34 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         seq_lens = [r.extend_range.end for r in reqs]
         orig_seq_lens = [max(r.extend_range.end, len(r.origin_input_ids)) for r in reqs]
         prefix_lens = [len(r.prefix_indices) for r in reqs]
+
+        # CP rank-invariant prefix consensus: HiCache local-only prefetch makes
+        # prefix_indices diverge across CP ranks → input_ids length diverges →
+        # after CP round-robin split, key size diverges → all_gather deadlock.
+        # all_reduce(MIN) so all ranks use the same prefix length → rank-invariant
+        # input_ids → uniform key size → safe all_gather.  Ranks with more prefix
+        # tokens (more HiCache hits) re-compute the excess as extend tokens —
+        # correct (KV values are deterministic) but slightly wasteful.
+        tree_cache = getattr(self, "tree_cache", None)
+        if (
+            tree_cache is not None
+            and hasattr(tree_cache, "_all_reduce_attn_groups")
+            and getattr(tree_cache, "attn_cp_group", None) is not None
+        ):
+            for i, req in enumerate(reqs):
+                plen = prefix_lens[i]
+                if plen == 0:
+                    continue
+                t = torch.tensor([plen], dtype=torch.int32, device="cpu")
+                tree_cache._all_reduce_attn_groups(
+                    t, torch.distributed.ReduceOp.MIN
+                )
+                min_plen = int(t.item())
+                if plen > min_plen:
+                    req.prefix_indices = req.prefix_indices[:min_plen]
+                    req.set_extend_range(min_plen, req.extend_range.end)
+                    prefix_lens[i] = min_plen
+
         extend_lens = [r.extend_range.length for r in reqs]
         extend_logprob_start_lens = [
             compute_extend_logprob_start_len(
