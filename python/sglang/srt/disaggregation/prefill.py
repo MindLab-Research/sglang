@@ -481,25 +481,26 @@ class SchedulerDisaggregationPrefillMixin:
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
         while True:
+            # Iteration barrier: at the TOP of the loop, BEFORE any collective.
+            # pop_bootstrapped() fires gloo all_reduce on attn_cp/tp groups;
+            # get_next_disagg_prefill_batch_to_run() fires NCCL all_gather;
+            # run_batch() fires NCCL collectives in model forward. If this
+            # barrier is placed AFTER pop_bootstrapped (as it was previously),
+            # fast ranks that finish run_batch early race ahead into the NEXT
+            # iteration's pop_bootstrapped gloo all_reduce while slow ranks
+            # are still in the CURRENT iteration's NCCL forward →
+            # cross-collective deadlock (gloo all_reduce waiting for ranks
+            # that are blocked in NCCL) → 600s watchdog SIGABRT.
+            _eb = torch.tensor(0, dtype=torch.int, device="cpu")
+            torch.distributed.all_reduce(_eb, op=torch.distributed.ReduceOp.MIN,
+                                         group=self.tp_cpu_group)
+
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
-
-            # Iteration barrier: AFTER recv_requests broadcast, BEFORE
-            # get_next_disagg_prefill_batch_to_run. All ranks must
-            # synchronize here before entering the NCCL all_gather in
-            # maybe_prepare_mlp_sync_batch (MLPSyncBatchInfo, 7 elements).
-            # This prevents cross-iteration collective drift: if one rank's
-            # zmq recv or mooncake bootstrap is slow/stalled, the barrier
-            # holds fast ranks here so they cannot race ahead into the NCCL
-            # all_gather and timeout waiting for the stalled rank (600s NCCL
-            # watchdog → crash).
-            _eb = torch.tensor(0, dtype=torch.int, device="cpu")
-            torch.distributed.all_reduce(_eb, op=torch.distributed.ReduceOp.MIN,
-                                         group=self.tp_cpu_group)
 
             if self._engine_paused:
                 continue
@@ -527,21 +528,18 @@ class SchedulerDisaggregationPrefillMixin:
         self.result_queue = deque()
 
         while True:
+            # Iteration barrier: at the TOP of the loop, BEFORE any collective.
+            # See event_loop_normal_disagg_prefill for detailed comment.
+            _eb = torch.tensor(0, dtype=torch.int, device="cpu")
+            torch.distributed.all_reduce(_eb, op=torch.distributed.ReduceOp.MIN,
+                                         group=self.tp_cpu_group)
+
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
-
-            # Iteration barrier: AFTER recv_requests broadcast, BEFORE
-            # get_next_disagg_prefill_batch_to_run. Prevents cross-iteration
-            # collective drift between gloo broadcast and NCCL all_gather
-            # (MLPSyncBatchInfo). See event_loop_normal_disagg_prefill for
-            # detailed comment.
-            _eb = torch.tensor(0, dtype=torch.int, device="cpu")
-            torch.distributed.all_reduce(_eb, op=torch.distributed.ReduceOp.MIN,
-                                         group=self.tp_cpu_group)
 
             if self._engine_paused:
                 continue
