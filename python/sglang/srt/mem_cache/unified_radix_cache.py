@@ -2262,7 +2262,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 device="cpu",
             )
             finalize_packed.append((packed, info, last_host_node, prefetch_key,
-                                     host_indices, anchor_lock_params, comp_xfers,
+                                     host_indices, operation, anchor_lock_params, comp_xfers,
                                      completed_tokens, hit_pages, hash_value))
 
         packed_tensor = torch.stack([fp[0] for fp in finalize_packed])
@@ -2277,6 +2277,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 last_host_node,
                 prefetch_key,
                 host_indices,
+                operation,
                 anchor_lock_params,
                 comp_xfers,
                 completed_tokens,
@@ -2325,25 +2326,51 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             assert info is not None
             fetched_key = prefetch_key[:min_completed_tokens]
             insert_result = self._insert_helper_host(
+                last_host_node,
                 fetched_key,
-                min_completed_tokens,
-                hash_value[:min_completed_tokens],
+                host_indices[:min_completed_tokens],
+                hash_value[: min_completed_tokens // self.page_size],
             )
-            loaded_from_storage = insert_result.loaded_from_storage
-            self.prefetch_loaded_tokens_by_reqid[rid] = loaded_from_storage
 
+            for ct, transfers in comp_xfers.items():
+                self.components[ct].commit_hicache_transfer(
+                    last_host_node,
+                    CacheTransferPhase.PREFETCH,
+                    transfers,
+                    insert_result=insert_result,
+                    pool_storage_result=operation.pool_storage_result,
+                )
+
+            self.cache_controller.mem_pool_host.free(
+                host_indices[: insert_result.prefix_len]
+            )
             self.cache_controller.append_host_mem_release(
-                host_indices=host_indices[completed_tokens:],
-                extra_pools=[
-                    transfer
-                    for transfers in comp_xfers.values()
-                    for transfer in transfers
-                ],
+                host_indices[min_completed_tokens:completed_tokens]
             )
             self.dec_host_lock_ref(last_host_node, anchor_lock_params)
             del self.ongoing_prefetch[rid]
             self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
-            assert self.cache_controller.prefetch_tokens_occupied >= 0
+
+            loaded_from_storage = min_completed_tokens - insert_result.prefix_len
+            self.prefetch_loaded_tokens_by_reqid[rid] = loaded_from_storage
+            logger.info(
+                "HiCache prefetch success req=%s completed_local=%d "
+                "completed_synced=%d matched=%d loaded=%d tail_release=%d occupied=%d",
+                rid,
+                completed_tokens,
+                min_completed_tokens,
+                insert_result.prefix_len,
+                loaded_from_storage,
+                completed_tokens - min_completed_tokens,
+                self.cache_controller.prefetch_tokens_occupied,
+            )
+            if (
+                self.enable_storage_metrics
+                and self.storage_metrics_collector is not None
+            ):
+                self.storage_metrics_collector.log_prefetched_tokens(
+                    loaded_from_storage
+                )
             results[rid] = True
 
         return results
