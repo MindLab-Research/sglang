@@ -114,9 +114,14 @@ def can_dsa_prefill_cp_round_robin_split(forward_batch: "ForwardBatch"):
     if not forward_batch.forward_mode.is_context_parallel_extend():
         return False
     cp_size = get_parallel().attn_cp_size
-    seq_len = sum(forward_batch.extend_seq_lens_cpu)
+    # Use extend_num_tokens (rank-invariant, computed from input_ids at batch
+    # prep time) instead of sum(extend_seq_lens_cpu) which diverges across CP
+    # ranks under HiCache local-only prefetch — causing NCCL collective order
+    # mismatch (some ranks enter CP, others don't) → watchdog SIGABRT.
+    seq_len = forward_batch.extend_num_tokens
     return (
         is_dsa_prefill_cp_round_robin_split()
+        and seq_len is not None
         and seq_len > 0
         and seq_len >= cp_size
         and cp_size > 1
@@ -217,7 +222,7 @@ def can_dsa_cp_split(seq_len: int, cp_size: int, use_dsa: bool, forward_batch):
         and use_dsa
         and forward_batch.forward_mode.is_context_parallel_extend()
         and is_dsa_enable_prefill_cp()
-        and sum(forward_batch.extend_seq_lens_cpu) >= cp_size
+        and seq_len >= cp_size
     ):
         return True
     else:
