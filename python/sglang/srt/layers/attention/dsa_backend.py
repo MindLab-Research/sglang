@@ -25,7 +25,7 @@ from sglang.srt.layers.dcp.comm import (
     get_attention_dcp_world_size,
     get_attention_dcp_rank,
 )
-from sglang.srt.layers.dcp.kernels import fused_localize_lens_cumsum
+from sglang.srt.layers.dcp.kernels import fused_localize_lens_cumsum, expand_lens_2d
 
 # DCP debug logging helper (gated by SGLANG_DCP_DEBUG env var)
 import os as _os
@@ -705,7 +705,11 @@ class DeepseekSparseAttnBackend(
             and next_n >= 2
             and is_sm100_supported()
         ):
-            return cache_seqlens_int32.view(-1, 1).expand(-1, next_n).contiguous()
+            # Write the expanded [B, next_n] lens with a single Triton kernel
+            # (each draft query uses the same final cache length), replacing
+            # view+expand+contiguous which copies through a broadcast layout.
+            out = cache_seqlens_int32.new_empty(batch_size, next_n)
+            return expand_lens_2d(cache_seqlens_int32, next_n, out)
         if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
             return _to_2d_context_lens(seqlens_expanded, batch_size)
         return _to_2d_context_lens(cache_seqlens_int32, batch_size)
