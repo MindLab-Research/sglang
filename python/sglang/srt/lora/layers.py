@@ -992,6 +992,15 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         elif runner_backend.is_triton():
             assert base_layer.quant_method is not None, "Quant method must be set"
             self._quant_info = base_layer.quant_method.get_triton_quant_info(base_layer)
+        elif runner_backend.is_aiter():
+            # AITER fused_moe doesn't expose intermediates, so we apply
+            # LoRA as a post-hoc residual on the fused_moe output.
+            assert base_layer.quant_method is not None, "Quant method must be set"
+            aiter_qi = base_layer.quant_method.maybe_get_hip_aiter_quant_info(base_layer)
+            if aiter_qi is not None:
+                self._quant_info = aiter_qi
+            else:
+                self._quant_info = base_layer.quant_method.get_triton_quant_info(base_layer)
         else:
             raise NotImplementedError(
                 f"LoRA MoE not supported for backend {runner_backend}"

@@ -646,11 +646,11 @@ def fused_topk_torch_native(
 ):
     def scoring_func_impl(gating_output: torch.Tensor) -> torch.Tensor:
         if scoring_func == "softmax":
-            return gating_output.softmax(dim=-1)
+            return gating_output.float().softmax(dim=-1).to(gating_output.dtype)
         elif scoring_func == "sigmoid":
-            return gating_output.sigmoid()
+            return gating_output.float().sigmoid().to(gating_output.dtype)
         elif scoring_func == "sqrtsoftplus":
-            return F.softplus(gating_output).sqrt()
+            return F.softplus(gating_output.float()).sqrt().to(gating_output.dtype)
         else:
             raise ValueError(f"Invalid scoring function: {scoring_func}")
 
@@ -877,7 +877,7 @@ def grouped_topk_gpu(
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
-    scores = torch.softmax(gating_output, dim=-1)
+    scores = torch.softmax(gating_output.float(), dim=-1).to(gating_output.dtype)
     num_token = scores.shape[0]
     num_experts = scores.shape[1]
     group_scores = (
@@ -971,7 +971,7 @@ def kimi_k2_biased_topk_impl(
     """
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
-    scores = gating_output.sigmoid()
+    scores = gating_output.float().sigmoid().to(gating_output.dtype)
     num_token = scores.shape[0]
 
     # When num_expert_group=1, no need for group masking
@@ -1009,9 +1009,9 @@ def biased_topk_impl(
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
     if scoring_func == "sigmoid":
-        scores = gating_output.sigmoid()
+        scores = gating_output.float().sigmoid().to(gating_output.dtype)
     elif scoring_func == "sqrtsoftplus":
-        scores = torch.nn.functional.softplus(gating_output).sqrt()
+        scores = torch.nn.functional.softplus(gating_output.float()).sqrt().to(gating_output.dtype)
 
     num_token = scores.shape[0]
     num_experts = scores.shape[1]
@@ -1124,7 +1124,7 @@ def biased_grouped_topk_impl(
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
-    scores = gating_output.sigmoid()
+    scores = gating_output.float().sigmoid().to(gating_output.dtype)
     num_token = scores.shape[0]
     num_experts = scores.shape[1]
     scores_for_choice = scores.view(num_token, -1) + correction_bias.unsqueeze(0)
@@ -1241,7 +1241,7 @@ def _fill_padded_rows(
         num_token_non_padded.device == x.device
     ), "num_token_non_padded and x must be on the same device"
     n_rows, n_cols = x.shape
-    _fill_padded_rows_kernel[(n_rows,)](
+    _fill_padded_rows_kernel_v2[(n_rows,)](
         x,
         num_token_non_padded,
         n_cols,
@@ -1513,6 +1513,9 @@ def biased_grouped_topk_gpu(
         assert (
             hidden_states.shape[0] == gating_output.shape[0]
         ), f"Number of tokens mismatch: hidden_states.shape[0] = {hidden_states.shape[0]}, gating_output.shape[0] = {gating_output.shape[0]}"
+        # AITER topk expects BF16 — LoRA delta may upcast to FP32
+        if gating_output.dtype != torch.bfloat16:
+            gating_output = gating_output.to(torch.bfloat16)
         topk_weights = torch.empty((token, topk), dtype=torch.float32, device=device)
         topk_ids = torch.empty((token, topk), dtype=torch.int32, device=device)
         aiter_biased_grouped_topk(
