@@ -29,6 +29,7 @@ from sglang.srt.layers.dcp.kernels import fused_localize_lens_cumsum
 
 # DCP debug logging helper (gated by SGLANG_DCP_DEBUG env var)
 import os as _os
+import time as _time
 _dcp_debug_flag = _os.environ.get("SGLANG_DCP_DEBUG", "").lower() in ("1", "true", "yes")
 def _dcp_log(msg, *args, **kwargs):
     if _dcp_debug_flag:
@@ -749,7 +750,9 @@ class DeepseekSparseAttnBackend(
             return
         from sglang.jit_kernel.dsv4.topk import plan_topk_v2
 
-        metadata.topk_v2_plan.copy_(plan_topk_v2(metadata.dsa_seqlens_expanded))
+        # In-place: the kernel writes directly into the captured buffer,
+        # avoiding a per-step new_empty allocation + copy_.
+        plan_topk_v2(metadata.dsa_seqlens_expanded, out=metadata.topk_v2_plan)
 
     def _get_fused_topk_page_table(self, topk_indices: torch.Tensor) -> torch.Tensor:
         if (
@@ -1116,6 +1119,11 @@ class DeepseekSparseAttnBackend(
             topk_v2_plan=self._build_topk_v2_plan(seqlens_expanded),
         )
         if dcp_enabled():
+            _DCP_PROFILE = _os.environ.get("SGLANG_DCP_PROFILE", "0") == "1"
+            _t0 = None
+            if _DCP_PROFILE and not torch.cuda.is_current_stream_capturing():
+                torch.cuda.synchronize()
+                _t0 = _time.perf_counter()
             expanded_size = metadata.dsa_seqlens_expanded.shape[0]
             _localize_page_dcp_metadata_(
                 metadata,
@@ -1124,6 +1132,13 @@ class DeepseekSparseAttnBackend(
                 self.real_page_size,
                 self.dsa_index_topk,
             )
+            if _t0 is not None:
+                torch.cuda.synchronize()
+                print(
+                    f"[DCP-PROF] _localize {(_time.perf_counter()-_t0)*1000:.2f}ms "
+                    f"batch={forward_batch.batch_size} expanded={expanded_size}",
+                    flush=True,
+                )
             if dcp_debug_enabled() and not torch.cuda.is_current_stream_capturing():
                 _g_sl = (
                     forward_batch.seq_lens.tolist()
@@ -1146,10 +1161,21 @@ class DeepseekSparseAttnBackend(
                 metadata.dsa_seqlens_expanded,
                 forward_batch.batch_size,
             )
+            _t1 = None
+            if _DCP_PROFILE and not torch.cuda.is_current_stream_capturing():
+                torch.cuda.synchronize()
+                _t1 = _time.perf_counter()
             if metadata.paged_mqa_ctx_lens_2d is not None:
                 metadata.paged_mqa_ctx_lens_2d.copy_(local_ctx_lens)
                 self._refresh_paged_mqa_schedule_metadata(metadata, local_ctx_lens)
             self._refresh_topk_v2_plan(metadata)
+            if _t1 is not None:
+                torch.cuda.synchronize()
+                print(
+                    f"[DCP-PROF] schedule+plan {(_time.perf_counter()-_t1)*1000:.2f}ms "
+                    f"lens2d={tuple(local_ctx_lens.shape)}",
+                    flush=True,
+                )
         self.forward_metadata = metadata
 
     def _cal_indexer_k_start_end(
