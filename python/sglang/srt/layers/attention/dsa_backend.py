@@ -3280,6 +3280,14 @@ class DeepseekSparseAttnMultiStepBackend:
     ):
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
+        # Pre-compile the topk_v2 JIT kernel at init time. The DCP decode path
+        # calls plan_topk_v2 every step; the first call JIT-compiles the CUDA
+        # kernel via tvm_ffi, causing a ~2s stall on the first request after a
+        # restart. Compiling here moves that cost into server startup.
+        if envs.SGLANG_OPT_USE_TOPK_V2.get():
+            from sglang.jit_kernel.dsv4.topk import _jit_topk_v2_module
+
+            _jit_topk_v2_module()
         self.attn_backends = []
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends.append(
