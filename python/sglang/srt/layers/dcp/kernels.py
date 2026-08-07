@@ -335,6 +335,38 @@ def correct_attn_out(
 
 
 @triton.jit
+def _expand_lens_2d_kernel(
+    src_ptr,   # [B] int32
+    dst_ptr,   # [B*N] int32
+    B,
+    N: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Fill dst[i*N+j] = src[i] for all j — replaces view+expand+contiguous
+    (which copies through an intermediate broadcast) with a single direct
+    store. Used by the DCP paged-MQA schedule build for the target-verify
+    (EAGLE) decode path, where the same cache length repeats across draft
+    tokens."""
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    i = offs // N
+    mask = (offs < B * N) & (i < B)
+    v = tl.load(src_ptr + i, mask=mask, other=0)
+    tl.store(dst_ptr + offs, v, mask=mask)
+
+
+def expand_lens_2d(src: torch.Tensor, n: int, out: torch.Tensor) -> torch.Tensor:
+    """Write src (int32 [B]) expanded to out (int32 [B, n]) in place."""
+    b = src.shape[0]
+    block = triton.next_power_of_2(1024)
+    grid = (triton.cdiv(b * n, block),)
+    _expand_lens_2d_kernel[grid](
+        src, out, b, N=n, BLOCK=block,
+    )
+    return out
+
+
+@triton.jit
 def _dcp_localize_lens_cumsum_kernel(
     lens_ptr,       # input:  [N] global lens (int32); may alias local_ptr (in-place)
     local_ptr,      # output: [N] local lens (int32)
