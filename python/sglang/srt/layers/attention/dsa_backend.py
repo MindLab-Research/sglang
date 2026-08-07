@@ -2840,12 +2840,6 @@ class DeepseekSparseAttnBackend(
                 or forward_batch.forward_mode.is_target_verify()
             )
         )
-        if dcp_enabled() and forward_batch.forward_mode.is_target_verify():
-            logger.warning(
-                f"[DCP-TV] target_verify _forward_trtllm: return_lse={return_lse} "
-                f"dcp_enabled={dcp_enabled()} _dcp_decode={_dcp_decode} "
-                f"is_prefill={is_prefill} dsa_impl={self.dsa_decode_impl}"
-            )
 
         merge_query = q_rope is not None
         if self.kv_cache_dtype == torch.float8_e4m3fn:

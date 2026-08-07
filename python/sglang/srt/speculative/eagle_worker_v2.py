@@ -90,6 +90,7 @@ from sglang.srt.speculative.spec_utils import (
     spec_stage_span,
 )
 from sglang.srt.speculative.triton_ops.eagle import fill_bonus_tokens
+from sglang.srt.speculative.triton_ops.topk1 import draft_topk1_postprocess
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -654,6 +655,27 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if self.server_args.speculative_use_rejection_sampling:
             draft_probs_list: List[torch.Tensor] = [spec_info.draft_probs]
 
+        topk1_chain_fits = (
+            self.topk == 1
+            and topk_index.shape[0] <= self._topk1_parents_prealloc.shape[0]
+        )
+        # Materialize the chain directly only when the CUDA kernel can write
+        # every subsequent column. Other topk=1 paths retain the token list and
+        # assemble it with one final cat instead of launching a copy per step.
+        draft_tokens_topk1 = None
+        if (
+            topk1_chain_fits
+            and _is_cuda
+            and self.hot_token_id is None
+            and not self.server_args.speculative_use_rejection_sampling
+        ):
+            draft_tokens_topk1 = torch.empty(
+                (topk_index.shape[0], self.speculative_num_steps),
+                dtype=topk_index.dtype,
+                device=topk_index.device,
+            )
+            draft_tokens_topk1[:, :1].copy_(topk_index)
+
         # Forward multiple steps
         scores = None
         if self.index_share_for_mtp_iteration:
@@ -665,12 +687,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             ):
                 spec_info.dsa_topk_indices = None
         for i in range(self.speculative_num_steps):
-            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
-                i, topk_p, topk_index, hidden_states, scores, self.topk
-            )
-            score_list.append(tree_info[0])
-            token_list.append(tree_info[1])
-            parents_list.append(tree_info[2])
+            if draft_tokens_topk1 is not None:
+                input_ids = topk_index.flatten()
+            else:
+                input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
+                    i, topk_p, topk_index, hidden_states, scores, self.topk
+                )
+                score_list.append(tree_info[0])
+                token_list.append(tree_info[1])
+                parents_list.append(tree_info[2])
 
             # We don't need to run the last forward. we get 1 token from draft prefill and (#spec steps - 1) tokens here
             if i == self.speculative_num_steps - 1:
@@ -715,11 +740,22 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 )
                 topk_p, topk_index = fast_sample(probs, num_samples=1)
                 draft_probs_list.append(probs)
+                forward_batch.positions.add_(1)
             elif self.topk == 1 and not _is_hip:
-                topk_index = torch.argmax(
-                    logits_output.next_token_logits, dim=-1, keepdim=True
-                )
-                topk_p = torch.ones_like(topk_index, dtype=torch.float32)
+                if _is_cuda:
+                    # The positions advance is fused into the kernel.
+                    topk_p, topk_index = draft_topk1_postprocess(
+                        logits_output.next_token_logits,
+                        forward_batch.positions,
+                        draft_tokens_topk1,
+                        i + 1,
+                    )
+                else:
+                    topk_index = torch.argmax(
+                        logits_output.next_token_logits, dim=-1, keepdim=True
+                    )
+                    topk_p = torch.ones_like(topk_index, dtype=torch.float32)
+                    forward_batch.positions.add_(1)
             else:
                 probs = renorm_draft_probs(
                     logits_output.next_token_logits,
@@ -727,6 +763,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     self.server_args.speculative_use_rejection_sampling,
                 )
                 topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+                forward_batch.positions.add_(1)
             maybe_detect_oob(
                 topk_index,
                 0,
@@ -736,17 +773,25 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             if self.hot_token_id is not None:
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
-            forward_batch.positions.add_(1)
 
         if self.index_share_for_mtp_iteration:
             spec_info.dsa_topk_indices = None
             forward_batch.reuse_dsa_topk_indices = False
 
+        draft_probs = (
+            torch.stack(draft_probs_list, dim=1)
+            if self.server_args.speculative_use_rejection_sampling
+            else None
+        )
+
         # Organize the results
-        if (
-            self.topk == 1
-            and token_list[0].shape[0] <= self._topk1_parents_prealloc.shape[0]
-        ):
+        if draft_tokens_topk1 is not None:
+            bs = draft_tokens_topk1.shape[0]
+            top_scores_index = self._topk1_score_indices_prealloc[:bs]
+            parent_list = self._topk1_parents_prealloc[:bs]
+            return parent_list, top_scores_index, draft_tokens_topk1, draft_probs
+
+        if topk1_chain_fits:
             # Chain topology: draft_tokens = concat of per-step tokens; the
             # full-length topk/sort/gather over score_list collapses to an
             # identity. parent_list and top_scores_index are runtime-invariant
@@ -756,21 +801,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             draft_tokens = torch.cat(token_list, dim=1)
             top_scores_index = self._topk1_score_indices_prealloc[:bs]
             parent_list = self._topk1_parents_prealloc[:bs]
-            draft_probs = (
-                torch.stack(draft_probs_list, dim=1)
-                if self.server_args.speculative_use_rejection_sampling
-                else None
-            )
             return parent_list, top_scores_index, draft_tokens, draft_probs
 
         parent_list, top_scores_index, draft_tokens = organize_draft_results(
             score_list, token_list, parents_list, self.speculative_num_draft_tokens
-        )
-
-        draft_probs = (
-            torch.stack(draft_probs_list, dim=1)
-            if self.server_args.speculative_use_rejection_sampling
-            else None
         )
         return parent_list, top_scores_index, draft_tokens, draft_probs
 
@@ -903,13 +937,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self, batch: ScheduleBatch, batch_result: GenerationBatchResult
     ):
         # Batch 2: Draft extend
-        if not torch.cuda.is_current_stream_capturing():
-            print(
-                f"[EAGLE-DIAG] draft_extend bs={len(batch.seq_lens)} "
-                f"ndt={self.speculative_num_draft_tokens} "
-                f"total={len(batch.seq_lens) * self.speculative_num_draft_tokens}",
-                flush=True,
-            )
         draft_extend_input = EagleDraftExtendInput(
             hidden_states=batch_result.logits_output.hidden_states,
             # accept_lens includes the bonus token; correct drafts exclude it.
@@ -1594,22 +1621,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         verify_input.num_tokens_per_req = self.speculative_num_steps + 1
         bs = len(batch.seq_lens)
-        if not torch.cuda.is_current_stream_capturing():
-            print(
-                f"[EAGLE-DIAG] verify bs={bs} "
-                f"num_tokens_per_req={verify_input.num_tokens_per_req} "
-                f"total={bs * verify_input.num_tokens_per_req}",
-                flush=True,
-            )
-            if bs == 1 or len(batch.seq_lens) > 1:
-                _pos = getattr(verify_input, "positions", None)
-                _draft = getattr(verify_input, "draft_token", None)
-                print(
-                    f"[POS-DIAG] seq_lens={batch.seq_lens.tolist()} "
-                    f"positions={_pos.tolist() if _pos is not None else None} "
-                    f"draft_token={_draft.tolist() if _draft is not None else None}",
-                    flush=True,
-                )
 
         # Batch 1: Target verify
         # Prepare for target verify in a separate stream
