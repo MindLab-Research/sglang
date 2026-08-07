@@ -271,11 +271,16 @@ class AiterRunnerCore(MoeRunnerCore):
                     topk_weights,
                     topk_ids,
                 )
-                # Sum across experts (weighted by topk_weights) and add to base output
+                # Sum across experts (weighted by topk_weights) and add to base output.
+                # Keep the residual in the base output dtype (BF16): topk_weights is
+                # FP32 (runner contract), so multiplying in FP32 and adding would
+                # upcast `output` to FP32, which breaks AITER add_rmsnorm under
+                # CUDA graph ("add_rmsnorm not support output type: float").
                 lora_down = lora_down.view(num_tokens, topk, hidden_dim)
-                output = output + (
-                    lora_down * topk_weights.unsqueeze(-1)
+                lora_delta = (
+                    lora_down * topk_weights.to(output.dtype).unsqueeze(-1)
                 ).sum(dim=1)
+                output = output + lora_delta
 
         return AiterRunnerOutput(hidden_states=output)
 
