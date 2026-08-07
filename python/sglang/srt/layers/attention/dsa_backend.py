@@ -1111,8 +1111,6 @@ class DeepseekSparseAttnBackend(
             topk_v2_plan=self._build_topk_v2_plan(seqlens_expanded),
         )
         if dcp_enabled():
-            _g_sl = forward_batch.seq_lens.tolist() if hasattr(forward_batch.seq_lens, 'tolist') else forward_batch.seq_lens
-            _g_mslk = metadata.max_seq_len_k
             expanded_size = metadata.dsa_seqlens_expanded.shape[0]
             _localize_page_dcp_metadata_(
                 metadata,
@@ -1122,6 +1120,12 @@ class DeepseekSparseAttnBackend(
                 self.dsa_index_topk,
             )
             if dcp_debug_enabled() and not torch.cuda.is_current_stream_capturing():
+                _g_sl = (
+                    forward_batch.seq_lens.tolist()
+                    if hasattr(forward_batch.seq_lens, "tolist")
+                    else forward_batch.seq_lens
+                )
+                _g_mslk = metadata.max_seq_len_k
                 _rpt = metadata.real_page_table
                 _rpt_valid = _rpt[_rpt >= 0]
                 _dcp_log(
