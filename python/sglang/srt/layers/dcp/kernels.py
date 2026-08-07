@@ -250,6 +250,7 @@ class CPTritonContext:
 
     def __init__(self):
         self.inner_kernel = None
+        self.new_output = None
 
     def call_kernel(self, kernel, grid, *regular_args, **const_args):
         if self.inner_kernel is None:

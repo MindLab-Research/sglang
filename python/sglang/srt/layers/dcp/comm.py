@@ -20,6 +20,8 @@ PR #25090 vs #14194):
   - cp_lse_ag_out_rs_mla: Triton (log2/exp2) correction / reduce-scatter
 """
 
+import os
+import time
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Optional
@@ -138,18 +140,35 @@ def cp_lse_ag_out_rs_mla(
     if ctx is None:
         ctx = CPTritonContext()
 
+    _DCP_PROFILE = os.environ.get("SGLANG_DCP_PROFILE", "0") == "1"
+    _t0 = None
+    if _DCP_PROFILE and not torch.cuda.is_current_stream_capturing():
+        torch.cuda.synchronize()
+        _t0 = time.perf_counter()
+
     with use_symmetric_memory(cp_group):
         # cp_attn_out is [B,H,D], we want to transpose it to [H,B,D] for the kernel, and then transpose back after correction.
-        new_output = cp_attn_out.new_empty(
-            cp_attn_out.transpose(0, 1).shape, dtype=torch.float32
-        )
+        # Reuse the buffer across steps to avoid a per-step GPU allocation.
+        transposed_shape = cp_attn_out.transpose(0, 1).shape
+        if ctx.new_output is None or tuple(ctx.new_output.shape) != tuple(transposed_shape):
+            ctx.new_output = cp_attn_out.new_empty(transposed_shape, dtype=torch.float32)
+        new_output = ctx.new_output
         cp_attn_lse = cp_attn_lse.to(torch.float32)
     lses = _ag_lse(cp_attn_lse, cp_group)
     out, _ = correct_attn_out(
         cp_attn_out, lses, cp_group.rank_in_group, ctx, new_output
     )
     out = cp_group.reduce_scatter_along_dim(out, dim=0)
-    return out.to(cp_attn_out.dtype)
+    out = out.to(cp_attn_out.dtype)
+
+    if _t0 is not None:
+        torch.cuda.synchronize()
+        print(
+            f"[DCP-PROF] cp_lse_ag_out_rs_mla {(time.perf_counter()-_t0)*1000:.2f}ms "
+            f"lse={tuple(cp_attn_lse.shape)} out={tuple(cp_attn_out.shape)}",
+            flush=True,
+        )
+    return out
 
 
 def _all_gather_dcp_kv_cache(kv_a: torch.Tensor):
