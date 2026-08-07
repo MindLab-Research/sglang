@@ -331,3 +331,78 @@ def correct_attn_out(
 
     ctx.call_kernel(_correct_attn_cp_out_kernel, grid, *regular_args, **const_args)
     return new_output, lse
+
+
+@triton.jit
+def _dcp_localize_lens_cumsum_kernel(
+    lens_ptr,       # input:  [N] global lens (int32); may alias local_ptr (in-place)
+    local_ptr,      # output: [N] local lens (int32)
+    cu_ptr,         # output: [N+1] cumsum of local lens (int32), cu[0]=0
+    clamped_ptr,    # output: [N] clamped local lens (int32), only written if CLAMP>0
+    N,
+    PAGE_SIZE: tl.constexpr,
+    DCP_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    CLAMP: tl.constexpr,   # 0 = no clamp; >0 = min(local, CLAMP) (dsa index topk)
+    BLOCK: tl.constexpr,
+):
+    """Fused get_page_dcp_lens + (optional clamp) + cumsum for DCP metadata.
+
+    Replaces the previous torch chain (div/remainder/where/clamp/cumsum/copy_)
+    of ~8 small kernels per decode step with a single kernel. Each element is
+    read once and written once (in-place safe); the cumsum uses the in-register
+    local values, so no second load is required.
+    """
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < N
+    lens = tl.load(lens_ptr + offs, mask=mask, other=0).to(tl.int32)
+
+    full_pages = lens // PAGE_SIZE
+    tail = lens % PAGE_SIZE
+    local_full = full_pages // DCP_SIZE + (DCP_RANK < full_pages % DCP_SIZE)
+    owns_tail = (full_pages % DCP_SIZE) == DCP_RANK
+    local = local_full * PAGE_SIZE + tl.where(owns_tail, tail, 0)
+
+    tl.store(local_ptr + offs, local, mask=mask)
+
+    if CLAMP > 0:
+        clamped = tl.minimum(local, CLAMP)
+        tl.store(clamped_ptr + offs, clamped, mask=mask)
+        cu = tl.cumsum(clamped, axis=0)
+    else:
+        cu = tl.cumsum(local, axis=0)
+
+    # Prefix sum within this block (single block when N <= BLOCK).
+    tl.store(cu_ptr + offs + 1, cu, mask=mask)
+    tl.store(cu_ptr, 0)
+
+
+def fused_localize_lens_cumsum(
+    lens: torch.Tensor,
+    local: torch.Tensor,
+    cu: torch.Tensor,
+    clamped: torch.Tensor,
+    n: int,
+    page_size: int,
+    dcp_size: int,
+    dcp_rank: int,
+    clamp: int = 0,
+):
+    """Launch the fused lens-localize + cumsum kernel on `lens[:n]`."""
+    if n <= 0:
+        return
+    block = triton.next_power_of_2(n)
+    grid = (triton.cdiv(n, block),)
+    _dcp_localize_lens_cumsum_kernel[grid](
+        lens,
+        local,
+        cu,
+        clamped,
+        n,
+        PAGE_SIZE=page_size,
+        DCP_SIZE=dcp_size,
+        DCP_RANK=dcp_rank,
+        CLAMP=clamp,
+        BLOCK=block,
+    )

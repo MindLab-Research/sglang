@@ -25,6 +25,7 @@ from sglang.srt.layers.dcp.comm import (
     get_attention_dcp_world_size,
     get_attention_dcp_rank,
 )
+from sglang.srt.layers.dcp.kernels import fused_localize_lens_cumsum
 
 # DCP debug logging helper (gated by SGLANG_DCP_DEBUG env var)
 import os as _os
@@ -177,34 +178,38 @@ def _localize_page_dcp_metadata_(
         localize_page_table_for_dcp_(metadata.real_page_table, dcp_size, dcp_rank)
 
     # Clone both sources before writing because decode may alias expanded
-    # seqlens to cache_seqlens.
+    # seqlens to cache_seqlens. The fused kernel reads the clones and writes
+    # the localised values + cumsums directly into metadata (in-place safe:
+    # each element read once, cumsum uses in-register values).
     global_cache_lens = metadata.cache_seqlens_int32[:batch_size].clone()
     global_expanded_lens = metadata.dsa_seqlens_expanded[:expanded_size].clone()
-    local_cache_lens = get_page_dcp_lens(
-        global_cache_lens, dcp_size, dcp_rank, page_size
-    ).to(metadata.cache_seqlens_int32.dtype)
-    local_expanded_lens = get_page_dcp_lens(
-        global_expanded_lens, dcp_size, dcp_rank, page_size
-    ).to(metadata.dsa_seqlens_expanded.dtype)
-    local_dsa_lens = compute_dsa_seqlens(
-        local_expanded_lens, dsa_index_topk=dsa_index_topk
+    fused_localize_lens_cumsum(
+        global_cache_lens,
+        metadata.cache_seqlens_int32,
+        metadata.cu_seqlens_k,
+        metadata.cache_seqlens_int32,  # clamped slot unused (CLAMP=0)
+        batch_size,
+        page_size,
+        dcp_size,
+        dcp_rank,
+        clamp=0,
     )
-
-    metadata.cache_seqlens_int32[:batch_size].copy_(local_cache_lens)
-    metadata.dsa_seqlens_expanded[:expanded_size].copy_(local_expanded_lens)
-    metadata.dsa_cache_seqlens_int32[:expanded_size].copy_(
-        local_dsa_lens.to(metadata.dsa_cache_seqlens_int32.dtype)
+    fused_localize_lens_cumsum(
+        global_expanded_lens,
+        metadata.dsa_seqlens_expanded,
+        metadata.dsa_cu_seqlens_k,
+        metadata.dsa_cache_seqlens_int32,
+        expanded_size,
+        page_size,
+        dcp_size,
+        dcp_rank,
+        clamp=dsa_index_topk,
     )
-
-    metadata.cu_seqlens_k[0].zero_()
-    metadata.cu_seqlens_k[1 : batch_size + 1].copy_(
-        torch.cumsum(local_cache_lens, dim=0, dtype=torch.int32)
+    return (
+        metadata.cache_seqlens_int32[:batch_size],
+        metadata.dsa_seqlens_expanded[:expanded_size],
+        metadata.dsa_cache_seqlens_int32[:expanded_size],
     )
-    metadata.dsa_cu_seqlens_k[0].zero_()
-    metadata.dsa_cu_seqlens_k[1 : expanded_size + 1].copy_(
-        torch.cumsum(local_dsa_lens, dim=0, dtype=torch.int32)
-    )
-    return local_cache_lens, local_expanded_lens, local_dsa_lens
 
 
 # Reuse this workspace buffer across all DSA backend instances
