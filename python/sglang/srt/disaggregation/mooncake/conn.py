@@ -1331,7 +1331,7 @@ class MooncakeKVManager(CommonKVManager):
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
 
-                        _transfer_indices = kv_chunk.prefill_kv_indices
+                        _transfer_indices = kv_chunk.prefill_kv_indices[kv_chunk.index_slice]
                         _dst_indices = chunked_dst_kv_indice
 
                         _dcp_size = getattr(req, "dcp_size", 1)
