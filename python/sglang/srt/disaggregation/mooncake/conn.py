@@ -1331,11 +1331,21 @@ class MooncakeKVManager(CommonKVManager):
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
 
-                        _transfer_indices = kv_chunk.prefill_kv_indices[kv_chunk.index_slice]
+                        _transfer_indices = kv_chunk.prefill_kv_indices
                         _dst_indices = chunked_dst_kv_indice
 
                         _dcp_size = getattr(req, "dcp_size", 1)
                         _dcp_rank = getattr(req, "dcp_rank", 0)
+                        if _dcp_size <= 1:
+                            logger.info(
+                                f"[KV-XFER-NODCP] room={kv_chunk.room} cp_rank={self.attn_cp_rank}"
+                                f" transfer_len={len(_transfer_indices)}"
+                                f" dst_len={len(_dst_indices)}"
+                                f" all_dst_kv_len={len(req.dst_kv_indices) if hasattr(req, 'dst_kv_indices') else 'N/A'}"
+                                f" src[0:5]={_transfer_indices[:5].tolist() if len(_transfer_indices)>0 else []}"
+                                f" dst[0:5]={_dst_indices[:5].tolist() if len(_dst_indices)>0 else []}"
+                                f" full_dst={list(_dst_indices[:20])}"
+                            )
                         if _dcp_size > 1:
                             # DCP reshard: filter by decode-side page VALUE parity.
                             # DCP rank owns page_idx % dcp_size == rank. Using the
@@ -1347,10 +1357,25 @@ class MooncakeKVManager(CommonKVManager):
                             #     sequential (0,1,2,...), so value % dcp_size
                             #     correctly alternates rank0/rank1
                             _n = len(_transfer_indices)
-                            _mask = (_dst_indices % _dcp_size) == _dcp_rank
                             _orig_len = _n
-                            _transfer_indices = _transfer_indices[_mask]
-                            _dst_indices = (_dst_indices[_mask] // _dcp_size).astype(np.int32)
+                            if len(_transfer_indices) != len(_dst_indices):
+                                # page_size=1 (DSA per-token): prefill holds full
+                                # token set, dst is per-rank shard. Filter prefill
+                                # by POSITION parity (not page value).
+                                _pos = np.arange(_n)
+                                _prefill_mask = (_pos % _dcp_size) == _dcp_rank
+                                _transfer_indices = _transfer_indices[
+                                    _prefill_mask
+                                ]
+                                _dst_indices = (
+                                    _dst_indices // _dcp_size
+                                ).astype(np.int32)
+                            else:
+                                _mask = (_dst_indices % _dcp_size) == _dcp_rank
+                                _transfer_indices = _transfer_indices[_mask]
+                                _dst_indices = (
+                                    _dst_indices[_mask] // _dcp_size
+                                ).astype(np.int32)
                             logger.info(
                                 f"[DCP-XFER] room={kv_chunk.room} dcp_rank={_dcp_rank}"
                                 f" dcp_size={_dcp_size} cp_rank={self.attn_cp_rank}"
@@ -1360,6 +1385,8 @@ class MooncakeKVManager(CommonKVManager):
                                 f" src[0:3]={_transfer_indices[:3].tolist()}"
                                 f" dst[0:3]={_dst_indices[:3].tolist()}"
                                 f" max_dst={int(_dst_indices.max()) if len(_dst_indices)>0 else -1}"
+                                f" item_lens={self.kv_args.kv_item_lens[:2]}"
+                                f" dst_ptrs_0={hex(target_rank_registration_info.dst_kv_ptrs[0]) if target_rank_registration_info.dst_kv_ptrs else 'N/A'}"
                             )
 
                         if len(chunked_dst_kv_indice) < len(_transfer_indices):

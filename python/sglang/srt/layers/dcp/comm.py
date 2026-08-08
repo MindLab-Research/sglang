@@ -60,12 +60,11 @@ def dcp_disabled():
 
 def dcp_enabled() -> bool:
     """
-    only checks whether dcp enabled for cuda platform
+    checks whether dcp enabled (cuda or hip/rocm platform)
     """
     if _dcp_force_disabled.get() or get_dcp_group_no_assert() is None:
         return False
-    if not is_cuda():
-        return False
+    # Removed is_cuda() check — DCP works on ROCm/HIP too
     return get_dcp_world_size() > 1
 
 

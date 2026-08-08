@@ -856,13 +856,20 @@ class Indexer(MultiPlatformOp):
                     f"HIP preshuffle requires page_size to be a multiple of 16, got {page_size}"
                 )
             else:
-                assert page_size == 1, (
-                    f"HIP legacy DSA path requires page_size == 1, got {page_size}"
-                )
+                if dcp_enabled():
+                    # DCP=8 requires page_size>1 (page-level KV indices).
+                    # Use page_size=64 like the NVIDIA path.
+                    assert page_size % 16 == 0, (
+                        f"HIP legacy DCP path requires page_size to be a multiple of 16, got {page_size}"
+                    )
+                else:
+                    assert page_size == 1, (
+                        f"HIP legacy DSA path requires page_size == 1, got {page_size}"
+                    )
         else:
             assert page_size == 64, "only support page size 64"
         # NOTE(dark): this support extend/decode/decode+graph
-        if _is_hip and not _use_aiter_preshuffle:
+        if _is_hip and not _use_aiter_preshuffle and not dcp_enabled():
             block_tables = metadata.get_page_table_1()
         else:
             block_tables = metadata.get_page_table_64()

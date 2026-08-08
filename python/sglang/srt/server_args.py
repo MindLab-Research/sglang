@@ -1369,7 +1369,7 @@ class ServerArgs:
             choices=DSA_CHOICES,
             resolvable=True,
         ),
-    ] = None
+    ] = "tilelang"
     dsa_decode_backend: A[
         Optional[str],
         Arg(
@@ -1377,7 +1377,7 @@ class ServerArgs:
             choices=DSA_CHOICES,
             resolvable=True,
         ),
-    ] = None
+    ] = "tilelang"
     dsa_paged_mqa_logits_backend: A[
         str,
         Arg(

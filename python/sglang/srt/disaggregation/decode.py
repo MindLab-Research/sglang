@@ -1090,9 +1090,20 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 ]
                 # Indexer lives on device pool; always use device page_size
                 device_page_size = self.token_to_kv_pool.page_size
-                return kv_to_page_indices(
+                _dsa_pages = kv_to_page_indices(
                     kv_indices_full.cpu().numpy(), device_page_size
                 )
+                # Debug: compare state page indices vs KV page indices
+                import logging as _lg
+                _lg.getLogger(__name__).warning(
+                    f"[DSA-PAYLOAD] rid={decode_req.req.rid} seq_len={seq_len}"
+                    f" device_page_size={device_page_size}"
+                    f" dsa_pages={_dsa_pages.tolist()}"
+                    f" kv_indices_full[:8]={kv_indices_full[:8].tolist()}"
+                    f" dst_kv_indices[:8]={dst_kv_indices[:8].tolist() if hasattr(dst_kv_indices, 'tolist') else dst_kv_indices[:8]}"
+                    f" prefix_len={total_prefix_len} origin_len={origin_input_len}"
+                )
+                return _dsa_pages
 
             def _swa_ring_payload():
                 # Mirror of prefill _swa_ring_payload using this side's req_pool_idx.
@@ -1146,6 +1157,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
             assert decode_req.metadata_buffer_index is not None
             page_indices = kv_to_page_indices(kv_indices, kv_transfer_page_size)
+            print(f"[PAGE-INDICES] page_indices={page_indices.tolist()} kv_indices[:8]={kv_indices[:8].tolist()} page_size={kv_transfer_page_size}", flush=True)
             if dcp_enabled():
                 import logging as _lg
                 _lg.getLogger(__name__).warning(
