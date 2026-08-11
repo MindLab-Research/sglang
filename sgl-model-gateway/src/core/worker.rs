@@ -522,6 +522,8 @@ pub enum WorkerType {
     },
     /// Decode worker for PD disaggregated mode
     Decode,
+    /// Child router in a multi-layer router topology
+    Router,
 }
 
 impl fmt::Display for WorkerType {
@@ -533,6 +535,7 @@ impl fmt::Display for WorkerType {
                 None => write!(f, "Prefill"),
             },
             WorkerType::Decode => write!(f, "Decode"),
+            WorkerType::Router => write!(f, "Router"),
         }
     }
 }
@@ -544,6 +547,7 @@ impl WorkerType {
             WorkerType::Regular => metrics_labels::WORKER_REGULAR,
             WorkerType::Prefill { .. } => metrics_labels::WORKER_PREFILL,
             WorkerType::Decode => metrics_labels::WORKER_DECODE,
+            WorkerType::Router => metrics_labels::WORKER_ROUTER,
         }
     }
 }
@@ -1268,6 +1272,7 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
         WorkerType::Regular => "regular",
         WorkerType::Prefill { .. } => "prefill",
         WorkerType::Decode => "decode",
+        WorkerType::Router => "router",
     };
 
     let bootstrap_port = match worker_type {

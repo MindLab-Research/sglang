@@ -640,9 +640,10 @@ struct CliArgs {
     #[arg(long, help_heading = "Parent Router (Auto-Registration)")]
     parent_router_api_key: Option<String>,
 
-    /// Worker type to register as with the parent router (e.g. "regular", "prefill", "decode").
-    /// Defaults to "regular".
-    #[arg(long, default_value = "regular", help_heading = "Parent Router (Auto-Registration)")]
+    /// Worker type to register as with the parent router.
+    /// Defaults to "router" since this is a child router registering with a parent.
+    /// Use "regular" if registering as a plain worker.
+    #[arg(long, default_value = "router", help_heading = "Parent Router (Auto-Registration)")]
     parent_router_worker_type: String,
 
     /// Interval in seconds between registration retry attempts if the parent router is unavailable.

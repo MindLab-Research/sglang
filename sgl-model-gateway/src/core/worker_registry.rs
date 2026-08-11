@@ -575,6 +575,7 @@ impl WorkerRegistry {
         let mut regular_count = 0;
         let mut prefill_count = 0;
         let mut decode_count = 0;
+        let mut router_count = 0;
         let mut http_count = 0;
         let mut grpc_count = 0;
         let mut cb_open_count = 0;
@@ -592,6 +593,7 @@ impl WorkerRegistry {
                 WorkerType::Regular => regular_count += 1,
                 WorkerType::Prefill { .. } => prefill_count += 1,
                 WorkerType::Decode => decode_count += 1,
+                WorkerType::Router => router_count += 1,
             }
 
             match worker.connection_mode() {
@@ -615,6 +617,7 @@ impl WorkerRegistry {
             regular_workers: regular_count,
             prefill_workers: prefill_count,
             decode_workers: decode_count,
+            router_workers: router_count,
             http_workers: http_count,
             grpc_workers: grpc_count,
             circuit_breaker_open: cb_open_count,
@@ -717,6 +720,8 @@ pub struct WorkerRegistryStats {
     pub prefill_workers: usize,
     /// Number of decode workers (PD mode)
     pub decode_workers: usize,
+    /// Number of child router workers (multi-layer router topology)
+    pub router_workers: usize,
     /// Number of HTTP-connected workers
     pub http_workers: usize,
     /// Number of gRPC-connected workers

@@ -154,6 +154,7 @@ pub struct ListWorkersResult {
     pub prefill_count: usize,
     pub decode_count: usize,
     pub regular_count: usize,
+    pub router_count: usize,
 }
 
 impl IntoResponse for ListWorkersResult {
@@ -165,6 +166,7 @@ impl IntoResponse for ListWorkersResult {
                 "prefill_count": self.prefill_count,
                 "decode_count": self.decode_count,
                 "regular_count": self.regular_count,
+                "router_count": self.router_count,
             }
         });
         Json(response).into_response()
@@ -278,6 +280,7 @@ impl WorkerService {
             prefill_count: stats.prefill_workers,
             decode_count: stats.decode_workers,
             regular_count: stats.regular_workers,
+            router_count: stats.router_workers,
         }
     }
 

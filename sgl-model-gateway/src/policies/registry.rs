@@ -378,7 +378,7 @@ impl PolicyRegistry {
         let policy = match worker.worker_type() {
             crate::core::WorkerType::Prefill { .. } => self.prefill_policy.get(),
             crate::core::WorkerType::Decode => self.decode_policy.get(),
-            crate::core::WorkerType::Regular => return,
+            crate::core::WorkerType::Regular | crate::core::WorkerType::Router => return,
         };
         if let Some(policy) = policy {
             if policy.name() == "cache_aware" {
