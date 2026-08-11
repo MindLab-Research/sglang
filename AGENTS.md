@@ -248,6 +248,13 @@ expand_lens_2d 有轻微负影响（24→21），需修复或回退。⚠️ 修
 4. **health 检查直接 curl 节点**，不要信嵌套 SSH 轮询的 000（会误判漏检）；
 5. 重启后按序：router → gateway → proxy → **otelcol**（否则 Grafana nodata）；
 6. 最后确认公网 chat 请求返回 200 + 正确输出。
+7. **⛔ 永远禁止 `scp`，文件传输一律用 `rsync`**（2026-08-11 确立）。scp 在 B300 节点上会挂起/断连（实测 151MB 二进制 scp 7 分钟未完成），rsync 稳定且支持断点/校验。跨节点传文件用：
+   ```bash
+   # 本地 → 节点
+   rsync -avz -e "ssh -p <port> -o ConnectTimeout=15" <src> root@<host>:<dest>
+   # 节点 → 节点（B300-1 → B300-2，已有免密）：用 ssh cat 管道
+   ssh root@10.0.0.67 "cat > <dest>" < <local_file>
+   ```
 
 ---
 

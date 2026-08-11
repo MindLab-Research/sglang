@@ -851,6 +851,13 @@ class OpenAIServingChat(OpenAIServingBase):
             if request.chat_template_kwargs:
                 extra_template_kwargs.update(request.chat_template_kwargs)
 
+            # Default clear_thinking=False so that reasoning_content from prior
+            # assistant turns is preserved in the rendered prompt (GLM-5.2 chat
+            # template discards historical thinking unless this flag is explicitly
+            # set).  Allow per-request override via chat_template_kwargs.
+            if "clear_thinking" not in extra_template_kwargs:
+                extra_template_kwargs["clear_thinking"] = False
+
             # Split apply_chat_template(tokenize=True) into render + encode so we
             # can skip add_special_tokens=False on tokenizers that don't auto-add
             # specials (Kimi-like, OpenAI-chat analogue of #25265). Chat
