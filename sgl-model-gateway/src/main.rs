@@ -628,6 +628,32 @@ struct CliArgs {
 
     #[arg(long, num_args = 0..)]
     mesh_peer_urls: Vec<String>,
+
+    // ==================== Parent Router (Auto-Registration) ====================
+    /// Parent router URL for auto-registration on startup.
+    /// When set, this router registers itself as a worker with the parent router
+    /// via POST /workers on startup, and deregisters on shutdown.
+    #[arg(long, help_heading = "Parent Router (Auto-Registration)")]
+    parent_router_url: Option<String>,
+
+    /// API key for authenticating with the parent router
+    #[arg(long, help_heading = "Parent Router (Auto-Registration)")]
+    parent_router_api_key: Option<String>,
+
+    /// Worker type to register as with the parent router (e.g. "regular", "prefill", "decode").
+    /// Defaults to "regular".
+    #[arg(long, default_value = "regular", help_heading = "Parent Router (Auto-Registration)")]
+    parent_router_worker_type: String,
+
+    /// Interval in seconds between registration retry attempts if the parent router is unavailable.
+    /// Defaults to 10 seconds.
+    #[arg(long, default_value_t = 10, help_heading = "Parent Router (Auto-Registration)")]
+    parent_router_retry_interval_secs: u64,
+
+    /// Maximum number of registration retry attempts.
+    /// Defaults to 30 (0 = retry forever).
+    #[arg(long, default_value_t = 30, help_heading = "Parent Router (Auto-Registration)")]
+    parent_router_max_retries: u32,
 }
 
 enum OracleConnectSource {
@@ -1182,6 +1208,17 @@ impl CliArgs {
             shutdown_grace_period_secs: self.shutdown_grace_period_secs,
             control_plane_auth,
             mesh_server_config,
+            parent_router_config: self.parent_router_url.as_ref().map(|url| {
+                let self_url = format!("http://{}:{}", self.host, self.port);
+                server::ParentRouterConfig {
+                    url: url.clone(),
+                    api_key: self.parent_router_api_key.clone(),
+                    worker_type: self.parent_router_worker_type.clone(),
+                    self_url,
+                    retry_interval_secs: self.parent_router_retry_interval_secs,
+                    max_retries: self.parent_router_max_retries,
+                }
+            }),
         }
     }
 }

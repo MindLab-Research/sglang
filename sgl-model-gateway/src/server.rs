@@ -531,6 +531,25 @@ pub struct ServerConfig {
     /// Control plane authentication configuration
     pub control_plane_auth: Option<crate::auth::ControlPlaneAuthConfig>,
     pub mesh_server_config: Option<MeshServerConfig>,
+    /// Parent router auto-registration configuration
+    pub parent_router_config: Option<ParentRouterConfig>,
+}
+
+/// Configuration for auto-registering this router as a worker with a parent router.
+#[derive(Debug, Clone)]
+pub struct ParentRouterConfig {
+    /// URL of the parent router (e.g. "http://parent-router:30000")
+    pub url: String,
+    /// API key for authenticating with the parent router
+    pub api_key: Option<String>,
+    /// Worker type to register as ("regular", "prefill", "decode")
+    pub worker_type: String,
+    /// This router's externally reachable URL
+    pub self_url: String,
+    /// Retry interval in seconds
+    pub retry_interval_secs: u64,
+    /// Max retry attempts (0 = retry forever)
+    pub max_retries: u32,
 }
 
 pub fn build_app(
@@ -1056,6 +1075,69 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .parse()
         .map_err(|e| format!("Invalid address: {}", e))?;
 
+    // Auto-register with parent router if configured
+    let parent_router_config = config.parent_router_config.clone();
+    let registered_worker_id: Arc<tokio::sync::Mutex<Option<String>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+
+    if let Some(ref parent_config) = parent_router_config {
+        match register_with_parent(parent_config).await {
+            Ok(worker_id) => {
+                info!(
+                    "Successfully registered with parent router at {} as worker {}",
+                    parent_config.url, worker_id
+                );
+                *registered_worker_id.lock().await = Some(worker_id);
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to register with parent router at {}: {}. \
+                    This router will start but the parent router will not route traffic to it \
+                    until registration succeeds.",
+                    parent_config.url, e
+                );
+            }
+        }
+    }
+
+    // Spawn a background task to retry registration if initial attempt failed
+    if let Some(ref parent_config) = parent_router_config {
+        if registered_worker_id.lock().await.is_none() {
+            let parent_config = parent_config.clone();
+            let registered = Arc::clone(&registered_worker_id);
+            spawn(async move {
+                let mut attempts = 1u32;
+                loop {
+                    if attempts >= parent_config.max_retries && parent_config.max_retries > 0 {
+                        warn!(
+                            "Exhausted {} retry attempts for parent router registration at {}",
+                            attempts, parent_config.url
+                        );
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_secs(parent_config.retry_interval_secs)).await;
+                    attempts += 1;
+                    match register_with_parent(&parent_config).await {
+                        Ok(worker_id) => {
+                            info!(
+                                "Successfully registered with parent router at {} as worker {} (attempt {})",
+                                parent_config.url, worker_id, attempts
+                            );
+                            *registered.lock().await = Some(worker_id);
+                            return;
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Registration retry {} failed for parent router {}: {}",
+                                attempts, parent_config.url, e
+                            );
+                        }
+                    }
+                }
+            });
+        }
+    }
+
     let handle = axum_server::Handle::new();
     let handle_clone = handle.clone();
     let grace_period = Duration::from_secs(config.shutdown_grace_period_secs);
@@ -1090,8 +1172,111 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
     }
 
+    // Auto-deregister from parent router if we were registered
+    if let Some(ref parent_config) = parent_router_config {
+        let worker_id = registered_worker_id.lock().await.take();
+        if let Some(worker_id) = worker_id {
+            info!("Deregistering from parent router at {}", parent_config.url);
+            if let Err(e) = deregister_from_parent(parent_config, &worker_id).await {
+                warn!(
+                    "Failed to deregister from parent router at {}: {}. \
+                    The parent router will eventually detect this via health checks.",
+                    parent_config.url, e
+                );
+            } else {
+                info!("Successfully deregistered from parent router");
+            }
+        }
+    }
+
     // HA handler shutdown is handled by the signal in mesh_run! macro
     // No need to manually shutdown here
+
+    Ok(())
+}
+
+/// Register this router as a worker with the parent router via POST /workers.
+///
+/// Sends a WorkerConfigRequest to the parent router's /workers endpoint.
+/// Returns the assigned worker_id on success.
+async fn register_with_parent(config: &ParentRouterConfig) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("failed to create HTTP client: {e}"))?;
+
+    let body = json!({
+        "url": config.self_url,
+        "worker_type": config.worker_type,
+        "api_key": config.api_key,
+        "labels": {
+            "role": "router",
+        },
+    });
+
+    let url = format!("{}/workers", config.url.trim_end_matches('/'));
+    let mut req = client.post(&url).json(&body);
+    if let Some(ref api_key) = config.api_key {
+        req = req.bearer_auth(api_key);
+    }
+
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("parent router returned {status}: {body}"));
+    }
+
+    // Response contains worker_id and location
+    let resp_json: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("failed to parse response: {e}"))?;
+
+    // The worker_id field is returned by WorkerService::create_worker
+    let worker_id = resp_json
+        .get("worker_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("missing worker_id in response: {resp_json}"))?
+        .to_string();
+
+    Ok(worker_id)
+}
+
+/// Deregister this router from the parent router via DELETE /workers/{worker_id}.
+async fn deregister_from_parent(
+    config: &ParentRouterConfig,
+    worker_id: &str,
+) -> Result<(), String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("failed to create HTTP client: {e}"))?;
+
+    let url = format!(
+        "{}/workers/{}",
+        config.url.trim_end_matches('/'),
+        worker_id
+    );
+    let mut req = client.delete(&url);
+    if let Some(ref api_key) = config.api_key {
+        req = req.bearer_auth(api_key);
+    }
+
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("parent router returned {status}: {body}"));
+    }
 
     Ok(())
 }
