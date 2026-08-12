@@ -4127,15 +4127,10 @@ class Scheduler(
 
     def load_lora_adapter(
         self, recv_req: LoadLoRAAdapterReqInput
-    ) -> "LoadLoRAAdapterReqOutput":
+    ) -> LoadLoRAAdapterReqOutput:
         """In-place loading a new lora adapter from disk or huggingface."""
 
         result = self.tp_worker.load_lora_adapter(recv_req)
-        # Also load into the draft worker so EAGLE predictions match the
-        # target (base + LoRA). Without this, the draft model runs without
-        # LoRA, causing low speculative acceptance rate (~0.4 vs ~0.95).
-        if self.draft_worker is not None:
-            self.draft_worker.draft_worker.load_lora_adapter(recv_req)
         return result
 
     def load_lora_adapter_from_tensors(
@@ -4144,10 +4139,6 @@ class Scheduler(
         """In-place loading a new lora adapter from serialized tensors."""
 
         result = self.tp_worker.load_lora_adapter_from_tensors(recv_req)
-        if self.draft_worker is not None:
-            self.draft_worker.draft_worker.load_lora_adapter_from_tensors(
-                recv_req
-            )
         return result
 
     def unload_lora_adapter(
@@ -4156,8 +4147,6 @@ class Scheduler(
         """Unload the lora adapter."""
 
         result = self.tp_worker.unload_lora_adapter(recv_req)
-        if self.draft_worker is not None:
-            self.draft_worker.draft_worker.unload_lora_adapter(recv_req)
         return result
 
     def init_weights_send_group_for_remote_instance(
