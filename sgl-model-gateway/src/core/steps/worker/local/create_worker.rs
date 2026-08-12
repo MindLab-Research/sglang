@@ -100,7 +100,13 @@ impl StepExecutor<LocalWorkerWorkflowData> for CreateLocalWorkerStep {
         let worker_type = parse_worker_type(config);
 
         // Get runtime type (for gRPC workers)
-        let runtime_type = determine_runtime_type(connection_mode, &context.data, config);
+        let runtime_type =
+            determine_runtime_type(connection_mode, &context.data, config).map_err(|message| {
+                WorkflowError::StepFailed {
+                    step_id: StepId::new("create_worker"),
+                    message,
+                }
+            })?;
 
         // Build circuit breaker config
         let circuit_breaker_config = build_circuit_breaker_config(app_context);
@@ -240,24 +246,24 @@ fn determine_runtime_type(
     connection_mode: &ConnectionMode,
     data: &LocalWorkerWorkflowData,
     config: &WorkerConfigRequest,
-) -> RuntimeType {
-    if !matches!(connection_mode, ConnectionMode::Grpc { .. }) {
-        return RuntimeType::Sglang;
+) -> Result<RuntimeType, String> {
+    if matches!(connection_mode, ConnectionMode::Grpc { .. }) {
+        if let Some(ref detected_runtime) = data.detected_runtime_type {
+            return parse_runtime_type(detected_runtime);
+        }
     }
 
-    if let Some(ref detected_runtime) = data.detected_runtime_type {
-        match detected_runtime.as_str() {
-            "vllm" => RuntimeType::Vllm,
-            _ => RuntimeType::Sglang,
-        }
-    } else if let Some(ref runtime) = config.runtime {
-        match runtime.as_str() {
-            "vllm" => RuntimeType::Vllm,
-            _ => RuntimeType::Sglang,
-        }
-    } else {
-        RuntimeType::Sglang
+    // HTTP workers also need an explicit runtime so the forwarding layer can
+    // apply backend-specific OAI compatibility without changing other workers.
+    if let Some(ref runtime) = config.runtime {
+        return parse_runtime_type(runtime);
     }
+
+    Ok(RuntimeType::Sglang)
+}
+
+fn parse_runtime_type(runtime: &str) -> Result<RuntimeType, String> {
+    runtime.parse::<RuntimeType>()
 }
 
 fn build_circuit_breaker_config(app_context: &AppContext) -> CircuitBreakerConfig {
@@ -349,6 +355,81 @@ fn create_dp_aware_workers(
     }
 
     Ok(workers)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::steps::workflow_data::LocalWorkerWorkflowData;
+
+    #[test]
+    fn test_http_runtime_config_is_honored() {
+        let config: WorkerConfigRequest = serde_json::from_value(serde_json::json!({
+            "url": "http://vllm:8000",
+            "runtime": "vllm"
+        }))
+        .unwrap();
+        let data = LocalWorkerWorkflowData {
+            config: config.clone(),
+            connection_mode: Some(ConnectionMode::Http),
+            discovered_labels: HashMap::new(),
+            dp_info: None,
+            workers: None,
+            final_labels: HashMap::new(),
+            detected_runtime_type: None,
+            app_context: None,
+            actual_workers: None,
+        };
+
+        assert_eq!(
+            determine_runtime_type(&ConnectionMode::Http, &data, &config).unwrap(),
+            RuntimeType::Vllm
+        );
+    }
+
+    #[test]
+    fn test_uppercase_http_runtime_is_rejected() {
+        let config: WorkerConfigRequest = serde_json::from_value(serde_json::json!({
+            "url": "http://vllm:8000",
+            "runtime": "VLLM"
+        }))
+        .unwrap();
+        let data = LocalWorkerWorkflowData {
+            config: config.clone(),
+            connection_mode: Some(ConnectionMode::Http),
+            discovered_labels: HashMap::new(),
+            dp_info: None,
+            workers: None,
+            final_labels: HashMap::new(),
+            detected_runtime_type: None,
+            app_context: None,
+            actual_workers: None,
+        };
+
+        assert!(determine_runtime_type(&ConnectionMode::Http, &data, &config).is_err());
+    }
+
+    #[test]
+    fn test_unknown_http_runtime_is_rejected() {
+        let config: WorkerConfigRequest = serde_json::from_value(serde_json::json!({
+            "url": "http://worker:8000",
+            "runtime": "vlllm"
+        }))
+        .unwrap();
+        let data = LocalWorkerWorkflowData {
+            config: config.clone(),
+            connection_mode: Some(ConnectionMode::Http),
+            discovered_labels: HashMap::new(),
+            dp_info: None,
+            workers: None,
+            final_labels: HashMap::new(),
+            detected_runtime_type: None,
+            app_context: None,
+            actual_workers: None,
+        };
+
+        assert!(determine_runtime_type(&ConnectionMode::Http, &data, &config).is_err());
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

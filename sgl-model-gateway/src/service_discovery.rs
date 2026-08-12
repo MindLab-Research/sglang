@@ -478,6 +478,9 @@ async fn handle_pod_event(
                 worker_type,
                 priority: None,
                 cost: None,
+                // The global --backend runtime hint is reserved for static
+                // --worker-urls. Kubernetes discovery keeps its native
+                // detection/default path instead of inheriting that hint.
                 runtime: None,
                 labels: HashMap::new(),
                 bootstrap_port,
@@ -883,6 +886,7 @@ mod tests {
                 router_config,
             )),
             inflight_tracker: InFlightRequestTracker::new(),
+            control_plane: crate::control_plane::ControlPlaneState::new(),
         })
     }
 

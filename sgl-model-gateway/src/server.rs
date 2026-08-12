@@ -7,15 +7,15 @@ use std::{
 };
 
 use axum::{
-    extract::{Path, Query, Request, State},
-    http::StatusCode,
+    extract::{rejection::JsonRejection, FromRequest, Path, Query, Request, State},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
 };
 use rustls::crypto::ring;
-use serde::Deserialize;
-use serde_json::{json, Value};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde_json::{json, Map, Value};
 use smg_mesh::{
     rate_limit_window::RateLimitWindow, MeshServerConfig, MeshServerHandler, MeshSyncManager,
 };
@@ -26,6 +26,7 @@ use wfaas::LoggingSubscriber;
 use crate::{
     app_context::AppContext,
     config::{RouterConfig, RoutingMode},
+    control_plane::{self, ControlPlaneState},
     core::{
         job_queue::{JobQueue, JobQueueConfig},
         steps::{TokenizerConfigRequest, WorkflowEngines},
@@ -53,7 +54,7 @@ use crate::{
         worker_spec::{WorkerConfigRequest, WorkerUpdateRequest},
     },
     routers::{
-        conversations,
+        conversations, error, header_utils,
         mesh::{
             get_app_config, get_cluster_status, get_global_rate_limit, get_global_rate_limit_stats,
             get_mesh_health, get_policy_state, get_policy_states, get_worker_state,
@@ -67,6 +68,128 @@ use crate::{
     tokenizer::TokenizerRegistry,
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
 };
+
+/// JSON extractor that validates a typed request while retaining unknown
+/// fields for transparent forwarding to Engine-specific APIs.
+struct RawValidatedJson<T> {
+    value: T,
+    raw: Value,
+}
+
+#[derive(Deserialize)]
+struct JsonWithExtensions<T> {
+    #[serde(flatten)]
+    value: T,
+    #[serde(flatten)]
+    extensions: Map<String, Value>,
+}
+
+impl<S, T> FromRequest<S> for RawValidatedJson<T>
+where
+    T: DeserializeOwned
+        + Serialize
+        + validator::Validate
+        + openai_protocol::validated::Normalizable
+        + Send,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let Json(JsonWithExtensions {
+            mut value,
+            extensions,
+        }) = Json::<JsonWithExtensions<T>>::from_request(req, state)
+            .await
+            .map_err(|err: JsonRejection| {
+                let error_message = match err {
+                    JsonRejection::JsonDataError(error) => {
+                        format!("Invalid JSON data: {error}")
+                    }
+                    JsonRejection::JsonSyntaxError(error) => {
+                        format!("JSON syntax error: {error}")
+                    }
+                    JsonRejection::MissingJsonContentType(_) => {
+                        "Missing Content-Type: application/json header".to_string()
+                    }
+                    _ => format!("Failed to parse JSON: {err}"),
+                };
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": {
+                            "message": error_message,
+                            "type": "invalid_request_error",
+                            "code": "json_parse_error"
+                        }
+                    })),
+                )
+                    .into_response()
+            })?;
+        openai_protocol::validated::Normalizable::normalize(&mut value);
+        value.validate().map_err(|validation_errors| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": {
+                        "message": validation_errors.to_string(),
+                        "type": "invalid_request_error",
+                        "code": 400
+                    }
+                })),
+            )
+                .into_response()
+        })?;
+
+        let mut forward = serde_json::to_value(&value).map_err(|err| {
+            error::internal_error(
+                "serialization_failed",
+                format!("Failed to normalize JSON: {err}"),
+            )
+        })?;
+        if let Some(normalized) = forward.as_object_mut() {
+            for (key, value) in extensions {
+                normalized.entry(key).or_insert(value);
+            }
+        }
+        Ok(Self {
+            value,
+            raw: forward,
+        })
+    }
+}
+
+#[cfg(test)]
+mod raw_validated_json_tests {
+    use super::*;
+
+    #[test]
+    fn flattened_chat_request_retains_only_unknown_top_level_extensions() {
+        let parsed: JsonWithExtensions<ChatCompletionRequest> = serde_json::from_value(json!({
+            "model": "L0",
+            "messages": [
+                {"role": "user", "content": "route this"},
+                {"role": "assistant", "content": "model_id="}
+            ],
+            "stream": false,
+            "continue_final_message": true,
+            "add_generation_prompt": false,
+            "structured_outputs": {"choice": ["L0", "L1", "L2", "L3"]}
+        }))
+        .unwrap();
+
+        assert_eq!(parsed.value.model, "L0");
+        assert!(parsed.value.continue_final_message);
+        assert_eq!(
+            parsed.extensions,
+            serde_json::from_value::<Map<String, Value>>(json!({
+                "add_generation_prompt": false,
+                "structured_outputs": {"choice": ["L0", "L1", "L2", "L3"]}
+            }))
+            .unwrap()
+        );
+    }
+}
 #[derive(Clone)]
 pub struct AppState {
     pub router: Arc<dyn RouterTrait>,
@@ -75,6 +198,7 @@ pub struct AppState {
     pub router_manager: Option<Arc<RouterManager>>,
     pub mesh_handler: Option<Arc<MeshServerHandler>>,
     pub mesh_sync_manager: Option<Arc<MeshSyncManager>>,
+    pub control_plane: Arc<ControlPlaneState>,
 }
 
 async fn parse_function_call(
@@ -171,7 +295,7 @@ async fn get_model_info(State(state): State<Arc<AppState>>, req: Request) -> Res
 
 async fn generate(
     State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
+    headers: HeaderMap,
     Json(body): Json<GenerateRequest>,
 ) -> Response {
     let model_id = body.model.as_deref();
@@ -183,18 +307,53 @@ async fn generate(
 
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
-    ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
+    headers: HeaderMap,
+    RawValidatedJson { value: body, raw }: RawValidatedJson<ChatCompletionRequest>,
 ) -> Response {
     state
         .router
-        .route_chat(Some(&headers), &body, Some(&body.model))
+        .route_chat_raw(Some(&headers), &body, &raw, Some(&body.model))
         .await
+}
+
+async fn release_routing_key(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let key = header_utils::extract_routing_key(Some(&headers));
+    if key.is_none() {
+        return error::bad_request("missing_routing_key", "X-SMG-Routing-Key is required");
+    }
+    state
+        .context
+        .policy_registry
+        .release_routing_key(key.unwrap());
+    StatusCode::NO_CONTENT.into_response()
+}
+
+#[derive(Deserialize)]
+struct ReleaseRoutingKeysRequest {
+    routing_keys: Vec<String>,
+}
+
+async fn release_routing_keys(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ReleaseRoutingKeysRequest>,
+) -> Response {
+    if body.routing_keys.len() > 4096 {
+        return error::bad_request(
+            "too_many_routing_keys",
+            "routing_keys must contain at most 4096 entries",
+        );
+    }
+    for key in body.routing_keys {
+        if !key.is_empty() {
+            state.context.policy_registry.release_routing_key(&key);
+        }
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn v1_completions(
     State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
+    headers: HeaderMap,
     Json(body): Json<CompletionRequest>,
 ) -> Response {
     state
@@ -205,7 +364,7 @@ async fn v1_completions(
 
 async fn v1_rerank(
     State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
+    headers: HeaderMap,
     Json(body): Json<V1RerankReqInput>,
 ) -> Response {
     let rerank_body = &body.into();
@@ -217,7 +376,7 @@ async fn v1_rerank(
 
 async fn v1_responses(
     State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
+    headers: HeaderMap,
     ValidatedJson(body): ValidatedJson<ResponsesRequest>,
 ) -> Response {
     state
@@ -228,7 +387,7 @@ async fn v1_responses(
 
 async fn v1_embeddings(
     State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
+    headers: HeaderMap,
     Json(body): Json<EmbeddingRequest>,
 ) -> Response {
     state
@@ -239,7 +398,7 @@ async fn v1_embeddings(
 
 async fn v1_classify(
     State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
+    headers: HeaderMap,
     Json(body): Json<ClassifyRequest>,
 ) -> Response {
     state
@@ -251,7 +410,7 @@ async fn v1_classify(
 async fn v1_responses_get(
     State(state): State<Arc<AppState>>,
     Path(response_id): Path<String>,
-    headers: http::HeaderMap,
+    headers: HeaderMap,
     Query(params): Query<ResponsesGetParams>,
 ) -> Response {
     state
@@ -263,7 +422,7 @@ async fn v1_responses_get(
 async fn v1_responses_cancel(
     State(state): State<Arc<AppState>>,
     Path(response_id): Path<String>,
-    headers: http::HeaderMap,
+    headers: HeaderMap,
 ) -> Response {
     state
         .router
@@ -274,7 +433,7 @@ async fn v1_responses_cancel(
 async fn v1_responses_delete(
     State(state): State<Arc<AppState>>,
     Path(response_id): Path<String>,
-    headers: http::HeaderMap,
+    headers: HeaderMap,
 ) -> Response {
     state
         .router
@@ -285,7 +444,7 @@ async fn v1_responses_delete(
 async fn v1_responses_list_input_items(
     State(state): State<Arc<AppState>>,
     Path(response_id): Path<String>,
-    headers: http::HeaderMap,
+    headers: HeaderMap,
 ) -> Response {
     state
         .router
@@ -544,6 +703,8 @@ pub fn build_app(
     let protected_routes = Router::new()
         .route("/generate", post(generate))
         .route("/v1/chat/completions", post(v1_chat_completions))
+        .route("/_internal/routing-key", delete(release_routing_key))
+        .route("/_internal/routing-keys", delete(release_routing_keys))
         .route("/v1/completions", post(v1_completions))
         .route("/v1/rerank", post(v1_rerank))
         .route("/v1/responses", post(v1_responses))
@@ -673,12 +834,35 @@ pub fn build_app(
             middleware::auth_middleware,
         ));
 
+    // Control plane routes (recursive router tree: models / units / register)
+    // Namespaced under /v1/control/ to avoid clashing with OpenAI-compatible
+    // /v1/* endpoints (e.g. /v1/models already serves the model list).
+    let control_plane_routes = Router::new()
+        .route(
+            "/v1/control/models",
+            get(control_plane::get_models)
+                .post(control_plane::deploy::deploy_model),
+        )
+        .route(
+            "/v1/control/models/{name}",
+            delete(control_plane::deploy::delete_model),
+        )
+        .route("/v1/control/units", get(control_plane::get_units))
+        .route(
+            "/v1/control/routing",
+            get(control_plane::get_routing).put(control_plane::put_routing),
+        )
+        .route("/v1/control/register", post(control_plane::register))
+        .route("/v1/control/healthz", get(control_plane::healthz))
+        .with_state(app_state.control_plane.clone());
+
     Router::new()
         .merge(protected_routes)
         .merge(public_routes)
         .merge(admin_routes)
         .merge(worker_routes)
         .merge(mesh_routes)
+        .merge(control_plane_routes)
         .layer(axum::extract::DefaultBodyLimit::max(max_payload_size))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             max_payload_size,
@@ -980,6 +1164,17 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .as_ref()
         .map(|c| c.self_addr.port());
 
+    // Control plane: shared model/metrics state + background metrics collector.
+    // Reuse the instance created inside AppContext so the data plane (Router)
+    // and the control-plane handlers share one registry.
+    let control_plane = app_context.control_plane.clone();
+    control_plane::spawn_metrics_collector(
+        Arc::clone(&control_plane),
+        Arc::clone(&app_context.worker_registry),
+        5,
+    )
+    .await;
+
     let app_state = Arc::new(AppState {
         router,
         context: app_context.clone(),
@@ -987,6 +1182,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         router_manager: Some(router_manager),
         mesh_handler,
         mesh_sync_manager,
+        control_plane,
     });
     if let Some(service_discovery_config) = config.service_discovery_config {
         if service_discovery_config.enabled {

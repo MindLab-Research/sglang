@@ -1,4 +1,9 @@
-use std::{sync::Arc, time::Instant};
+use std::{
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::Instant,
+};
 
 use axum::{
     body::{to_bytes, Body},
@@ -7,13 +12,14 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use futures_util::{stream, StreamExt};
+use futures_util::{stream, Stream, StreamExt};
 use reqwest::Client;
 use tracing::{debug, error};
 
 use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
+    control_plane::{ChildUnit, ControlPlaneState},
     core::{
         is_retryable_status, AttachedBody, ConnectionMode, RetryExecutor, Worker, WorkerLoadGuard,
         WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID,
@@ -51,6 +57,83 @@ pub struct Router {
     dp_aware: bool,
     enable_igw: bool,
     retry_config: RetryConfig,
+    control_plane: Arc<ControlPlaneState>,
+}
+
+const MOL_INTERNAL_HOP_KEY: &str = "mol_internal_hop";
+const MOL_ROUTE_HOP: &str = "route";
+
+/// Stream wrapper that calls `on_end` exactly once when the inner stream
+/// terminates (clean EOF, error, or drop) — used for per-model in-flight
+/// accounting on streaming responses.
+struct EndTrackedStream<S> {
+    inner: S,
+    on_end: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl<S: Stream + Unpin> Stream for EndTrackedStream<S> {
+    type Item = S::Item;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.inner.poll_next_unpin(cx) {
+            Poll::Ready(Some(item)) => Poll::Ready(Some(item)),
+            Poll::Ready(None) => {
+                if let Some(f) = self.on_end.take() {
+                    f();
+                }
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<S> Drop for EndTrackedStream<S> {
+    fn drop(&mut self) {
+        if let Some(f) = self.on_end.take() {
+            f();
+        }
+    }
+}
+
+/// Validates the private route marker while borrowing one payload for every runtime.
+struct WorkerPayload<'a> {
+    serialized: &'a serde_json::Value,
+}
+
+impl<'a> WorkerPayload<'a> {
+    fn new(
+        headers: Option<&HeaderMap>,
+        serialized: &'a serde_json::Value,
+        route: &str,
+    ) -> Result<Self, String> {
+        let header_hop = header_utils::extract_mol_internal_hop(headers);
+        let metadata_hop_value = serialized
+            .get("metadata")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|metadata| metadata.get(MOL_INTERNAL_HOP_KEY));
+        if metadata_hop_value.is_some() {
+            return Err(
+                "metadata.mol_internal_hop is no longer supported; use X-MOL-Internal-Hop"
+                    .to_string(),
+            );
+        }
+
+        if let Some(internal_hop) = header_hop {
+            if internal_hop != MOL_ROUTE_HOP {
+                return Err("unsupported internal hop value".to_string());
+            }
+            if route != "/v1/chat/completions" {
+                return Err("mol route marker is valid only for chat completions".to_string());
+            }
+        }
+
+        Ok(Self { serialized })
+    }
+
+    fn payload(&self) -> &'a serde_json::Value {
+        self.serialized
+    }
 }
 
 impl std::fmt::Debug for Router {
@@ -76,6 +159,7 @@ impl Router {
             dp_aware: ctx.router_config.dp_aware,
             enable_igw: ctx.router_config.enable_igw,
             retry_config: ctx.router_config.effective_retry_config(),
+            control_plane: ctx.control_plane.clone(),
         })
     }
 
@@ -127,6 +211,62 @@ impl Router {
                 }
             }
             Err(e) => error::service_unavailable("no_workers", e),
+        }
+    }
+
+    /// Forward a request to a registered child unit (sub-router / engine /
+    /// pd_cluster) instead of the local worker registry. Used by the
+    /// recursive tree: the top router routes down to the child that declares
+    /// it can serve the requested model.
+    async fn proxy_to_child(
+        &self,
+        child: &ChildUnit,
+        headers: Option<&HeaderMap>,
+        serialized: &serde_json::Value,
+        route: &'static str,
+        is_stream: bool,
+    ) -> Response {
+        let url = format!("{}{}", child.url.trim_end_matches('/'), route);
+        let mut builder = self.client.post(&url).json(serialized);
+        if let Some(h) = headers {
+            for (name, value) in h.iter() {
+                if header_utils::should_forward_request_header(name.as_str()) {
+                    builder = builder.header(name.as_str(), value);
+                }
+            }
+        }
+        if let Some(key) = &child.api_key {
+            builder = builder.header("Authorization", format!("Bearer {}", key));
+        }
+
+        match builder.send().await {
+            Ok(res) => {
+                let status = StatusCode::from_u16(res.status().as_u16())
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                let response_headers = header_utils::preserve_response_headers(res.headers());
+                if is_stream {
+                    // Keep streaming: forward the byte stream unchanged.
+                    let body = Body::from_stream(res.bytes_stream());
+                    let mut response = Response::new(body);
+                    *response.status_mut() = status;
+                    *response.headers_mut() = response_headers;
+                    response
+                } else {
+                    match res.bytes().await {
+                        Ok(body) => {
+                            let mut response = Response::new(Body::from(body));
+                            *response.status_mut() = status;
+                            *response.headers_mut() = response_headers;
+                            response
+                        }
+                        Err(e) => error::internal_error(
+                            "read_child_response_failed",
+                            format!("Failed to read response: {}", e),
+                        ),
+                    }
+                }
+            }
+            Err(e) => convert_reqwest_error(e),
         }
     }
 
@@ -198,11 +338,71 @@ impl Router {
         route: &'static str,
         model_id: Option<&str>,
     ) -> Response {
-        let start = Instant::now();
-        let is_stream = typed_req.is_stream();
+        let serialized = match serde_json::to_value(typed_req) {
+            Ok(value) => value,
+            Err(err) => {
+                return error::bad_request(
+                    "serialization_failed",
+                    format!("Convert into serde_json::Value failed: {err}"),
+                )
+            }
+        };
         let text = typed_req.extract_text_for_routing();
+        self.route_serialized_request(
+            headers,
+            &serialized,
+            route,
+            model_id,
+            typed_req.is_stream(),
+            &text,
+        )
+        .await
+    }
+
+    async fn route_serialized_request(
+        &self,
+        headers: Option<&HeaderMap>,
+        serialized: &serde_json::Value,
+        route: &'static str,
+        model_id: Option<&str>,
+        is_stream: bool,
+        text: &str,
+    ) -> Response {
+        let worker_payloads = match WorkerPayload::new(headers, serialized, route) {
+            Ok(payloads) => payloads,
+            Err(message) => {
+                return error::bad_request("invalid_internal_route_payload", message);
+            }
+        };
+        let start = Instant::now();
         let model = model_id.unwrap_or(UNKNOWN_MODEL_ID);
         let endpoint = route_to_endpoint(route);
+
+        // Recursive tree: prefer a registered child (sub-router / engine /
+        // pd_cluster) that declares it can serve this model. Fall back to the
+        // local worker registry when no child matches.
+        if let Some(child) = self.control_plane.child_for_model(model_id) {
+            let response = self
+                .proxy_to_child(&child, headers, serialized, route, is_stream)
+                .await;
+            // per-model in-flight accounting on the child path too
+            if !is_stream {
+                self.control_plane.request_finished(model);
+            } else {
+                let (parts, body) = response.into_parts();
+                let cp = self.control_plane.clone();
+                let model_owned = model.to_string();
+                let stream = EndTrackedStream {
+                    inner: body.into_data_stream(),
+                    on_end: Some(Box::new(move || cp.request_finished(&model_owned))),
+                };
+                return Response::from_parts(parts, Body::from_stream(stream));
+            }
+            return response;
+        }
+
+        // Control-plane per-model in-flight accounting (data plane).
+        self.control_plane.request_started(model);
 
         // Record request start (Layer 2)
         Metrics::record_router_request(
@@ -219,7 +419,14 @@ impl Router {
             // operation per attempt
             |_: u32| async {
                 let res = self
-                    .route_typed_request_once(headers, typed_req, route, model_id, is_stream, &text)
+                    .route_serialized_request_once(
+                        headers,
+                        &worker_payloads,
+                        route,
+                        model_id,
+                        is_stream,
+                        text,
+                    )
                     .await;
 
                 // Need to be outside `route_typed_request_once` because that function has multiple return paths
@@ -267,13 +474,29 @@ impl Router {
             );
         }
 
-        response
+        // Per-model in-flight accounting end.
+        if !is_stream {
+            self.control_plane.request_finished(model);
+            response
+        } else {
+            // For streaming, wrap the body so the counter is released exactly
+            // when the stream terminates (clean EOF, upstream error, or the
+            // client disconnecting and dropping the body).
+            let (parts, body) = response.into_parts();
+            let cp = self.control_plane.clone();
+            let model_owned = model.to_string();
+            let stream = EndTrackedStream {
+                inner: body.into_data_stream(),
+                on_end: Some(Box::new(move || cp.request_finished(&model_owned))),
+            };
+            Response::from_parts(parts, Body::from_stream(stream))
+        }
     }
 
-    async fn route_typed_request_once<T: GenerationRequest + serde::Serialize + Clone>(
+    async fn route_serialized_request_once(
         &self,
         headers: Option<&HeaderMap>,
-        typed_req: &T,
+        worker_payloads: &WorkerPayload<'_>,
         route: &'static str,
         model_id: Option<&str>,
         is_stream: bool,
@@ -307,8 +530,17 @@ impl Router {
         inject_trace_context_http(&mut headers_with_trace);
         let headers = Some(&headers_with_trace);
 
+        let worker_payload = worker_payloads.payload();
+
         let response = self
-            .send_typed_request(headers, typed_req, route, &worker, is_stream, load_guard)
+            .send_json_request(
+                headers,
+                worker_payload,
+                route,
+                &worker,
+                is_stream,
+                load_guard,
+            )
             .await;
 
         events::RequestReceivedEvent {}.emit();
@@ -484,10 +716,10 @@ impl Router {
     }
 
     // Send typed request directly without conversion
-    async fn send_typed_request<T: serde::Serialize>(
+    async fn send_json_request(
         &self,
         headers: Option<&HeaderMap>,
-        typed_req: &T,
+        serialized: &serde_json::Value,
         route: &'static str,
         worker: &Arc<dyn Worker>,
         is_stream: bool,
@@ -511,15 +743,7 @@ impl Router {
                 }
             };
 
-            let mut json_val = match serde_json::to_value(typed_req) {
-                Ok(j) => j,
-                Err(e) => {
-                    return error::bad_request(
-                        "serialization_failed",
-                        format!("Convert into serde_json::Value failed: {}", e),
-                    );
-                }
-            };
+            let mut json_val = serialized.clone();
 
             if let Some(map) = json_val.as_object_mut() {
                 // Use static key string to avoid allocation
@@ -544,7 +768,7 @@ impl Router {
         } else {
             self.client
                 .post(format!("{}{}", worker_url, route))
-                .json(typed_req) // Use json() directly with typed request
+                .json(serialized)
         };
 
         if let Some(key) = api_key {
@@ -766,6 +990,25 @@ impl RouterTrait for Router {
             .await
     }
 
+    async fn route_chat_raw(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+        raw_body: &serde_json::Value,
+        model_id: Option<&str>,
+    ) -> Response {
+        let text = body.extract_text_for_routing();
+        self.route_serialized_request(
+            headers,
+            raw_body,
+            "/v1/chat/completions",
+            model_id,
+            body.is_stream(),
+            &text,
+        )
+        .await
+    }
+
     async fn route_completion(
         &self,
         headers: Option<&HeaderMap>,
@@ -856,6 +1099,37 @@ mod tests {
     use super::*;
     use crate::core::BasicWorkerBuilder;
 
+    fn route_payload() -> serde_json::Value {
+        serde_json::json!({
+            "model": "L0",
+            "messages": [{
+                "role": "user",
+                "content": "classify this request\nmodel_id="
+            }],
+            "max_completion_tokens": 24,
+            "temperature": 0.0,
+            "stream": false,
+            "chat_template_kwargs": {"enable_thinking": false},
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "model_route",
+                    "strict": true,
+                    "schema": {
+                        "type": "string",
+                        "enum": ["L0", "L1", "L2", "L3"]
+                    }
+                }
+            }
+        })
+    }
+
+    fn route_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-mol-internal-hop", "route".parse().unwrap());
+        headers
+    }
+
     fn create_test_regular_router() -> Router {
         // Create registries
         let worker_registry = Arc::new(WorkerRegistry::new());
@@ -880,6 +1154,7 @@ mod tests {
             client: Client::new(),
             retry_config: RetryConfig::default(),
             enable_igw: false,
+            control_plane: crate::control_plane::ControlPlaneState::new(),
         }
     }
 
@@ -922,5 +1197,65 @@ mod tests {
 
         let worker = router.worker_registry.get_by_url(&url).unwrap();
         assert!(worker.is_healthy());
+    }
+
+    #[test]
+    fn test_unmarked_chat_payload_is_not_cloned_or_adapted() {
+        let payload = serde_json::json!({
+            "model": "L0",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let cache = WorkerPayload::new(None, &payload, "/v1/chat/completions").unwrap();
+        let worker_payload = cache.payload();
+        assert!(std::ptr::eq(worker_payload, &payload));
+    }
+
+    #[test]
+    fn test_header_route_payload_is_borrowed_without_clone() {
+        let payload = route_payload();
+        let headers = route_headers();
+        let cache = WorkerPayload::new(Some(&headers), &payload, "/v1/chat/completions").unwrap();
+        let worker_payload = cache.payload();
+
+        assert!(std::ptr::eq(worker_payload, &payload));
+        assert_eq!(worker_payload["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            worker_payload["messages"][0]["content"],
+            "classify this request\nmodel_id="
+        );
+        assert_eq!(worker_payload["response_format"]["type"], "json_schema");
+    }
+
+    #[test]
+    fn test_unrelated_metadata_is_borrowed_unchanged() {
+        let mut payload = route_payload();
+        payload["metadata"] = serde_json::json!({"trace": "keep-me"});
+        let cache = WorkerPayload::new(None, &payload, "/v1/chat/completions").unwrap();
+        let worker_payload = cache.payload();
+        assert!(std::ptr::eq(worker_payload, &payload));
+        assert_eq!(
+            worker_payload["metadata"],
+            serde_json::json!({"trace": "keep-me"})
+        );
+    }
+
+    #[test]
+    fn test_legacy_metadata_route_is_rejected() {
+        let mut payload = route_payload();
+        payload["metadata"] = serde_json::json!({"mol_internal_hop": "route"});
+        let error = WorkerPayload::new(None, &payload, "/v1/chat/completions")
+            .err()
+            .unwrap();
+        assert!(error.contains("no longer supported"));
+    }
+
+    #[test]
+    fn test_invalid_internal_hop_header_is_rejected() {
+        let payload = route_payload();
+        let mut invalid_headers = HeaderMap::new();
+        invalid_headers.insert("x-mol-internal-hop", "answer".parse().unwrap());
+        assert!(
+            WorkerPayload::new(Some(&invalid_headers), &payload, "/v1/chat/completions").is_err()
+        );
     }
 }

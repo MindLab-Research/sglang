@@ -72,7 +72,7 @@ impl Default for ManualConfig {
         Self {
             eviction_interval_secs: 60,
             max_idle_secs: 4 * 3600,
-            assignment_mode: ManualAssignmentMode::Random,
+            assignment_mode: ManualAssignmentMode::MinLoadThenGroup,
         }
     }
 }
@@ -156,6 +156,9 @@ impl ManualPolicy {
             ManualAssignmentMode::Random => random_select(healthy_indices),
             ManualAssignmentMode::MinLoad => min_load_select(workers, healthy_indices),
             ManualAssignmentMode::MinGroup => min_group_select(workers, healthy_indices),
+            ManualAssignmentMode::MinLoadThenGroup => {
+                min_load_then_group_select(workers, healthy_indices)
+            }
         }
     }
 
@@ -208,7 +211,7 @@ impl ManualPolicy {
         }
 
         (
-            Some(random_select(&healthy_indices)),
+            Some(min_load_select(workers, &healthy_indices)),
             ExecutionBranch::NoRoutingId,
         )
     }
@@ -229,6 +232,15 @@ impl LoadBalancingPolicy for ManualPolicy {
 
     fn name(&self) -> &'static str {
         "manual"
+    }
+
+    fn release_routing_key(&self, routing_key: &str) -> bool {
+        let removed = self
+            .routing_map
+            .remove(&RoutingId::new(routing_key))
+            .is_some();
+        Metrics::set_manual_policy_cache_entries(self.routing_map.len());
+        removed
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -300,6 +312,15 @@ fn min_load_select(workers: &[Arc<dyn Worker>], healthy_indices: &[usize]) -> us
 fn min_group_select(workers: &[Arc<dyn Worker>], healthy_indices: &[usize]) -> usize {
     select_min_by(healthy_indices, |idx| {
         workers[idx].worker_routing_key_load().value()
+    })
+}
+
+fn min_load_then_group_select(workers: &[Arc<dyn Worker>], healthy_indices: &[usize]) -> usize {
+    select_min_by(healthy_indices, |idx| {
+        (
+            workers[idx].load(),
+            workers[idx].worker_routing_key_load().value(),
+        )
     })
 }
 
@@ -378,9 +399,10 @@ mod tests {
     }
 
     #[test]
-    fn test_manual_fallback_random() {
+    fn test_manual_fallback_min_load() {
         let policy = ManualPolicy::new();
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+        workers[1].increment_load();
 
         let mut counts = HashMap::new();
         for _ in 0..100 {
@@ -392,7 +414,12 @@ mod tests {
             }
         }
 
-        assert_eq!(counts.len(), 2, "Random fallback should use all workers");
+        assert_eq!(
+            counts.len(),
+            1,
+            "MinLoad fallback should choose the idle worker"
+        );
+        assert_eq!(counts.get(&0), Some(&100));
     }
 
     #[test]
@@ -692,6 +719,10 @@ mod tests {
         let config = ManualConfig::default();
         assert_eq!(config.eviction_interval_secs, 60);
         assert_eq!(config.max_idle_secs, 4 * 3600);
+        assert_eq!(
+            config.assignment_mode,
+            ManualAssignmentMode::MinLoadThenGroup
+        );
     }
 
     #[test]
@@ -935,7 +966,7 @@ mod tests {
         );
     }
 
-    fn assert_no_routing_key_uses_random(
+    fn assert_no_routing_key_uses_min_load(
         assignment_mode: ManualAssignmentMode,
         setup_load: impl Fn(&[Arc<dyn Worker>]),
     ) {
@@ -947,35 +978,83 @@ mod tests {
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
         setup_load(&workers);
 
-        let mut selected_worker_0 = false;
-        for _ in 0..50 {
-            let info = SelectWorkerInfo::default();
-            let (result, branch) = policy.select_worker_impl(&workers, &info);
-            assert_eq!(branch, ExecutionBranch::NoRoutingId);
-            if result == Some(0) {
-                selected_worker_0 = true;
-                break;
-            }
-        }
-        assert!(
-            selected_worker_0,
-            "Should randomly select worker 0 despite higher load"
-        );
+        let info = SelectWorkerInfo::default();
+        let (result, branch) = policy.select_worker_impl(&workers, &info);
+        assert_eq!(branch, ExecutionBranch::NoRoutingId);
+        assert_eq!(result, Some(1), "No-key requests should use MinLoad");
     }
 
     #[test]
-    fn test_no_routing_key_uses_random_even_with_min_load_mode() {
-        assert_no_routing_key_uses_random(ManualAssignmentMode::MinLoad, |workers| {
+    fn test_no_routing_key_uses_min_load_mode() {
+        assert_no_routing_key_uses_min_load(ManualAssignmentMode::MinLoad, |workers| {
             workers[0].increment_load();
             workers[0].increment_load();
         });
     }
 
     #[test]
-    fn test_no_routing_key_uses_random_even_with_min_group_mode() {
-        assert_no_routing_key_uses_random(ManualAssignmentMode::MinGroup, |workers| {
+    fn test_no_routing_key_uses_min_load_in_min_group_mode() {
+        assert_no_routing_key_uses_min_load(ManualAssignmentMode::MinGroup, |workers| {
+            workers[0].increment_load();
             workers[0].worker_routing_key_load().increment("k1");
             workers[0].worker_routing_key_load().increment("k2");
         });
+    }
+
+    #[test]
+    fn test_min_load_then_group_prefers_load_before_groups() {
+        let config = ManualConfig {
+            assignment_mode: ManualAssignmentMode::MinLoadThenGroup,
+            ..Default::default()
+        };
+        let policy = ManualPolicy::with_config(config);
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+        workers[0].worker_routing_key_load().increment("existing");
+        workers[0].increment_load();
+        workers[1].worker_routing_key_load().increment("a");
+        workers[1].worker_routing_key_load().increment("b");
+
+        let headers = headers_with_routing_key("new");
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+        let (result, _) = policy.select_worker_impl(&workers, &info);
+        assert_eq!(result, Some(1), "load is the primary comparison");
+    }
+
+    #[test]
+    fn test_min_load_then_group_uses_groups_as_tiebreaker() {
+        let config = ManualConfig {
+            assignment_mode: ManualAssignmentMode::MinLoadThenGroup,
+            ..Default::default()
+        };
+        let policy = ManualPolicy::with_config(config);
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+        workers[0].worker_routing_key_load().increment("existing");
+
+        let headers = headers_with_routing_key("new");
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+        let (result, _) = policy.select_worker_impl(&workers, &info);
+        assert_eq!(result, Some(1), "groups break equal-load ties");
+    }
+
+    #[test]
+    fn test_release_routing_key_is_idempotent() {
+        let policy = ManualPolicy::new();
+        let workers = create_workers(&["http://w1:8000"]);
+        let headers = headers_with_routing_key("release-me");
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+        policy.select_worker_impl(&workers, &info);
+        assert_eq!(policy.routing_map.len(), 1);
+        assert!(policy.release_routing_key("release-me"));
+        assert!(!policy.release_routing_key("release-me"));
+        assert_eq!(policy.routing_map.len(), 0);
     }
 }

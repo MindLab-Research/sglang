@@ -9,6 +9,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
+use serde_json::Value;
 
 use crate::protocols::{
     chat::ChatCompletionRequest,
@@ -97,6 +98,21 @@ pub trait RouterTrait: Send + Sync + Debug {
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response;
+
+    /// Route a validated Chat request while preserving unknown JSON extensions.
+    /// Implementations that do not support raw forwarding fall back to the
+    /// typed path; the regular HTTP router overrides this for Engine-specific
+    /// fields such as `add_generation_prompt`.
+    async fn route_chat_raw(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+        raw_body: &Value,
+        model_id: Option<&str>,
+    ) -> Response {
+        let _ = raw_body;
+        self.route_chat(headers, body, model_id).await
+    }
 
     /// Route a completion request
     async fn route_completion(

@@ -7,6 +7,7 @@ use http::header::HeaderName;
 
 static HEADER_TARGET_WORKER: HeaderName = HeaderName::from_static("x-smg-target-worker");
 static HEADER_ROUTING_KEY: HeaderName = HeaderName::from_static("x-smg-routing-key");
+static HEADER_MOL_INTERNAL_HOP: HeaderName = HeaderName::from_static("x-mol-internal-hop");
 
 fn extract_header_value<'a>(headers: Option<&'a HeaderMap>, name: &HeaderName) -> Option<&'a str> {
     headers
@@ -21,6 +22,10 @@ pub fn extract_target_worker(headers: Option<&HeaderMap>) -> Option<&str> {
 
 pub fn extract_routing_key(headers: Option<&HeaderMap>) -> Option<&str> {
     extract_header_value(headers, &HEADER_ROUTING_KEY)
+}
+
+pub fn extract_mol_internal_hop(headers: Option<&HeaderMap>) -> Option<&str> {
+    extract_header_value(headers, &HEADER_MOL_INTERNAL_HOP)
 }
 
 /// Copy request headers to a Vec of name-value string pairs
@@ -212,7 +217,6 @@ pub fn should_forward_request_header(name: &str) -> bool {
         || name.eq_ignore_ascii_case("x-correlation-id")
         || name.eq_ignore_ascii_case("traceparent")
         || name.eq_ignore_ascii_case("tracestate")
-        || name.eq_ignore_ascii_case("x-smg-routing-key")
         || name
             .get(..REQUEST_ID_PREFIX.len())
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case(REQUEST_ID_PREFIX))
@@ -261,6 +265,14 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_mol_internal_hop() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-mol-internal-hop", "route".parse().unwrap());
+        assert_eq!(extract_mol_internal_hop(Some(&headers)), Some("route"));
+        assert!(!should_forward_request_header("x-mol-internal-hop"));
+    }
+
+    #[test]
     fn test_should_forward_request_header_whitelist() {
         assert!(should_forward_request_header("authorization"));
         assert!(should_forward_request_header("Authorization"));
@@ -276,8 +288,8 @@ mod tests {
         assert!(should_forward_request_header("x-request-id-user"));
         assert!(should_forward_request_header("X-Request-ID-Span"));
         assert!(should_forward_request_header("x-request-id-123"));
-        assert!(should_forward_request_header("x-smg-routing-key"));
-        assert!(should_forward_request_header("X-SMG-Routing-Key"));
+        assert!(!should_forward_request_header("x-smg-routing-key"));
+        assert!(!should_forward_request_header("X-SMG-Routing-Key"));
     }
 
     #[test]

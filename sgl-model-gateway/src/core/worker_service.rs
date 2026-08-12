@@ -16,7 +16,10 @@ use tracing::warn;
 
 use crate::{
     config::RouterConfig,
-    core::{worker::worker_to_info, worker_registry::WorkerId, Job, JobQueue, WorkerRegistry},
+    core::{
+        worker::worker_to_info, worker_registry::WorkerId, Job, JobQueue, RuntimeType,
+        WorkerRegistry,
+    },
     protocols::worker_spec::{
         WorkerConfigRequest, WorkerErrorResponse, WorkerInfo, WorkerUpdateRequest,
     },
@@ -33,6 +36,10 @@ pub enum WorkerServiceError {
     QueueNotInitialized,
     /// Failed to submit job to queue
     QueueSubmitFailed { message: String },
+    /// Invalid worker runtime
+    InvalidRuntime { runtime: String, message: String },
+    /// Dynamic worker registration omitted the required runtime
+    MissingRuntime,
 }
 
 impl WorkerServiceError {
@@ -42,6 +49,8 @@ impl WorkerServiceError {
             Self::InvalidId { .. } => "BAD_REQUEST",
             Self::QueueNotInitialized => "INTERNAL_SERVER_ERROR",
             Self::QueueSubmitFailed { .. } => "INTERNAL_SERVER_ERROR",
+            Self::InvalidRuntime { .. } => "BAD_REQUEST",
+            Self::MissingRuntime => "BAD_REQUEST",
         }
     }
 
@@ -51,6 +60,8 @@ impl WorkerServiceError {
             Self::InvalidId { .. } => StatusCode::BAD_REQUEST,
             Self::QueueNotInitialized => StatusCode::INTERNAL_SERVER_ERROR,
             Self::QueueSubmitFailed { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::InvalidRuntime { .. } => StatusCode::BAD_REQUEST,
+            Self::MissingRuntime => StatusCode::BAD_REQUEST,
         }
     }
 }
@@ -68,6 +79,13 @@ impl std::fmt::Display for WorkerServiceError {
             }
             Self::QueueNotInitialized => write!(f, "Job queue not initialized"),
             Self::QueueSubmitFailed { message } => write!(f, "{}", message),
+            Self::InvalidRuntime { runtime, message } => {
+                write!(f, "Invalid worker runtime '{}': {}", runtime, message)
+            }
+            Self::MissingRuntime => write!(
+                f,
+                "Missing required worker runtime; expected lowercase sglang, vllm, or external"
+            ),
         }
     }
 }
@@ -226,6 +244,18 @@ impl WorkerService {
         &self,
         mut config: WorkerConfigRequest,
     ) -> Result<CreateWorkerResult, WorkerServiceError> {
+        let runtime = config
+            .runtime
+            .as_deref()
+            .ok_or(WorkerServiceError::MissingRuntime)?;
+        let runtime_type = runtime.parse::<RuntimeType>().map_err(|message| {
+            WorkerServiceError::InvalidRuntime {
+                runtime: runtime.to_string(),
+                message,
+            }
+        })?;
+        config.runtime = Some(runtime_type.to_string());
+
         if self.router_config.api_key.is_some() && config.api_key.is_none() {
             warn!(
                 "Adding worker {} without API key while router has API key configured. \
@@ -362,5 +392,27 @@ impl WorkerService {
             .map_err(|e| WorkerServiceError::QueueSubmitFailed { message: e })?;
 
         Ok(UpdateWorkerResult { worker_id, url })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_type_parsing_requires_known_lowercase_values() {
+        assert_eq!("vllm".parse::<RuntimeType>().unwrap(), RuntimeType::Vllm);
+        assert_eq!(
+            "sglang".parse::<RuntimeType>().unwrap(),
+            RuntimeType::Sglang
+        );
+        assert_eq!(
+            "external".parse::<RuntimeType>().unwrap(),
+            RuntimeType::External
+        );
+        assert!("VLLM".parse::<RuntimeType>().is_err());
+        assert!("SGLANG".parse::<RuntimeType>().is_err());
+        assert!("EXTERNAL".parse::<RuntimeType>().is_err());
+        assert!("vlllm".parse::<RuntimeType>().is_err());
     }
 }

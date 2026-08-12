@@ -1,6 +1,7 @@
 pub mod app_context;
 pub use smg_auth as auth;
 pub mod config;
+pub mod control_plane;
 pub mod core;
 pub mod middleware;
 pub mod observability;

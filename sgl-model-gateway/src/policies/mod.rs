@@ -89,6 +89,14 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         // Default: no-op for stateless policies
     }
 
+    /// Release a sticky routing key, when the policy maintains such state.
+    ///
+    /// This is intentionally a no-op for policies without a routing map so
+    /// internal lifecycle cleanup can be idempotent across policy instances.
+    fn release_routing_key(&self, _routing_key: &str) -> bool {
+        false
+    }
+
     /// Get as Any for downcasting
     fn as_any(&self) -> &dyn std::any::Any;
 }

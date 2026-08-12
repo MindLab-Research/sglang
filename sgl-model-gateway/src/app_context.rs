@@ -13,6 +13,7 @@ use tracing::debug;
 
 use crate::{
     config::RouterConfig,
+    control_plane::ControlPlaneState,
     core::{steps::WorkflowEngines, JobQueue, LoadMonitor, WorkerRegistry, WorkerService},
     middleware::TokenBucket,
     observability::inflight_tracker::InFlightRequestTracker,
@@ -59,6 +60,7 @@ pub struct AppContext {
     pub wasm_manager: Option<Arc<WasmModuleManager>>,
     pub worker_service: Arc<WorkerService>,
     pub inflight_tracker: Arc<InFlightRequestTracker>,
+    pub control_plane: Arc<ControlPlaneState>,
 }
 
 impl std::fmt::Debug for AppContext {
@@ -281,6 +283,7 @@ impl AppContextBuilder {
             wasm_manager: self.wasm_manager,
             worker_service,
             inflight_tracker: InFlightRequestTracker::new(),
+            control_plane: ControlPlaneState::new(),
         })
     }
 

@@ -18,6 +18,9 @@ pub struct RouterConfig {
     pub mode: RoutingMode,
     #[serde(default)]
     pub connection_mode: ConnectionMode,
+    /// Runtime hint applied to workers initialized from static URLs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_runtime: Option<String>,
     pub policy: PolicyConfig,
     pub host: String,
     pub port: u16,
@@ -239,13 +242,15 @@ impl RoutingMode {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ManualAssignmentMode {
-    /// Random selection (default)
-    #[default]
+    /// Random selection
     Random,
     /// Select worker with minimum running requests
     MinLoad,
     /// Select worker with minimum active routing keys
     MinGroup,
+    /// Select minimum in-flight load, then minimum active routing groups
+    #[default]
+    MinLoadThenGroup,
 }
 
 /// Policy configuration for routing
@@ -283,7 +288,7 @@ pub enum PolicyConfig {
     /// Manual routing policy with sticky sessions using DashMap.
     /// - X-SMG-Routing-Key: Routes to a cached worker or assigns a new one
     /// - Provides true sticky sessions with zero key redistribution on worker add
-    /// - Falls back to random selection if no routing key is provided
+    /// - Uses MinLoad selection if no routing key is provided
     /// - Supports LRU eviction when cache size exceeds max_entries
     #[serde(rename = "manual")]
     Manual {
@@ -293,7 +298,7 @@ pub enum PolicyConfig {
         /// Maximum idle time before eviction (seconds, default: 14400 = 4 hours)
         #[serde(default = "default_manual_max_idle_secs")]
         max_idle_secs: u64,
-        /// Assignment mode for new routing keys (default: random)
+        /// Assignment mode for new routing keys (default: min_load_then_group)
         #[serde(default)]
         assignment_mode: ManualAssignmentMode,
     },
@@ -508,7 +513,7 @@ impl Default for RouterConfig {
             },
             policy: PolicyConfig::Random,
             host: "0.0.0.0".to_string(),
-            port: 3001,
+            port: 30001,
             max_payload_size: 536_870_912,     // 512MB
             request_timeout_secs: 1800,        // 30 minutes
             worker_startup_timeout_secs: 1800, // 30 minutes for large model loading
@@ -537,6 +542,7 @@ impl Default for RouterConfig {
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             connection_mode: ConnectionMode::Http,
+            worker_runtime: None,
             model_path: None,
             tokenizer_path: None,
             chat_template: None,
@@ -636,7 +642,7 @@ mod tests {
         );
         assert!(matches!(config.policy, PolicyConfig::Random));
         assert_eq!(config.host, "0.0.0.0");
-        assert_eq!(config.port, 3001);
+        assert_eq!(config.port, 30001);
         assert_eq!(config.max_payload_size, 536_870_912);
         assert_eq!(config.request_timeout_secs, 1800);
         assert_eq!(config.worker_startup_timeout_secs, 1800);
@@ -678,7 +684,7 @@ mod tests {
 
         assert!(matches!(config.policy, PolicyConfig::RoundRobin));
         assert_eq!(config.host, "0.0.0.0");
-        assert_eq!(config.port, 3001);
+        assert_eq!(config.port, 30001);
     }
 
     #[test]
@@ -1381,5 +1387,39 @@ mod tests {
             PolicyConfig::RoundRobin => {}
             _ => panic!("Expected RoundRobin for regular mode"),
         }
+    }
+
+    #[test]
+    fn test_static_worker_runtime_round_trip() {
+        let config = RouterConfig::builder()
+            .worker_runtime(Some("vllm".to_string()))
+            .build_unchecked();
+
+        assert_eq!(config.worker_runtime.as_deref(), Some("vllm"));
+        let round_trip = serde_json::to_value(&config).unwrap();
+        assert_eq!(round_trip["worker_runtime"], "vllm");
+    }
+
+    #[test]
+    fn test_static_worker_runtime_validation() {
+        let lowercase = RouterConfig::builder()
+            .worker_runtime(Some("external".to_string()))
+            .build_unchecked();
+        assert!(lowercase.validate().is_ok());
+
+        let uppercase = RouterConfig::builder()
+            .worker_runtime(Some("VLLM".to_string()))
+            .build_unchecked();
+        assert!(uppercase.validate().is_err());
+
+        let uppercase_external = RouterConfig::builder()
+            .worker_runtime(Some("EXTERNAL".to_string()))
+            .build_unchecked();
+        assert!(uppercase_external.validate().is_err());
+
+        let invalid = RouterConfig::builder()
+            .worker_runtime(Some("vlllm".to_string()))
+            .build_unchecked();
+        assert!(invalid.validate().is_err());
     }
 }

@@ -91,6 +91,12 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// Set the runtime hint for workers loaded from static URLs.
+    pub fn worker_runtime(mut self, runtime: Option<String>) -> Self {
+        self.config.worker_runtime = runtime;
+        self
+    }
+
     // ==================== Policy ====================
 
     pub fn policy(mut self, policy: PolicyConfig) -> Self {

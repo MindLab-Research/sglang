@@ -127,6 +127,10 @@ redis = { version = "0.27.6", features = ["tokio-comp", "json", "connection-mana
 # wasm dependencies
 sha2 = "0.10"
 wasmtime = { version = "38.0", features = ["component-model", "async"] }
+http-body-util = "0.1"
+tar = "0.4.46"
+flate2 = "1.1.9"
+zstd = "0.13.3"
 
 [build-dependencies]
 chrono = { version = "0.4", features = ["clock"] }

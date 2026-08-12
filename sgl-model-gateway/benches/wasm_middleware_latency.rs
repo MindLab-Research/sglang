@@ -65,6 +65,7 @@ fn bench_wasm_middleware_buffering(c: &mut Criterion) {
     let config = RouterConfig::builder().enable_wasm(true).build_unchecked();
 
     let context = rt.block_on(AppContext::from_config(config, 30)).unwrap();
+    let control_plane = context.control_plane.clone();
     let app_state = Arc::new(AppState {
         router: Arc::new(MockRouter),
         context: Arc::new(context),
@@ -72,6 +73,7 @@ fn bench_wasm_middleware_buffering(c: &mut Criterion) {
         router_manager: None,
         mesh_handler: None,
         mesh_sync_manager: None,
+        control_plane,
     });
 
     c.bench_function("wasm_middleware_pre_fix_latency", |b| {

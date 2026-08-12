@@ -1,4 +1,5 @@
 use super::*;
+use crate::core::RuntimeType;
 
 /// Configuration validator
 pub(crate) struct ConfigValidator;
@@ -8,6 +9,16 @@ impl ConfigValidator {
         Self::validate_mode(&config.mode)?;
         Self::validate_policy(&config.policy)?;
         Self::validate_server_settings(config)?;
+
+        if let Some(runtime) = &config.worker_runtime {
+            runtime
+                .parse::<RuntimeType>()
+                .map_err(|reason| ConfigError::InvalidValue {
+                    field: "worker_runtime".to_string(),
+                    value: runtime.clone(),
+                    reason,
+                })?;
+        }
 
         if let Some(discovery) = &config.discovery {
             Self::validate_discovery(discovery, &config.mode)?;

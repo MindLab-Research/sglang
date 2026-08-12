@@ -39,36 +39,6 @@ static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .expect("Failed to create worker HTTP client")
 });
 
-pub(crate) fn parse_bootstrap_host_from_url(url: &str) -> String {
-    let metadata_url = match url.rsplit_once('@') {
-        Some((base_url, rank)) if rank.parse::<usize>().is_ok() => base_url,
-        _ => url,
-    };
-
-    match url::Url::parse(metadata_url) {
-        Ok(parsed) => parsed.host_str().unwrap_or("localhost").to_string(),
-        Err(_) if !metadata_url.contains("://") => {
-            match url::Url::parse(&format!("http://{}", metadata_url)) {
-                Ok(parsed) => parsed.host_str().unwrap_or("localhost").to_string(),
-                Err(_) => {
-                    tracing::warn!(
-                        "Failed to parse URL '{}', defaulting to localhost",
-                        metadata_url
-                    );
-                    "localhost".to_string()
-                }
-            }
-        }
-        Err(_) => {
-            tracing::warn!(
-                "Failed to parse URL '{}', defaulting to localhost",
-                metadata_url
-            );
-            "localhost".to_string()
-        }
-    }
-}
-
 pub struct WorkerRoutingKeyLoad {
     url: String,
     active_routing_keys: dashmap::DashMap<String, usize>,
@@ -497,15 +467,14 @@ impl std::str::FromStr for RuntimeType {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        // Use eq_ignore_ascii_case to avoid to_lowercase() allocation
-        if s.eq_ignore_ascii_case("sglang") {
-            Ok(RuntimeType::Sglang)
-        } else if s.eq_ignore_ascii_case("vllm") {
-            Ok(RuntimeType::Vllm)
-        } else if s.eq_ignore_ascii_case("external") {
-            Ok(RuntimeType::External)
-        } else {
-            Err(format!("Unknown runtime type: {}", s))
+        match s {
+            "sglang" => Ok(RuntimeType::Sglang),
+            "vllm" => Ok(RuntimeType::Vllm),
+            "external" => Ok(RuntimeType::External),
+            _ => Err(format!(
+                "Unknown runtime type: {}. Expected lowercase sglang, vllm, or external",
+                s
+            )),
         }
     }
 }
@@ -993,8 +962,6 @@ pub struct DPAwareWorker {
     dp_size: usize,
     /// Base URL without DP suffix
     base_url: String,
-    /// Bootstrap host parsed from the real base URL, not the virtual DP URL.
-    bootstrap_host: String,
 }
 
 impl DPAwareWorker {
@@ -1006,13 +973,11 @@ impl DPAwareWorker {
         dp_rank: usize,
         dp_size: usize,
     ) -> Self {
-        let bootstrap_host = parse_bootstrap_host_from_url(&base_url);
         Self {
             base_worker,
             dp_rank,
             dp_size,
             base_url,
-            bootstrap_host,
         }
     }
 }
@@ -1033,10 +998,6 @@ impl Worker for DPAwareWorker {
 
     fn connection_mode(&self) -> &ConnectionMode {
         self.base_worker.connection_mode()
-    }
-
-    fn bootstrap_host(&self) -> &str {
-        &self.bootstrap_host
     }
 
     fn is_healthy(&self) -> bool {
@@ -1275,10 +1236,7 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
         _ => None,
     };
 
-    let runtime_type = match connection_mode {
-        ConnectionMode::Grpc { .. } => Some(worker.metadata().runtime_type.to_string()),
-        ConnectionMode::Http => None,
-    };
+    let runtime_type = Some(worker.metadata().runtime_type.to_string());
 
     WorkerInfo {
         id: url.to_string(),
@@ -1311,22 +1269,6 @@ mod tests {
         circuit_breaker::{CircuitBreakerConfig, CircuitState},
         DPAwareWorkerBuilder,
     };
-
-    #[test]
-    fn test_parse_bootstrap_host_strips_dp_rank_suffix() {
-        assert_eq!(
-            parse_bootstrap_host_from_url("http://10.66.5.115:20664@3"),
-            "10.66.5.115"
-        );
-        assert_eq!(
-            parse_bootstrap_host_from_url("grpc://cluster.local@1"),
-            "cluster.local"
-        );
-        assert_eq!(
-            parse_bootstrap_host_from_url("localhost:8080@2"),
-            "localhost"
-        );
-    }
 
     #[test]
     fn test_worker_type_display() {
@@ -1419,6 +1361,21 @@ mod tests {
         assert!(worker.is_healthy());
         assert_eq!(worker.load(), 0);
         assert_eq!(worker.processed_requests(), 0);
+    }
+
+    #[test]
+    fn test_http_worker_info_exposes_runtime_type() {
+        use crate::core::BasicWorkerBuilder;
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://test:8080")
+                .worker_type(WorkerType::Regular)
+                .runtime_type(RuntimeType::Vllm)
+                .build(),
+        );
+
+        let info = worker_to_info(&worker);
+        assert_eq!(info.connection_mode, "HTTP");
+        assert_eq!(info.runtime_type.as_deref(), Some("vllm"));
     }
 
     #[test]
@@ -1733,7 +1690,6 @@ mod tests {
 
         assert_eq!(dp_worker.url(), "http://worker1:8080@2");
         assert_eq!(dp_worker.base_url(), "http://worker1:8080");
-        assert_eq!(dp_worker.bootstrap_host(), "worker1");
         assert!(dp_worker.is_dp_aware());
         assert_eq!(dp_worker.dp_rank(), Some(2));
         assert_eq!(dp_worker.dp_size(), Some(4));
@@ -1749,8 +1705,6 @@ mod tests {
             .build();
 
         assert_eq!(dp_worker.url(), "http://worker1:8080@1");
-        assert_eq!(dp_worker.bootstrap_host(), "worker1");
-        assert_eq!(dp_worker.bootstrap_port(), Some(9090));
         assert!(dp_worker.is_dp_aware());
         assert_eq!(
             dp_worker.worker_type(),
@@ -1769,23 +1723,6 @@ mod tests {
         assert_eq!(dp_worker.url(), "http://worker1:8080@0");
         assert!(dp_worker.is_dp_aware());
         assert_eq!(dp_worker.worker_type(), &WorkerType::Decode);
-    }
-
-    #[test]
-    fn test_dp_aware_worker_bootstrap_host_uses_base_url() {
-        let dp_worker = DPAwareWorkerBuilder::new("http://10.66.5.240:21686", 1, 4)
-            .worker_type(WorkerType::Prefill {
-                bootstrap_port: None,
-            })
-            .build();
-
-        assert_eq!(dp_worker.url(), "http://10.66.5.240:21686@1");
-        assert_eq!(
-            dp_worker.endpoint_url("/generate"),
-            "http://10.66.5.240:21686/generate"
-        );
-        assert_eq!(dp_worker.bootstrap_host(), "10.66.5.240");
-        assert_eq!(dp_worker.bootstrap_port(), None);
     }
 
     #[tokio::test]

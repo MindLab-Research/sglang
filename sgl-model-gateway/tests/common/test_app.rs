@@ -84,6 +84,7 @@ pub fn create_test_app(
     );
 
     // Create AppState with the test router and context
+    let control_plane = app_context.control_plane.clone();
     let app_state = Arc::new(AppState {
         router,
         context: app_context,
@@ -91,6 +92,7 @@ pub fn create_test_app(
         router_manager: None,
         mesh_handler: None,
         mesh_sync_manager: None,
+        control_plane,
     });
 
     // Configure request ID headers (use defaults if not specified)
@@ -133,6 +135,7 @@ pub fn create_test_app_with_context(
         router_manager: None,
         mesh_handler: None,
         mesh_sync_manager: None,
+        control_plane: app_context.control_plane.clone(),
     });
 
     // Get config from the context

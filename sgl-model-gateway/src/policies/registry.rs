@@ -254,6 +254,35 @@ impl PolicyRegistry {
             .unwrap_or_else(|| self.get_default_policy())
     }
 
+    /// Release a routing key from every registered policy instance.
+    ///
+    /// Model-specific policies can coexist with the default policy, so cleanup
+    /// intentionally walks all unique instances. This keeps the internal
+    /// lifecycle endpoint independent of the model used by the last hop.
+    pub fn release_routing_key(&self, routing_key: &str) -> bool {
+        let mut policies: Vec<Arc<dyn LoadBalancingPolicy>> =
+            vec![Arc::clone(&self.default_policy)];
+        if let Some(policy) = self.prefill_policy.get() {
+            if !policies.iter().any(|p| Arc::ptr_eq(p, policy)) {
+                policies.push(Arc::clone(policy));
+            }
+        }
+        if let Some(policy) = self.decode_policy.get() {
+            if !policies.iter().any(|p| Arc::ptr_eq(p, policy)) {
+                policies.push(Arc::clone(policy));
+            }
+        }
+        for entry in self.model_policies.iter() {
+            let policy = entry.value();
+            if !policies.iter().any(|p| Arc::ptr_eq(p, policy)) {
+                policies.push(Arc::clone(policy));
+            }
+        }
+        policies.into_iter().fold(false, |released, policy| {
+            policy.release_routing_key(routing_key) || released
+        })
+    }
+
     /// Get all PowerOfTwo policies that need load updates (lock-free)
     pub fn get_all_power_of_two_policies(&self) -> Vec<Arc<dyn LoadBalancingPolicy>> {
         let mut power_of_two_policies = Vec::new();

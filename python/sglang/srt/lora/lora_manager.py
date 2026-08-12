@@ -54,6 +54,125 @@ _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 logger = logging.getLogger(__name__)
 
 
+def _find_adapter_dir(target: str) -> str:
+    """Locate the directory that contains adapter_config.json. The checkpoint
+    tarball may nest the LoRA under e.g. `adapter/` (full checkpoint layout),
+    so return the innermost dir that looks like a LoRA adapter."""
+    import os
+
+    if os.path.exists(os.path.join(target, "adapter_config.json")):
+        return target
+    try:
+        for d in sorted(os.listdir(target)):
+            sub = os.path.join(target, d)
+            if os.path.isdir(sub) and os.path.exists(
+                os.path.join(sub, "adapter_config.json")
+            ):
+                return sub
+    except OSError:
+        pass
+    return target
+
+
+def resolve_lora_local_path(name: str, path: str) -> str:
+    """Download + extract a remote LoRA archive to a local directory on THIS
+    node when `path` is an http(s):// URL; otherwise return the path as-is.
+
+    Each PD node (prefill / decode) downloads its own copy locally — the
+    router never intermediates the download, there is no ssh dependency, and
+    nodes download in parallel at local bandwidth.
+
+    Only ONE TP rank downloads (mkdir lock); the other ranks wait for the
+    marker file — avoids 8x duplicate downloads of a multi-GB checkpoint.
+    """
+    if not (path.startswith("http://") or path.startswith("https://")):
+        return path
+
+    import os
+    import shutil
+    import subprocess
+    import tarfile
+    import time
+    from urllib.parse import urlparse
+
+    cache_root = os.environ.get("SGLANG_LORA_CACHE_DIR", "/root/glm52_local/loras")
+    target = os.path.join(cache_root, name)
+    # Done marker is a .done file we write after extraction — the checkpoint
+    # tarball may not contain adapter_config.json, so we must not key on it.
+    marker = os.path.join(target, ".done")
+    if os.path.exists(marker):
+        logger.info("lora %s already cached at %s", name, target)
+        adapter_dir = _find_adapter_dir(target)
+        if adapter_dir != target:
+            logger.info("lora %s adapter dir: %s", name, adapter_dir)
+        return adapter_dir
+
+    # Extension detection must use the URL *path* (strip query params).
+    url_path = urlparse(path).path
+    is_zst = url_path.endswith(".tar.zst") or url_path.endswith(".tzst")
+    suffix = ".tar.zst" if is_zst else ".tar.gz"
+
+    lock_dir = target + ".lock"
+    deadline = time.time() + 3600
+    while not os.path.exists(marker):
+        if time.time() > deadline:
+            raise RuntimeError(f"timed out waiting for lora {name} to download")
+        try:
+            os.mkdir(lock_dir)
+        except FileExistsError:
+            # another TP rank is downloading; wait for the marker
+            time.sleep(1)
+            continue
+        try:
+            archive = os.path.join(cache_root, f"{name}{suffix}")
+            logger.info("downloading lora %s from %s", name, path)
+            _stream_download(path, archive)
+            logger.info("extracting lora %s -> %s", name, target)
+            if os.path.isdir(target):
+                shutil.rmtree(target, ignore_errors=True)
+            os.makedirs(target, exist_ok=True)
+            if is_zst:
+                subprocess.run(["tar", "--zstd", "-xf", archive, "-C", target], check=True)
+            else:
+                with tarfile.open(archive, "r:gz") as tf:
+                    tf.extractall(target)
+            os.remove(archive)
+
+            # Hoist a single nested top-level directory if present.
+            entries = [os.path.join(target, e) for e in os.listdir(target)]
+            if len(entries) == 1 and os.path.isdir(entries[0]):
+                nested = entries[0]
+                for e in os.listdir(nested):
+                    shutil.move(os.path.join(nested, e), os.path.join(target, e))
+                os.rmdir(nested)
+            # Write the done marker (extraction succeeded).
+            with open(marker, "w") as f:
+                f.write("ok")
+        finally:
+            try:
+                os.rmdir(lock_dir)
+            except OSError:
+                pass
+    logger.info("lora %s ready at %s", name, target)
+    adapter_dir = _find_adapter_dir(target)
+    if adapter_dir != target:
+        logger.info("lora %s adapter dir: %s", name, adapter_dir)
+    return adapter_dir
+
+
+def _stream_download(url: str, dest: str) -> None:
+    """Download a file reliably. `requests` streaming can stall on some
+    B300 nodes; curl is verified stable (~5MB/s) so use it via subprocess.
+    """
+    import subprocess
+
+    subprocess.run(
+        ["curl", "-sfL", "--retry", "3", "--retry-delay", "2", "-o", dest, url],
+        check=True,
+        timeout=3600,
+    )
+
+
 class LoRAManager:
     def __init__(
         self,
@@ -178,9 +297,13 @@ class LoRAManager:
         ), f"LoRA adapter with ID {lora_ref.lora_id} is already loaded. This should have been verified before request is sent to the backend."
 
         try:
+            # Resolve a remote URL to a local directory downloaded on THIS node
+            # (each PD node downloads its own copy — no intermediate hop, no
+            # ssh dependency; local-bandwidth, parallel across nodes).
+            local_path = resolve_lora_local_path(lora_ref.lora_name, lora_ref.lora_path)
             # load configs
             new_adapter = LoRAConfig(
-                lora_ref.lora_path,
+                local_path,
                 base_vocab_size=self.base_hf_config.vocab_size,
             )
             self.validate_new_adapter(new_adapter, lora_ref)

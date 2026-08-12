@@ -79,6 +79,15 @@ impl std::fmt::Display for Backend {
     }
 }
 
+impl Backend {
+    fn static_worker_runtime(&self) -> Option<String> {
+        match self {
+            Backend::Sglang | Backend::Vllm => Some(self.to_string()),
+            Backend::Trtllm | Backend::Openai | Backend::Anthropic => None,
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "sglang-router", alias = "smg", alias = "amg")]
 #[command(about = "SGLang Model Gateway - High-performance inference gateway")]
@@ -138,7 +147,7 @@ struct CliArgs {
     host: String,
 
     /// Port number to bind the router server
-    #[arg(long, default_value_t = 30000, help_heading = "Worker Configuration")]
+    #[arg(long, default_value_t = 30001, help_heading = "Worker Configuration")]
     port: u16,
 
     /// List of worker URLs (supports IPv4 and IPv6)
@@ -175,7 +184,7 @@ struct CliArgs {
     max_idle_secs: u64,
 
     /// Assignment mode for manual policy when encountering a new routing key
-    #[arg(long, default_value = "random", value_parser = ["random", "min_load", "min_group"], help_heading = "Routing Policy")]
+    #[arg(long, default_value = "min_load_then_group", value_parser = ["random", "min_load", "min_group", "min_load_then_group"], help_heading = "Routing Policy")]
     assignment_mode: String,
 
     /// Number of prefix tokens to use for prefix_hash policy
@@ -781,6 +790,7 @@ impl CliArgs {
                     "random" => ManualAssignmentMode::Random,
                     "min_load" => ManualAssignmentMode::MinLoad,
                     "min_group" => ManualAssignmentMode::MinGroup,
+                    "min_load_then_group" => ManualAssignmentMode::MinLoadThenGroup,
                     other => panic!("Unknown assignment mode: {}", other),
                 },
             },
@@ -1002,6 +1012,7 @@ impl CliArgs {
 
         let builder = RouterConfig::builder()
             .mode(mode)
+            .worker_runtime(self.backend.static_worker_runtime())
             .policy(policy)
             .connection_mode(connection_mode)
             .host(&self.host)
@@ -1249,14 +1260,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Mode: {}", mode_str);
 
     match cli_args.backend {
-        Backend::Vllm | Backend::Trtllm | Backend::Anthropic => {
+        Backend::Trtllm | Backend::Anthropic => {
             println!(
                 "WARNING: runtime '{}' not implemented yet; falling back to regular routing. \
 Provide --worker-urls or PD flags as usual.",
                 cli_args.backend
             );
         }
-        Backend::Sglang | Backend::Openai => {}
+        Backend::Sglang | Backend::Vllm | Backend::Openai => {}
     }
 
     if !cli_args.enable_igw {
