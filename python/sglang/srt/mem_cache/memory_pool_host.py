@@ -7,41 +7,20 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.hicache_storage import PoolName
+    from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 
 import numpy as np
 import psutil
 import torch
 
 from sglang.jit_kernel.hicache import (
-    can_use_hicache_jit_kernel,
     can_use_write_back_jit_kernel,
-)
-from sglang.jit_kernel.hicache import (
-    transfer_hicache_all_layer as jit_transfer_hicache_all_layer,
-)
-from sglang.jit_kernel.hicache import (
-    transfer_hicache_all_layer_mla as jit_transfer_hicache_all_layer_mla,
 )
 from sglang.jit_kernel.hicache import (
     transfer_hicache_all_layer_mla_staged_lf_pf as jit_transfer_hicache_all_layer_mla_staged_lf_pf,
 )
-from sglang.jit_kernel.hicache import (
-    transfer_hicache_all_layer_staged_lf_pf as jit_transfer_hicache_all_layer_staged_lf_pf,
-)
-from sglang.jit_kernel.hicache import (
-    transfer_hicache_one_layer as jit_transfer_hicache_one_layer,
-)
-from sglang.jit_kernel.hicache import (
-    transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
-)
 from sglang.jit_kernel.hisparse import transfer_cache_dsv4_mla
-from sglang.srt.mem_cache.memory_pool import (
-    DSATokenToKVPool,
-    MambaPool,
-    MHATokenToKOnlyPool,
-    MHATokenToKVPool,
-    MLATokenToKVPool,
-)
+from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, MambaPool
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
@@ -51,28 +30,28 @@ _is_xpu = is_xpu()
 _is_mps = is_mps()
 if _is_cuda or _is_hip:
     from sgl_kernel.kvcacheio import (
-        transfer_kv_all_layer,
         transfer_kv_all_layer_direct_lf_pf,
-        transfer_kv_all_layer_lf_pf,
-        transfer_kv_all_layer_lf_ph,
         transfer_kv_all_layer_mla,
         transfer_kv_all_layer_mla_lf_pf,
         transfer_kv_direct,
-        transfer_kv_per_layer,
         transfer_kv_per_layer_direct_pf_lf,
         transfer_kv_per_layer_mla,
         transfer_kv_per_layer_mla_pf_lf,
-        transfer_kv_per_layer_pf_lf,
-        transfer_kv_per_layer_ph_lf,
+    )
+if _is_cuda:
+    from sglang.jit_kernel.transfer_mamba import (
+        transfer_kv_mamba_lf_pf,
+        transfer_kv_mamba_pf_lf,
     )
 if _is_npu:
-    from sgl_kernel_npu.kvcacheio import TransferDirection, transfer_kv_dim_exchange
+    pass
 
 logger = logging.getLogger(__name__)
 
 
 from sglang.srt.mem_cache.pool_host import HostKVCache
 from sglang.srt.mem_cache.pool_host.base import (
+    _WRITE_BACK_STAGING_PAGE_CHUNK,
     HICACHE_HOST_MEMORY_RESERVE_BYTES,
     sync_fixed_hicache_size,
     synchronized,
@@ -1702,7 +1681,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         base_aligned = self.kv_buffer.data_ptr() % page_size_bytes == 0
         return base_aligned and stride % page_size_bytes == 0
 
-
 class MambaPoolHost(HostKVCache):
 
     def __init__(
@@ -1718,14 +1696,10 @@ class MambaPoolHost(HostKVCache):
         self.device_pool = device_pool
         self.page_size = 1
 
-        # TODO: Mamba pool is currently incompatible with write-back staging
-        # kernel; only allow 'page_first_direct' + 'direct' for now.
-        # Relax this restriction once the staging bug is fixed.
-        if layout != "page_first_direct":
-            raise ValueError(
-                f"MambaPoolHost only supports layout='page_first_direct', "
-                f"got '{layout}'."
-            )
+        assert layout in [
+            "page_first",
+            "page_first_direct",
+        ], f"Unsupported layout: {layout}"
 
         self.layout = layout
         self.pin_memory = pin_memory
@@ -1804,7 +1778,20 @@ class MambaPoolHost(HostKVCache):
         self.clear()
 
     def init_kv_buffer(self):
-        alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+        _host_alloc = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+
+        def alloc_func(dims, *, dtype, device, pin_memory, allocator):
+            # conv-only linear attention has no ssm state: mmap can't map the
+            # 0-element temporal buffer, so hand back a plain empty tensor.
+            if np.prod(dims) == 0:
+                return torch.empty(dims, dtype=dtype, device=device)
+            return _host_alloc(
+                dims,
+                dtype=dtype,
+                device=device,
+                pin_memory=pin_memory,
+                allocator=allocator,
+            )
 
         if self.layout in ["page_first", "page_first_direct"]:
             # page-first: (page_num, num_layers, 1, *shape) — per-page data is contiguous
@@ -1861,50 +1848,13 @@ class MambaPoolHost(HostKVCache):
     def _init_write_back_staging_buffers(self):
         self.temporal_staging_buffer = None
         self.conv_staging_buffers = [None] * len(self.conv_buffer)
-        self.can_use_write_back_jit = False
+        # Must be True: HostPoolGroup computes can_use_write_back_jit as AND of
+        # all pools. When True, start_writing() keeps indices on CPU, which MLA's
+        # staged write-back kernel requires. MambaPoolHost's own backup path does
+        # not check this flag — it routes by layout + io_backend instead.
+        self.can_use_write_back_jit = True
         self._temporal_can_use_jit = False
         self._conv_can_use_jit = [False] * len(self.conv_buffer)
-        if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
-            return
-
-        self._temporal_can_use_jit = _is_cuda and can_use_write_back_jit_kernel(
-            element_size=self._item_size_per_index(self.temporal_buffer[0]),
-        )
-        self._conv_can_use_jit = [
-            _is_cuda
-            and can_use_write_back_jit_kernel(
-                element_size=self._item_size_per_index(buf[0]),
-            )
-            for buf in self.conv_buffer
-        ]
-        self.can_use_write_back_jit = self._temporal_can_use_jit and all(
-            self._conv_can_use_jit
-        )
-        self.staging_page_capacity = min(self.page_num, _WRITE_BACK_STAGING_PAGE_CHUNK)
-        self.staging_token_capacity = self.staging_page_capacity * self.page_size
-        self.temporal_staging_buffer = torch.empty(
-            (
-                self.staging_token_capacity,
-                self.num_mamba_layers,
-                1,
-                *self.temporal_state_shape,
-            ),
-            dtype=self.temporal_dtype,
-            device=self.device_pool.device,
-        )
-        self.conv_staging_buffers = [
-            torch.empty(
-                (
-                    self.staging_token_capacity,
-                    self.num_mamba_layers,
-                    1,
-                    *conv_shape,
-                ),
-                dtype=self.conv_dtype,
-                device=self.device_pool.device,
-            )
-            for conv_shape in self.conv_state_shapes
-        ]
 
     def get_hybrid_pool_buffer(self):
         # Expose all mamba host tensors that need Mooncake buffer registration.
@@ -1930,9 +1880,11 @@ class MambaPoolHost(HostKVCache):
             (self.size,), dtype=torch.uint8, device=self.device
         )
         self.free_slots = torch.arange(self.size, dtype=torch.int64)
+        self.release_slots = []
+        self.num_release_slots = 0
 
     def available_size(self):
-        return len(self.free_slots)
+        return len(self.free_slots) + self.num_release_slots
 
     @synchronized
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
@@ -1941,13 +1893,22 @@ class MambaPoolHost(HostKVCache):
         ), "The requested size should be a multiple of the page size."
         if need_size > self.available_size():
             return None
+
+        if need_size > len(self.free_slots):
+            self._merge_release_slots()
+
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
         return select_index
 
     @synchronized
     def free(self, indices: torch.Tensor) -> int:
-        self.free_slots = torch.cat([self.free_slots, indices])
+        indices_cpu = indices.cpu()
+        if indices_cpu.numel() == 0:
+            return 0
+
+        self.release_slots.append(indices_cpu)
+        self.num_release_slots += len(indices_cpu)
         return len(indices)
 
     def get_size_per_token(self):
@@ -2013,7 +1974,12 @@ class MambaPoolHost(HostKVCache):
             return
         if io_backend == "kernel":
             item_size = MambaPoolHost._item_size_per_index(dst)
-            transfer_kv_per_layer_mla_pf_lf(
+            # Mamba JIT kernel expects all index tensors on CUDA.
+            # host_indices may be on CPU (kept there by start_writing when
+            # can_use_write_back_jit is True on the HostPoolGroup).
+            if src_indices.device.type != "cuda":
+                src_indices = src_indices.to(dst_indices.device, non_blocking=True)
+            transfer_kv_mamba_pf_lf(
                 src=src,
                 dst=dst,
                 src_indices=src_indices,
@@ -2050,26 +2016,21 @@ class MambaPoolHost(HostKVCache):
             return
         if io_backend == "kernel":
             item_size = MambaPoolHost._item_size_per_index(src_layers[0])
-            if can_use_jit:
-                jit_transfer_hicache_all_layer_mla_staged_lf_pf(
-                    ptr_src=src_ptrs,
-                    src_indices=src_indices,
-                    dst_indices=dst_indices,
-                    staging=staging,
-                    dst=dst,
-                    page_size=1,
-                    element_size=item_size,
-                )
-            else:
-                transfer_kv_all_layer_mla_lf_pf(
-                    src_layers=src_ptrs,
-                    dst=dst,
-                    src_indices=src_indices,
-                    dst_indices=dst_indices,
-                    item_size=item_size,
-                    dst_layout_dim=item_size * num_layers,
-                    num_layers=num_layers,
-                )
+            # Mamba JIT kernel expects all index tensors on CUDA.
+            # When can_use_write_back_jit is True on the HostPoolGroup,
+            # start_writing() keeps host_indices on CPU (for MLA staged kernel).
+            # Move dst_indices to CUDA here to satisfy the kernel's requirement.
+            if dst_indices.device.type != "cuda":
+                dst_indices = dst_indices.to(src_indices.device, non_blocking=True)
+            transfer_kv_mamba_lf_pf(
+                src_ptrs=src_ptrs,
+                dst=dst,
+                src_indices=src_indices,
+                dst_indices=dst_indices,
+                item_size=item_size,
+                dst_layout_dim=item_size * num_layers,
+                num_layers=num_layers,
+            )
         elif io_backend == "direct":
             src_ptrs = [src_layers[i] for i in range(num_layers)]
             transfer_kv_all_layer_direct_lf_pf(
@@ -2090,21 +2051,18 @@ class MambaPoolHost(HostKVCache):
         layer_id,
         io_backend="kernel",
     ):
-        if io_backend != "direct":
-            raise ValueError(
-                f"MambaPoolHost only supports io_backend='direct', "
-                f"got '{io_backend}'."
-            )
         if self.layout in ["page_first", "page_first_direct"]:
-            self._copy_tensor_pf_lf(
-                src=self.temporal_buffer,
-                dst=device_pool.mamba_cache.temporal[layer_id],
-                src_indices=host_indices,
-                dst_indices=device_indices,
-                layer_id=layer_id,
-                num_layers=self.num_mamba_layers,
-                io_backend=io_backend,
-            )
+            # no ssm state on conv-only models: nothing to transfer
+            if self.temporal_state_elem_size > 0:
+                self._copy_tensor_pf_lf(
+                    src=self.temporal_buffer,
+                    dst=device_pool.mamba_cache.temporal[layer_id],
+                    src_indices=host_indices,
+                    dst_indices=device_indices,
+                    layer_id=layer_id,
+                    num_layers=self.num_mamba_layers,
+                    io_backend=io_backend,
+                )
             for conv_idx in range(len(self.conv_state_shapes)):
                 self._copy_tensor_pf_lf(
                     src=self.conv_buffer[conv_idx],
@@ -2135,23 +2093,20 @@ class MambaPoolHost(HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend="kernel"
     ):
-        if io_backend != "direct":
-            raise ValueError(
-                f"MambaPoolHost only supports io_backend='direct', "
-                f"got '{io_backend}'."
-            )
         if self.layout in ["page_first", "page_first_direct"]:
-            self._copy_tensor_all_layers_lf_pf(
-                src_layers=device_pool.mamba_cache.temporal,
-                dst=self.temporal_buffer,
-                src_indices=device_indices,
-                dst_indices=host_indices,
-                num_layers=self.num_mamba_layers,
-                io_backend=io_backend,
-                staging=self.temporal_staging_buffer,
-                can_use_jit=self._temporal_can_use_jit,
-                src_ptrs=self.temporal_device_ptrs,
-            )
+            # no ssm state on conv-only models: a 0-size batched memcpy errors
+            if self.temporal_state_elem_size > 0:
+                self._copy_tensor_all_layers_lf_pf(
+                    src_layers=device_pool.mamba_cache.temporal,
+                    dst=self.temporal_buffer,
+                    src_indices=device_indices,
+                    dst_indices=host_indices,
+                    num_layers=self.num_mamba_layers,
+                    io_backend=io_backend,
+                    staging=self.temporal_staging_buffer,
+                    can_use_jit=self._temporal_can_use_jit,
+                    src_ptrs=self.temporal_device_ptrs,
+                )
             for conv_idx in range(len(self.conv_state_shapes)):
                 self._copy_tensor_all_layers_lf_pf(
                     src_layers=device_pool.mamba_cache.conv[conv_idx],
@@ -2249,17 +2204,20 @@ class MambaPoolHost(HostKVCache):
         ]
 
         for i in range(0, len(indices), self.page_size):
-            # Emit component pointers in stable order:
-            # temporal first, then conv_0..conv_n for this page.
-            temporal_ptr = (
-                temporal_base_ptr
-                + indices[i]
-                * self.num_mamba_layers
-                * self.temporal_state_elem_size
-                * self.temporal_dtype.itemsize
-            )
-            ptr_list.append(temporal_ptr)
-            element_size_list.append(temporal_element_size)
+            # Emit component pointers in stable order: temporal first (dropped
+            # for conv-only models with no ssm state), then conv_0..conv_n.
+            # _get_hybrid_page_component_keys drops the temporal key under the
+            # same condition, keeping keys and buffers aligned.
+            if self.temporal_state_elem_size > 0:
+                temporal_ptr = (
+                    temporal_base_ptr
+                    + indices[i]
+                    * self.num_mamba_layers
+                    * self.temporal_state_elem_size
+                    * self.temporal_dtype.itemsize
+                )
+                ptr_list.append(temporal_ptr)
+                element_size_list.append(temporal_element_size)
             for j in range(len(self.conv_buffer)):
                 conv_ptr = (
                     conv_base_ptrs[j]
@@ -2271,6 +2229,26 @@ class MambaPoolHost(HostKVCache):
                 ptr_list.append(conv_ptr)
                 element_size_list.append(conv_element_sizes[j])
         return ptr_list, element_size_list
+
+    def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
+        if self.layout not in ["page_first", "page_first_direct"]:
+            return False
+        temporal_stride = (
+            self.num_mamba_layers
+            * self.temporal_state_elem_size
+            * self.temporal_dtype.itemsize
+        )
+        if self.temporal_buffer.data_ptr() % page_size_bytes != 0:
+            return False
+        if temporal_stride % page_size_bytes != 0:
+            return False
+        for buf, elem_size in zip(self.conv_buffer, self.conv_state_elem_sizes):
+            conv_stride = self.num_mamba_layers * elem_size * self.conv_dtype.itemsize
+            if buf.data_ptr() % page_size_bytes != 0:
+                return False
+            if conv_stride % page_size_bytes != 0:
+                return False
+        return True
 
 
 # ---- V4 Compressed KV Host Pools ----
@@ -2521,9 +2499,11 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
 
     def clear(self):
         self.free_slots = torch.arange(self.size, dtype=torch.int64)
+        self.release_slots = []
+        self.num_release_slots = 0
 
     def available_size(self):
-        return len(self.free_slots)
+        return len(self.free_slots) + self.num_release_slots
 
     @synchronized
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
@@ -2532,15 +2512,22 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         ) * self.slot_page_size
         if need_size > self.available_size():
             return None
+
+        if need_size > len(self.free_slots):
+            self._merge_release_slots()
+
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
         return select_index
 
     @synchronized
     def free(self, indices: torch.Tensor) -> int:
-        self.free_slots = torch.cat(
-            [self.free_slots, indices.to(dtype=torch.int64, device="cpu").flatten()]
-        )
+        indices_cpu = indices.cpu()
+        if indices_cpu.numel() == 0:
+            return 0
+
+        self.release_slots.append(indices_cpu)
+        self.num_release_slots += len(indices_cpu)
         return len(indices)
 
     def backup_from_device_all_layer(
@@ -2734,6 +2721,15 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 ptr_list.append(self.kv_buffer[int(row)].data_ptr())
             return ptr_list, [page_bytes] * len(ptr_list)
         raise ValueError(f"Unsupported layout: {self.layout}")
+
+    def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
+        if self.layout not in ["page_first", "page_first_direct"]:
+            return False
+        page_bytes = self.layer_num * self.item_bytes * self.dtype.itemsize
+        return (
+            self.kv_buffer.data_ptr() % page_size_bytes == 0
+            and page_bytes % page_size_bytes == 0
+        )
 
 
 class DeepSeekV4StateHostPool(HostKVCache):
@@ -3104,6 +3100,15 @@ class DeepSeekV4StateHostPool(HostKVCache):
             return ptr_list, [page_bytes] * len(ptr_list)
         raise ValueError(f"Unsupported layout: {self.layout}")
 
+    def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
+        if self.layout not in ["page_first", "page_first_direct"]:
+            return False
+        page_bytes = self.layer_num * self.state_page_bytes * self.dtype.itemsize
+        return (
+            self.kv_buffer.data_ptr() % page_size_bytes == 0
+            and page_bytes % page_size_bytes == 0
+        )
+
 
 @dataclass
 class PoolEntry:
@@ -3178,6 +3183,9 @@ class HostPoolGroup:
 
     def get_page_buffer_meta(self, indices):
         return self.anchor_entry.host_pool.get_page_buffer_meta(indices)
+
+    def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
+        return self.anchor_entry.host_pool.is_stride_page_aligned(page_size_bytes)
 
     def clear(self) -> None:
         for entry in self.entries:
@@ -3289,7 +3297,7 @@ class DSAIndexerPoolHost(HostKVCache):
         self.dtype = device_pool.store_dtype
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
-        self.layer_num = device_pool.layer_num
+        self.layer_num = self._effective_host_layer_num()
 
         self.index_head_dim = device_pool.index_head_dim
         self.indexer_quant_block_size = device_pool.quant_block_size
@@ -3422,6 +3430,10 @@ class DSAIndexerPoolHost(HostKVCache):
     def load_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
     ):
+        if not self._is_device_layer_owned(device_pool, layer_id):
+            return
+        host_layer = self._host_layer_index(layer_id)
+
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
             host_indices, device_indices
         )
@@ -3429,7 +3441,7 @@ class DSAIndexerPoolHost(HostKVCache):
         if use_kernel:
             if self.layout == "layer_first":
                 transfer_kv_per_layer_mla(
-                    src=self.index_k_with_scale_buffer[layer_id],
+                    src=self.index_k_with_scale_buffer[host_layer],
                     dst=device_pool.index_k_with_scale_buffer[layer_id],
                     src_indices=host_page_indices,
                     dst_indices=device_page_indices,
@@ -3450,7 +3462,7 @@ class DSAIndexerPoolHost(HostKVCache):
         elif io_backend == "direct":
             if self.layout == "layer_first":
                 transfer_kv_direct(
-                    src_layers=[self.index_k_with_scale_buffer[layer_id]],
+                    src_layers=[self.index_k_with_scale_buffer[host_layer]],
                     dst_layers=[device_pool.index_k_with_scale_buffer[layer_id]],
                     src_indices=host_page_indices,
                     dst_indices=device_page_indices,
@@ -3462,7 +3474,7 @@ class DSAIndexerPoolHost(HostKVCache):
                     dst_ptrs=[device_pool.index_k_with_scale_buffer[layer_id]],
                     src_indices=host_page_indices,
                     dst_indices=device_page_indices,
-                    layer_id=layer_id,
+                    layer_id=host_layer,
                     page_size=1,
                 )
             else:
@@ -3470,9 +3482,57 @@ class DSAIndexerPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
+    def _backup_from_device_per_layer(
+        self, device_pool, host_indices, device_indices, layer_id, io_backend
+    ):
+        host_layer = self._host_layer_index(layer_id)
+        host_page_indices, device_page_indices = self._get_indexer_page_indices(
+            host_indices, device_indices
+        )
+        use_kernel = io_backend == "kernel" and self.indexer_page_stride_size % 8 == 0
+        if use_kernel:
+            if self.layout == "layer_first":
+                transfer_kv_per_layer_mla(
+                    src=device_pool.index_k_with_scale_buffer[layer_id],
+                    dst=self.index_k_with_scale_buffer[host_layer],
+                    src_indices=device_page_indices,
+                    dst_indices=host_page_indices,
+                    item_size=self.indexer_page_stride_size,
+                )
+            elif self.layout == "page_first":
+                raise ValueError(
+                    "Layer-sharded DSA indexer HiCache backup with page_first "
+                    "layout is not supported without a per-layer LF->PF kernel."
+                )
+            else:
+                raise ValueError(f"Unsupported layout: {self.layout}")
+        elif io_backend == "direct":
+            if self.layout == "layer_first":
+                transfer_kv_direct(
+                    src_layers=[device_pool.index_k_with_scale_buffer[layer_id]],
+                    dst_layers=[self.index_k_with_scale_buffer[host_layer]],
+                    src_indices=device_page_indices,
+                    dst_indices=host_page_indices,
+                    page_size=1,
+                )
+            else:
+                raise ValueError(
+                    "Layer-sharded direct DSA indexer backup only supports "
+                    f"layer_first layout, got {self.layout}"
+                )
+        else:
+            raise ValueError(f"Unsupported IO backend: {io_backend}")
+
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        if self._is_device_layer_sharded(device_pool):
+            for layer_id in self._owned_device_layer_ids(device_pool):
+                self._backup_from_device_per_layer(
+                    device_pool, host_indices, device_indices, layer_id, io_backend
+                )
+            return
+
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
             host_indices, device_indices
         )
@@ -3587,3 +3647,14 @@ class DSAIndexerPoolHost(HostKVCache):
             page_index = int(indices[i]) // self.page_size
             ptr_list.append(base_ptr + page_index * page_stride_bytes)
         return ptr_list, [page_stride_bytes] * len(ptr_list)
+
+    def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
+        if self.layout not in ["page_first", "page_first_direct"]:
+            return False
+        page_stride_bytes = (
+            self.layer_num * self.indexer_page_stride_size * self.indexer_dtype.itemsize
+        )
+        return (
+            self.index_k_with_scale_buffer.data_ptr() % page_size_bytes == 0
+            and page_stride_bytes % page_size_bytes == 0
+        )

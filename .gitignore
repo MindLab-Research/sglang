@@ -287,3 +287,6 @@ artifacts/
 # Triton autotune config JSON (causes EAGLE degradation, pip-installed)
 python/sglang/srt/**/configs/
 python/sglang/srt/**/csgmv_configs/
+
+# Internal, non-published docs
+internal-docs/

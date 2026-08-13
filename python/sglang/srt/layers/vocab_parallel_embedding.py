@@ -9,6 +9,9 @@ from typing import List, Optional, Sequence, Tuple
 import torch
 from torch.nn.parameter import Parameter, UninitializedParameter
 
+from sglang.kernels.ops.embeddings.vocab_parallel_embedding import (
+    vocab_parallel_embedding as fused_vocab_parallel_embedding,
+)
 from sglang.srt.distributed import (
     divide,
     get_tp_group,
@@ -32,7 +35,7 @@ from sglang.srt.layers.quantization.base_config import (
     method_has_implemented_embedding,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
-from sglang.srt.layers.triton_ops.vocab_parallel_embedding import (
+from sglang.kernels.ops.activation.vocab_parallel_embedding import (
     vocab_parallel_embedding as fused_vocab_parallel_embedding,
 )
 from sglang.srt.runtime_context import get_parallel
@@ -503,6 +506,8 @@ class VocabParallelEmbedding(torch.nn.Module):
 
     def _use_triton_embedding(self, input_: torch.Tensor) -> bool:
         """Whether the fused Triton kernel can replace the mask+gather+fill unit."""
+        if _is_npu:
+            return False
         if self.tp_size == 1:
             return False
         if not envs.SGLANG_OPT_USE_TRITON_VOCAB_PARALLEL_EMBEDDING.get():
@@ -611,6 +616,7 @@ class ParallelLMHead(VocabParallelEmbedding):
         padding_size: int = DEFAULT_VOCAB_PADDING_SIZE,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        enable_tp: bool = True,
         use_attn_tp_group: bool = False,
         use_presharded_weights: bool = False,
     ):
@@ -622,6 +628,7 @@ class ParallelLMHead(VocabParallelEmbedding):
             padding_size=padding_size,
             quant_config=quant_config,
             prefix=prefix,
+            enable_tp=enable_tp,
             use_attn_tp_group=use_attn_tp_group,
             use_presharded_weights=use_presharded_weights,
         )
