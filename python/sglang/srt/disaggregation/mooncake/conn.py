@@ -961,6 +961,13 @@ class MooncakeKVManager(CommonKVManager):
     ) -> Tuple[bool, bool]:
         skip_kv = False
         skip_state = False
+        logger.info(
+            f"[SKIP-FLAGS] hybrid_mla={self.is_hybrid_mla_backend}"
+            f" attn_tp={self.attn_tp_size} dst_attn_tp={info.dst_attn_tp_size if info else None}"
+            f" attn_cp={self.attn_cp_size} cp_rank={self.attn_cp_rank}"
+            f" dsa_layer_split={getattr(self.server_args, 'enable_dsa_cache_layer_split', None)}"
+            f" dcp_size={self.kv_args.dcp_size if hasattr(self.kv_args, 'dcp_size') else '?'}"
+        )
         if not self.is_hybrid_mla_backend:
             return skip_kv, skip_state
 
@@ -1090,11 +1097,21 @@ class MooncakeKVManager(CommonKVManager):
                 _dcp_size = getattr(req, "dcp_size", 1)
                 _dcp_rank = getattr(req, "dcp_rank", 0)
                 if _dcp_size > 1 and st != StateType.C128_STATE:
-                    _n = len(src_indices)
-                    _dst_arr = np.asarray(dst_indices_local, dtype=np.int32)
-                    _mask = (_dst_arr % _dcp_size) == _dcp_rank
-                    src_indices = [src_indices[i] for i in range(_n) if _mask[i]]
-                    dst_indices_local = [dst_indices_local[i] // _dcp_size for i in range(_n) if _mask[i]]
+                    # DSV4 decode keeps FULL pools per DCP rank (req_to_token is
+                    # full-length; main KV + compressed KV must BROADCAST).
+                    _dsv4_bcast = self._is_dsv4_kv_transfer()
+                    if not _dsv4_bcast:
+                        _n = len(src_indices)
+                        _dst_arr = np.asarray(dst_indices_local, dtype=np.int32)
+                        _mask = (_dst_arr % _dcp_size) == _dcp_rank
+                        src_indices = [src_indices[i] for i in range(_n) if _mask[i]]
+                        dst_indices_local = [dst_indices_local[i] // _dcp_size for i in range(_n) if _mask[i]]
+                    else:
+                        logger.info(
+                            f"[STATE-BCAST] st={st} dcp_rank={_dcp_rank} dcp_size={_dcp_size}"
+                            f" n={len(src_indices)} src[0:3]={src_indices[:3]}"
+                            f" dst[0:3]={dst_indices_local[:3] if len(dst_indices_local)>0 else []}"
+                        )
                 if (
                     st == StateType.C128_STATE
                     and len(src_indices) == 0
@@ -1167,6 +1184,27 @@ class MooncakeKVManager(CommonKVManager):
                     or rc
                 )
         return rc
+
+    def _is_dsv4_kv_transfer(self) -> bool:
+        """DSV4 decode keeps FULL pools per DCP rank (req_to_token is full-length;
+        fill_len is NOT divided by dcp_size). So all KV transfers (compressed
+        c4/c128 via transfer_worker, main SWA/DSA via maybe_send_extra) must
+        BROADCAST. Plain-MLA (GLM) stores 1/dcp and keeps DCP sharding.
+        """
+        try:
+            from sglang.srt.configs.model_config import is_deepseek_v4
+
+            mcfg = getattr(self.server_args, "model_config", None)
+            if mcfg is None:
+                logger.info("[DSV4-CHECK] server_args.model_config is None -> False")
+                return False
+            hf = getattr(mcfg, "hf_config", None)
+            ret = bool(is_deepseek_v4(hf))
+            logger.info(f"[DSV4-CHECK] is_deepseek_v4(hf={type(hf).__name__}) -> {ret}")
+            return ret
+        except Exception as e:
+            logger.info(f"[DSV4-CHECK] exception {type(e).__name__}: {e} -> False")
+            return False
 
     def _send_mamba_state(
         self,
@@ -1391,30 +1429,32 @@ class MooncakeKVManager(CommonKVManager):
                         _dcp_size = getattr(req, "dcp_size", 1)
                         _dcp_rank = getattr(req, "dcp_rank", 0)
                         if _dcp_size > 1:
-                            # DCP reshard: filter by decode-side page VALUE parity.
-                            # DCP rank owns page_idx % dcp_size == rank. Using the
-                            # value (not array position) is correct because:
-                            #   - chunk index_slice is PREPILL-local (CP interleave
-                            #     gives each rank 1/8 tokens -> 1 page), so slicing
-                            #     req.dst_kv_indices by it misaligns vs decode pages
-                            #   - decode allocator page indices are globally
-                            #     sequential (0,1,2,...), so value % dcp_size
-                            #     correctly alternates rank0/rank1
-                            _n = len(_transfer_indices)
-                            _mask = (_dst_indices % _dcp_size) == _dcp_rank
-                            _orig_len = _n
-                            _transfer_indices = _transfer_indices[_mask]
-                            _dst_indices = (_dst_indices[_mask] // _dcp_size).astype(np.int32)
-                            logger.info(
-                                f"[DCP-XFER] room={kv_chunk.room} dcp_rank={_dcp_rank}"
-                                f" dcp_size={_dcp_size} cp_rank={self.attn_cp_rank}"
-                                f" pages: {_orig_len}→{len(_transfer_indices)}"
-                                f" | all_src={_transfer_indices[:5].tolist() if _orig_len>0 else []}"
-                                f" all_dst={chunked_dst_kv_indice[:5].tolist()}"
-                                f" src[0:3]={_transfer_indices[:3].tolist()}"
-                                f" dst[0:3]={_dst_indices[:3].tolist()}"
-                                f" max_dst={int(_dst_indices.max()) if len(_dst_indices)>0 else -1}"
-                            )
+                            # DSV4 decode keeps FULL pools per DCP rank, so the
+                            # compressed (c4/c128) KV transfer must BROADCAST.
+                            # GLM (plain MLA main K/V) keeps DCP sharding below.
+                            _dsv4_bcast = self._is_dsv4_kv_transfer()
+                            if not _dsv4_bcast:
+                                _n = len(_transfer_indices)
+                                _mask = (_dst_indices % _dcp_size) == _dcp_rank
+                                _orig_len = _n
+                                _transfer_indices = _transfer_indices[_mask]
+                                _dst_indices = (_dst_indices[_mask] // _dcp_size).astype(np.int32)
+                                logger.info(
+                                    f"[DCP-XFER] room={kv_chunk.room} dcp_rank={_dcp_rank}"
+                                    f" dcp_size={_dcp_size} cp_rank={self.attn_cp_rank}"
+                                    f" pages: {_orig_len}→{len(_transfer_indices)}"
+                                    f" src[0:3]={_transfer_indices[:3].tolist() if _orig_len>0 else []}"
+                                    f" dst[0:3]={_dst_indices[:3].tolist()}"
+                                    f" max_dst={int(_dst_indices.max()) if len(_dst_indices)>0 else -1}"
+                                )
+                            else:
+                                logger.info(
+                                    f"[DCP-XFER-BROADCAST] room={kv_chunk.room} dcp_rank={_dcp_rank}"
+                                    f" dcp_size={_dcp_size} dsv4_kv_broadcast"
+                                    f" pages: {len(_transfer_indices)}"
+                                    f" src[0:3]={_transfer_indices[:3].tolist() if len(_transfer_indices)>0 else []}"
+                                    f" dst[0:3]={_dst_indices[:3].tolist() if len(_dst_indices)>0 else []}"
+                                )
 
                         if len(chunked_dst_kv_indice) < len(_transfer_indices):
                             logger.warning(
