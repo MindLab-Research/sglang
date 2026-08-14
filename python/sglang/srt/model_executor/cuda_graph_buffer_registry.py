@@ -421,6 +421,7 @@ class CudaGraphBufferRegistry:
         # Phase 2: collect (dst, src) pairs and dispatch a grouped copy.
         gpu_dsts: List[torch.Tensor] = []
         gpu_srcs: List[torch.Tensor] = []
+        gpu_names: List[str] = []
         cpu_dsts: List[torch.Tensor] = []
         cpu_srcs: List[torch.Tensor] = []
         for slot in self._slots.values():
@@ -457,8 +458,34 @@ class CudaGraphBufferRegistry:
             else:
                 gpu_dsts.append(dst)
                 gpu_srcs.append(src)
+                gpu_names.append(slot.name)
         if gpu_dsts:
-            _grouped_foreach_copy_(gpu_dsts, gpu_srcs)
+            try:
+                _grouped_foreach_copy_(gpu_dsts, gpu_srcs)
+            except RuntimeError:
+                # Diagnostic: identify which slot's shape mismatches under
+                # concurrent batches (PD DSPARK bring-up). Use print/stderr —
+                # logger may be torn down during scheduler crash.
+                for _n, _d, _s in zip(gpu_names, gpu_dsts, gpu_srcs):
+                    if tuple(_d.shape) != tuple(_s.shape):
+                        print(
+                            f"[FILL-MISMATCH] slot={_n} dst={tuple(_d.shape)} "
+                            f"src={tuple(_s.shape)} raw_bs={raw_bs} "
+                            f"padded_bs={padded_bs}",
+                            flush=True,
+                        )
+                _sl = getattr(forward_batch, "seq_lens", None)
+                _ii = getattr(forward_batch, "input_ids", None)
+                _rp = getattr(forward_batch, "req_pool_indices", None)
+                print(
+                    f"[FILL-FB] fb.bs={forward_batch.batch_size} "
+                    f"fb.seq_lens={tuple(_sl.shape) if _sl is not None else None} "
+                    f"fb.input_ids={tuple(_ii.shape) if _ii is not None else None} "
+                    f"fb.req_pool={tuple(_rp.shape) if _rp is not None else None} "
+                    f"fb.mode={forward_batch.forward_mode}",
+                    flush=True,
+                )
+                raise
         for dst, src in zip(cpu_dsts, cpu_srcs):
             dst.copy_(src)
 

@@ -58,6 +58,9 @@ from sglang.srt.disaggregation.prefill import (
     SchedulerDisaggregationPrefillMixin,
     maybe_release_metadata_buffer,
 )
+from sglang.srt.disaggregation.scheduler_disaggregation_init import (
+    SchedulerDisaggregationInitMixin,
+)
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     MetadataBuffers,
@@ -307,6 +310,7 @@ class Scheduler(
     SchedulerPPMixin,
     SchedulerDllmMixin,
     SchedulerMlxOverlapMixin,
+    SchedulerDisaggregationInitMixin,
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
 

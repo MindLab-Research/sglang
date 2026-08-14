@@ -3017,7 +3017,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
         self.is_prefill_only = self.is_prefill_only and other.is_prefill_only
 
-        if self.spec_info:
+        if self.spec_info and other.spec_info:
             self.spec_info.merge_batch(other.spec_info)
 
     def copy(self):

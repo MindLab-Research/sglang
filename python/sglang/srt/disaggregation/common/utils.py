@@ -3,7 +3,7 @@ import dataclasses
 import struct
 import threading
 from collections import deque
-from typing import List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -28,6 +28,88 @@ class TransferKVChunk:
     trace_ctx: Union[TraceReqContext, TraceNullContext] = dataclasses.field(
         default_factory=TraceNullContext
     )
+    # PD hidden state transfer fields
+    kv_sent: bool = False
+    pd_hidden_packet_idx: int = 0
+    pd_hidden_sent: bool = False
+    pd_hidden_ready_sent: bool = False
+    pd_hidden_ack_ready: bool = False
+    pd_hidden_ack_expected_count: int = 0
+    pd_hidden_ack_timed_out: bool = False
+    pd_hidden_start: Optional[int] = None
+    pd_hidden_row_len: int = 0
+    pd_hidden_is_last_chunk: bool = False
+    pd_hidden_release_indices: Optional[List[int]] = None
+    enqueue_time: float = 0.0
+    source_event: Optional[Any] = None
+
+
+@dataclasses.dataclass
+class PDHiddenChunk:
+    """Transport-neutral PD hidden chunk descriptor."""
+
+    room: int
+    prefill_rank: int
+    hidden_start: int
+    row_len: int
+    is_last_hidden_chunk: bool
+    dst_indices: List[int]
+    ack_host: Optional[str] = None
+    ack_port: Optional[int] = None
+
+
+@dataclasses.dataclass
+class PDHiddenRequestState:
+    """Decode-side request state for hidden transfer, separate from KV status."""
+
+    enabled: bool = False
+    streaming: bool = False
+    start: int = 0
+    next_start: int = 0
+    end: int = 0
+    hidden_done: bool = True
+    kv_done: bool = False
+
+    @classmethod
+    def disabled(cls) -> "PDHiddenRequestState":
+        return cls()
+
+    @classmethod
+    def full(cls, start: int, end: int) -> "PDHiddenRequestState":
+        return cls(
+            enabled=True,
+            streaming=False,
+            start=int(start),
+            next_start=int(start),
+            end=int(end),
+            hidden_done=True,
+        )
+
+    @classmethod
+    def streaming_state(cls, start: int, end: int) -> "PDHiddenRequestState":
+        return cls(
+            enabled=True,
+            streaming=True,
+            start=int(start),
+            next_start=int(start),
+            end=int(end),
+            hidden_done=False,
+        )
+
+    def reset(self) -> None:
+        self.enabled = False
+        self.streaming = False
+        self.start = 0
+        self.next_start = 0
+        self.end = 0
+        self.hidden_done = True
+        self.kv_done = False
+
+    def mark_kv_done(self) -> None:
+        self.kv_done = True
+
+    def mark_hidden_done(self) -> None:
+        self.hidden_done = True
 
 
 def pack_list_of_buffers(buffers: List[bytes]) -> bytes:

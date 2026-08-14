@@ -295,6 +295,18 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     def init_cuda_graphs(self):
         capture_decode_cuda_graph = not self.server_args.disable_cuda_graph
+        # PD disaggregation: draft CUDA graph buffers are captured at fixed bs
+        # but concurrent requests produce variable batch sizes (bs=1 graph vs
+        # bs=3 batch → _foreach_copy_ shape mismatch crash). Disable draft CUDA
+        # graph in PD mode; the draft model is small so eager mode is cheap.
+        if getattr(self.server_args, 'disaggregation_mode', None) is not None:
+            pd_mode = str(self.server_args.disaggregation_mode)
+            if pd_mode in ('decode', 'prefill'):
+                capture_decode_cuda_graph = False
+                logger.info(
+                    "Disable DSpark draft CUDA graph in PD disaggregation mode "
+                    "(variable batch sizes require eager mode)."
+                )
         if is_cuda() and capture_decode_cuda_graph:
             available_mem = get_available_gpu_memory(self.device, self.gpu_id)
             if available_mem < 1.0:
@@ -450,6 +462,29 @@ class DSparkWorkerV2(BaseSpecWorker):
             return None
         return dp_global_verify_tier_num_tokens(
             global_tier_num_tokens=batch.global_spec_verify_tier_num_tokens
+        )
+
+    def inject_pd_hidden_chunk(
+        self,
+        req,
+        hidden: torch.Tensor,
+        hidden_start: int,
+    ) -> Optional[torch.cuda.Event]:
+        if hidden is None or hidden.numel() == 0:
+            return None
+        row_len = int(hidden.shape[0])
+        pos = torch.arange(
+            int(hidden_start),
+            int(hidden_start) + row_len,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        req_pool_idx = int(req.req_pool_idx)
+        cache_loc = self.model_runner.req_to_token_pool.req_to_token[req_pool_idx, pos]
+        return self._kv_injector.inject_target_hidden(
+            target_hidden=hidden,
+            cache_loc=cache_loc,
+            positions=pos,
         )
 
     def _decode_idle_result(
