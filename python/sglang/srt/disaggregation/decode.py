@@ -41,6 +41,7 @@ import torch
 from torch.distributed import ProcessGroup
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
+from sglang.srt.configs.model_config import is_deepseek_v4
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
@@ -1158,9 +1159,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 ]
 
             def _swa_payload():
+                # SWA pool is physical page_size (token_to_kv_pool.page_size);
+                # allocator.page_size is the VIRTUAL page (page_size * dcp_size)
+                # under DCP -> using it here misaligns every SWA item. dcp=1 makes
+                # them equal (256), which is why this only breaks under dcp>1.
+                _full_page_size = self.token_to_kv_pool.page_size
                 window_size = self.scheduler.sliding_window_size
                 window_start = max(0, seq_len - window_size)
-                window_start = page_align_floor(window_start, page_size)
+                window_start = page_align_floor(window_start, _full_page_size)
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[
                     decode_req.req.req_pool_idx, window_start:seq_len
                 ]
@@ -1169,7 +1175,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         window_kv_indices_full
                     )
                 )
-                return kv_to_page_indices(window_kv_indices_swa, page_size)
+                return kv_to_page_indices(
+                    window_kv_indices_swa, _full_page_size
+                )
 
             def _dsa_payload():
                 kv_indices_full = self.req_to_token_pool.req_to_token[
@@ -1231,7 +1239,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
             assert decode_req.metadata_buffer_index is not None
             # int32 for ZMQ serialization -- from_zmq reads np.int32.
-            page_indices = kv_to_page_indices(kv_indices, kv_transfer_page_size).astype(
+            # page_indices drives ONLY the compressed-KV transfer (transfer_worker
+            # -> send_kvcache -> kv_args.kv_data_ptrs = c4/c4_indexer/c128 pools).
+            # Those pools are item-aligned to the GLOBAL page_size (256 tokens ->
+            # c4 rows), NOT kv_transfer_page_size (64 under DCP). Using the 64-token
+            # page index here misaligns every compressed item -> garbled decode.
+            # DSV4 only: GLM ships its main K/V through kv_data and must keep the
+            # 64-token (DCP) page index.
+            _pi_page_size = kv_transfer_page_size
+            if dcp_enabled() and is_deepseek_v4(
+                self.scheduler.model_config.hf_config
+            ):
+                _pi_page_size = self.token_to_kv_pool_allocator.page_size
+            page_indices = kv_to_page_indices(kv_indices, _pi_page_size).astype(
                 np.int32
             )
             if dcp_enabled():
