@@ -910,6 +910,8 @@ def setup_state_kv_args(
     kv_args.state_dim_per_tensor = []
     kv_args.is_hybrid_mla_backend = False
     kv_args.state_conv_shard_groups = []
+    import logging as _lg
+    _lg.getLogger(__name__).info("[STATE-REG-BEGIN] entering setup_state_kv_args")
 
     if isinstance(token_to_kv_pool, MiniMaxSparseKVPool):
         if token_to_kv_pool.index_kv_pool is not None:
@@ -980,6 +982,7 @@ def setup_state_kv_args(
                 dim,
                 conv_shard_groups,
             )
+
         elif isinstance(token_to_kv_pool, (DSATokenToKVPool, NPUMLATokenToKVPool)):
             if draft_token_to_kv_pool is not None and isinstance(
                 draft_token_to_kv_pool, DSATokenToKVPool
@@ -1104,6 +1107,11 @@ def setup_state_kv_args(
                 dim,
                 conv_shard_groups,
             )
+
+    import logging as _lg2
+    _lg2.getLogger(__name__).info(
+        f"[STATE-REG-END] registered n={len(kv_args.state_types)} types={[t.name for t in kv_args.state_types]}"
+    )
 
 
 def prepare_abort(req: Req, error_message: str, status_code=None):

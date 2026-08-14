@@ -448,6 +448,13 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
                 req.req_pool_idx, req.cache_protected_len : kv_len_to_handle
             ]
             self.token_to_kv_pool_allocator.free(kv_indices)
+            # The paged allocator frees whole pages. Any overallocated tail
+            # (speculative/draft tokens beyond kv_len_to_handle) lives in the
+            # same trailing page and is already released by the page-level free
+            # above. Mark it committed so release_kv_cache skips the duplicate
+            # overallocated free (which would double-free that page).
+            if req.kv is not None:
+                req.kv.kv_allocated_len = kv_len_to_handle
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]

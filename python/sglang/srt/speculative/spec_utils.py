@@ -833,6 +833,16 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
     """eagle/ngram share a stateless free function; dflash keeps stateful
     prep on its draft input -- the dispatcher routes.
     """
+    if batch.spec_algorithm.is_dspark():
+        # DSpark's draft head is embedded in the target model forward, but the
+        # decode step still needs the same per-step verify-window KV allocation
+        # as EAGLE (anchor + draft slots written into req_to_token). Without it,
+        # assign_extend_cache_locs reads pad slot 0 for the draft positions and
+        # the draft states are garbage (repeated garbled tokens after step 1).
+        from sglang.srt.speculative.eagle_utils import eagle_prepare_for_decode
+
+        eagle_prepare_for_decode(batch)
+        return
     if batch.spec_algorithm.is_dflash_family():
         batch.spec_info.prepare_for_decode(batch)
     else:

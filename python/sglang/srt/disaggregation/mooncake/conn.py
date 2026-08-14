@@ -1084,9 +1084,12 @@ class MooncakeKVManager(CommonKVManager):
 
                 # DCP: filter state indices by decode-side page VALUE parity.
                 # Must match the KV DCP filter exactly (rank owns page_idx % dcp).
+                # NOTE: C128_STATE ships the FULL compressed pool (decode does not
+                # reshard c4/c128 components -- _inplace_shard_dcp only shards the
+                # SWA/DSA pools), so it must broadcast (skip the DCP filter).
                 _dcp_size = getattr(req, "dcp_size", 1)
                 _dcp_rank = getattr(req, "dcp_rank", 0)
-                if _dcp_size > 1:
+                if _dcp_size > 1 and st != StateType.C128_STATE:
                     _n = len(src_indices)
                     _dst_arr = np.asarray(dst_indices_local, dtype=np.int32)
                     _mask = (_dst_arr % _dcp_size) == _dcp_rank

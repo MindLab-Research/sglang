@@ -133,7 +133,15 @@ def register_fake_if_exists(op_name):
         namespace, bare_op = op_name.split("::")
         ops_namespace = getattr(torch.ops, namespace, None)
         if ops_namespace and hasattr(ops_namespace, bare_op):
-            torch.library.register_fake(op_name, func)
+            # Idempotent: skip if a fake impl is already registered (can happen
+            # when sgl_kernel ships its own register_fake for the same op).
+            try:
+                torch.library.register_fake(op_name, func)
+            except RuntimeError as e:
+                if "already has an fake impl" in str(e):
+                    pass
+                else:
+                    raise
         return func
 
     return decorator

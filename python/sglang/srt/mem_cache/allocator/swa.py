@@ -319,12 +319,27 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if free_index.numel() == 0:
             return
 
-        # NOTE: the API is not idempotent.
+        # NOTE: the API is not idempotent. DSPARK draft/verify reuses KV slots
+        # across steps and req_to_token rows can alias the same physical page,
+        # so dedupe before freeing to avoid double-free (available_size > size).
+        if free_index.numel() > 1:
+            free_index = torch.unique(free_index)
         if self.is_not_in_free_group:
             self.full_attn_allocator.free(free_index)
             self.free_swa(free_index)
         else:
             self.free_group.append(free_index)
+        _avail = self.full_attn_allocator.available_size()
+        _size = self.full_attn_allocator.size
+        if _avail > _size:
+            _uniq = free_index.unique().numel()
+            print(
+                f"[SWA-FREE-OVER] n={free_index.numel()} uniq={_uniq}"
+                f" idx[:8]={free_index[:8].tolist()}"
+                f" avail={_avail} size={_size} over={_avail - _size}"
+                f" in_group={not self.is_not_in_free_group}",
+                flush=True,
+            )
         assert (
             self.full_attn_allocator.available_size() <= self.full_attn_allocator.size
         )

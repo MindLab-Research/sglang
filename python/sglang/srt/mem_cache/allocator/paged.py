@@ -264,6 +264,15 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         if self.is_not_in_free_group:
             free_page_indices = torch.unique(free_index // self.page_size)
+            # Page/slot 0 is reserved for padding (dummy outputs). DSPARK
+            # draft/verify KV reuse can alias it (or the pad row), and freeing
+            # it makes available_size exceed the pool size (double-free assert).
+            # Drop invalid pages (0 or beyond the pool) before re-freeing.
+            free_page_indices = free_page_indices[
+                (free_page_indices >= 1) & (free_page_indices <= self.num_pages)
+            ]
+            if free_page_indices.numel() == 0:
+                return
             if self.need_sort:
                 self.release_pages = torch.cat((free_page_indices, self.release_pages))
             else:

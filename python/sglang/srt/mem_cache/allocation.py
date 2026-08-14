@@ -575,8 +575,31 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     else:
         locs = seq_lens_gpu.clone()
 
-    batch.req_to_token_pool.write(
-        (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
+    if token_per_req > 1:
+        # Spec (DSpark) verify window: write ALL token_per_req slots
+        # (anchor + draft positions) into req_to_token so
+        # assign_extend_cache_locs reads real KV slots for every verify
+        # position instead of pad slot 0 (garbage draft states).
+        tpr = torch.arange(token_per_req, device=locs.device)
+        locs = locs.unsqueeze(1) + tpr  # [bs, tpr]
+        batch.req_to_token_pool.write(
+            (
+                batch.req_pool_indices.unsqueeze(1).expand(-1, token_per_req),
+                locs,
+            ),
+            out_cache_loc.to(torch.int32),
+        )
+    else:
+        batch.req_to_token_pool.write(
+            (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
+        )
+
+    import logging as _lg
+    _lg.getLogger(__name__).info(
+        f"[DSP-ALLOC] token_per_req={token_per_req} out_cache_loc[:8]={out_cache_loc[:8].tolist() if hasattr(out_cache_loc[:8], 'tolist') else out_cache_loc}"
+        f" locs={locs[:2].tolist() if hasattr(locs, 'tolist') else locs}"
+        f" req_pool={batch.req_pool_indices.tolist() if hasattr(batch.req_pool_indices, 'tolist') else batch.req_pool_indices}"
+        f" spec={batch.spec_algorithm}"
     )
 
     # DSV4-NPU hook: no-op on non-DSV4 paths.

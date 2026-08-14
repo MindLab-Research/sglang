@@ -355,7 +355,11 @@ class DraftBlockProposer:
         draft_block_ids = torch.full(
             (bs, gamma), int(self._mask_token_id), dtype=torch.long, device=device
         )
-        draft_block_ids[:, 0].copy_(draft_input.bonus_tokens.view(-1))
+        if draft_input.bonus_tokens.numel() == bs:
+            draft_block_ids[:, 0].copy_(draft_input.bonus_tokens.view(-1))
+        # else: PD-disaggregated first decode can arrive with an idle spec_info
+        # (empty bonus_tokens); keep mask_token so we degrade to target-only
+        # rather than crashing on the shape-[1]-vs-[0] broadcast.
         draft_positions = positions_2d[:, :gamma].reshape(-1)
         draft_cache_loc = verify_cache_loc_2d[:, :gamma].reshape(-1)
 
@@ -372,7 +376,10 @@ class DraftBlockProposer:
             draft_seq_lens_cpu = draft_input.reserved_seq_lens_cpu
             draft_seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
         else:
-            raise RuntimeError("DSpark decode expected batch.seq_lens_cpu, got None")
+            # PD-disaggregated decode may not populate seq_lens_cpu; derive it
+            # from the GPU-side seq_lens (required for DSpark position math).
+            draft_seq_lens_cpu = batch.seq_lens + gamma
+            draft_seq_lens_sum = int(draft_seq_lens_cpu.sum())
 
         draft_forward_batch = ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,
