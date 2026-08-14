@@ -1166,9 +1166,24 @@ class Scheduler(
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
             )
 
+            # Dedicated gloo group for disagg poll collectives. pop_transferred's
+            # _padded_all_reduce_min previously shared attn_tp_cpu_group with
+            # recv_requests' broadcast and the iteration barrier. Under concurrent
+            # abort storms, per-rank cleanup latency (prepare_abort/stream_output)
+            # desynchronized ranks by a full loop iteration: fast ranks entered
+            # the NEXT iteration's broadcast while slow ranks were still in the
+            # PREVIOUS iteration's poll all_reduce — gloo FIFO-matched the
+            # heterogeneous collectives against each other and wedged all ranks
+            # (health stays 200, requests time out, 0 crashes). A dedicated group
+            # makes the poll sequence independent: each rank's per-group
+            # collective stream stays aligned regardless of cross-group timing.
+            self._disagg_poll_gloo_group = torch.distributed.new_group(
+                backend="gloo"
+            )
+
             # The decode requests polling kv cache
             self.disagg_decode_transfer_queue = DecodeTransferQueue(
-                gloo_group=self.attn_tp_cpu_group,
+                gloo_group=self._disagg_poll_gloo_group,
                 req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
                 tp_rank=self.ps.tp_rank,
                 metadata_buffers=self.disagg_metadata_buffers,
@@ -1186,7 +1201,7 @@ class Scheduler(
                 scheduler=self,
                 transfer_queue=self.disagg_decode_transfer_queue,
                 tree_cache=self.tree_cache,
-                gloo_group=self.attn_tp_cpu_group,
+                gloo_group=self._disagg_poll_gloo_group,
                 tp_rank=self.ps.tp_rank,
                 tp_size=self.ps.tp_size,
                 dp_size=self.server_args.dp_size,
@@ -1221,7 +1236,7 @@ class Scheduler(
                 tp_size=self.ps.tp_size,
                 gpu_id=self.ps.gpu_id,
                 bootstrap_port=self.server_args.disaggregation_bootstrap_port,
-                gloo_group=self.attn_tp_cpu_group,
+                gloo_group=self._disagg_poll_gloo_group,
                 max_total_num_tokens=self.max_total_num_tokens,
                 scheduler=self,
                 pp_rank=self.ps.pp_rank,
