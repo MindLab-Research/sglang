@@ -35,6 +35,10 @@ from sglang.srt.layers.dcp import (
     all_gather_q_for_mla_decode,
     cp_lse_ag_out_rs_mla,
 )
+from sglang.srt.layers.dcp.comm import (
+    dcp_enabled,
+    get_attention_dcp_world_size,
+)
 from sglang.srt.layers.quantization.fp8_utils import (
     materialize_bpreshuffle_fp8_scale_tuple,
 )
@@ -591,7 +595,7 @@ class DeepseekMLAForwardMixin:
             )
 
         # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [B, H, ROPE_DIM], q_nope_out [B, H, NOPE_DIM] gathered to [B, H * dcp_world_size, ROPE_DIM] [B, H * dcp_world_size, NOPE_DIM] for decode batch, and all gather k_pe, k_nope for extend batch.
-        if get_parallel().dcp_enabled:
+        if dcp_enabled():
             _dcp_meta = getattr(forward_batch, "attn_dcp_metadata", None)
             if (
                 forward_batch.forward_mode.is_decode()
@@ -768,7 +772,7 @@ class DeepseekMLAForwardMixin:
                 elif (
                     forward_batch.forward_mode.is_decode()
                     or forward_batch.forward_mode.is_target_verify()
-                ) and get_parallel().dcp_enabled:
+                ) and dcp_enabled():
                     # set return_lse=True to correct attn_output
                     attn_output, lse = self.attn_mqa_for_dcp_decode(
                         q_nope_out,
@@ -845,7 +849,7 @@ class DeepseekMLAForwardMixin:
         if (
             forward_batch.forward_mode.is_decode()
             or forward_batch.forward_mode.is_target_verify()
-        ) and get_parallel().dcp_enabled:
+        ) and dcp_enabled():
             if not torch.cuda.is_current_stream_capturing():
                 _is_tuple = isinstance(attn_output, tuple)
                 _lse_ok = lse is not None if not _is_tuple else (attn_output[1] is not None)

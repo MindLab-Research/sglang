@@ -16,6 +16,7 @@ from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.server_args import get_global_server_args
 
 
 @dataclass

@@ -53,6 +53,11 @@ from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
+from sglang.srt.layers.dcp.comm import (
+    dcp_enabled,
+    get_attention_dcp_rank,
+    get_attention_dcp_world_size,
+)
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     UnquantizedKVCacheMethod,
 )
@@ -3952,8 +3957,6 @@ class MLATokenToKVPool(KVCache):
         cache_k_rope: torch.Tensor,
         forward_mode=None,
     ) -> None:
-        layer_id = layer.layer_id
-
         # DCP uses whole-page round-robin ownership. The target allocator exposes
         # a global virtual space of max_total*dcp_size slots, while each rank's
         # physical pool stores max_total slots. Keep graph shapes static by
@@ -4022,6 +4025,7 @@ class MLATokenToKVPool(KVCache):
         loc: torch.Tensor,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
+        forward_mode=None,
     ):
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_mla_kv_buffer (MLA)")
         layer_id = layer.layer_id

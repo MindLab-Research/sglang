@@ -688,7 +688,12 @@ class ModelRunner:
             self.apply_torch_tp()
 
     def maybe_init_lora_manager(self):
-        if self.server_args.enable_lora:
+        # Draft workers load only the MTP/EAGLE head and never apply LoRA
+        # adapters, so skip LoRA manager init here. Otherwise the global
+        # --enable-lora forces the draft TpModelWorker to pre-allocate its own
+        # LoRA CUDA buffers on already-tight ranks (e.g. bf16 target + EAGLE
+        # on B300), which OOMs during init.
+        if self.server_args.enable_lora and not self.is_draft_worker:
             self.init_lora_manager()
 
     def maybe_enable_batch_invariant_mode(self):
