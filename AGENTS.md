@@ -280,6 +280,8 @@ rsync -avz --exclude='__pycache__' --exclude='*.pyc' "$SRC" root@<node>:"$DEST"
 - **a605ab4e6（全局 seq_len 决策）是失败的**：导致 DeepGEMM `attention.hpp:150 cu_seq_len_k_start.size(0) == seq_len` 崩溃，别重新部署。
 - **1101 曾反复因 `gloo/tcp/pair.cc:547 Connection closed by peer 22.0.68.78` 崩溃**（网络层，非代码）——重启集群恢复，根因待查。
 - **router/proxy 会"进程活着但转发卡死"**（health 200、请求超时）——重启即恢复；router 重启后必须重启 gateway+proxy。
-- **decode 是 DCP=4 + EAGLE**（不是 DCP=2 no-EAGLE——旧文档已废弃）。
+- **decode 是 DCP=4 + DSPARK**（V4 Flash 用 DSPARK；EAGLE 是 GLM-5.2 的旧配置）。
+- **⛔ DSV4 的 DCP KV 必须广播（2026-08-14 修复）**：decode 端每 DCP rank 持有**全量池**（`_pre_alloc_fill_len` 不按 dcp_size 缩减，req_to_token 是全量长度）——所以**主 KV（SWA/DSA 经 maybe_send_extra）和压缩 KV（c4/c128 经 transfer_worker）都必须广播**（跳过 DCP token-shard 分片）。若分片传输（每 rank 只收 1/dcp）→ decode 读取范围（req_to_token 0..len）远超写入范围（0..len/dcp）→ **KV 污染 → target logits 错 → 输出乱码（draft 停滞是症状不是根因）**。判断：`_is_dsv4_kv_transfer()`（is_deepseek_v4）；GLM（1/dcp 布局）保持分片。验证：dcp=4 出师表全文背诵（finish=stop）。
+- **⛔ rsync 后必须彻底清 `__pycache__`（2026-08-14 教训）**：`find ... -name '__pycache__' -o -name '*.pyc' | xargs rm -rf`——只清目标目录的子目录不够，旧 .pyc 会让进程加载**没有最新修复的代码**（曾导致广播修复"看似没生效"——实际是缓存遮挡）。改 mooncake/conn.py 等热路径后必须全 sglang 目录清缓存再重启。
 - **⛔ L20D triton config 是 TPOT 杀手（2026-08-06）**：本地 `configs/triton_3_6_0/` 里有打包的错误 `E=1024,*L20D*.json`，rsync 到集群后 sglang 启动会找到并使用它 → MoE kernel 按 1024 专家展开 → TPOT 23ms→80ms。**每次 rsync 后必须 `rm *L20D*.json`**；找不到 config 回退默认 kernel 才是 B300 上的正确状态（1P1D 无此文件、TPOT 7-21ms 为基准）。
 - **TPOT 异常排查**：先拉 Grafana `sglang:inter_token_latency_seconds` P50 时序找突变点（VictoriaMetrics query: `histogram_quantile(0.5, sum(rate(sglang:inter_token_latency_seconds_bucket{cluster=...,engine_type="decode"}[15m])) by (le))`），再对 decode 日志 `Decode batch` 算 `TPOT ≈ #running-req / gen-throughput × 1000ms`。
