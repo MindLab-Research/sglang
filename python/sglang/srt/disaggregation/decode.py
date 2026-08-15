@@ -2585,6 +2585,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     continue
                 hidden_state = decode_req.pd_hidden_state
                 hidden_state.mark_kv_done()
+                # If hidden is not done but KV is done, mark hidden as done.
+                # This handles the case where prefill couldn't send hidden
+                # (e.g., pending_bootstrap reqs where hidden states were not
+                # materialized before transfer). Target KV is correct; draft
+                # quality may be lower (no hidden bootstrap) but output is safe.
+                if not hidden_state.hidden_done:
+                    hidden_state.mark_hidden_done()
                 # This branch's PDHiddenRequestState has no request_done();
                 # it is done once both the KV transfer and (for streaming
                 # hidden transfers) the final hidden chunk ack have landed.
