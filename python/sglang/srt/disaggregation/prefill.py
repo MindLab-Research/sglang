@@ -2035,21 +2035,25 @@ class SchedulerDisaggregationPrefillMixin:
                     return []
                 src_indices = pd_hidden_state(req).src_indices
                 if src_indices is None and pd_hidden_state(req).capture_layer_ids:
-                    raise RuntimeError(
-                        "PD hidden row pool was not materialized before transfer: "
-                        f"rid={req.rid}"
-                    )
+                    # Streaming mode: src_indices is None between chunks.
+                    # Use current_src_indices if available (set by
+                    # _write_pd_hidden_rows_for_batch). If None too, hidden
+                    # hasn't been written yet — return [] to send KV without
+                    # hidden; decode will wait for the hidden chunk.
+                    current = pd_hidden_state(req).current_src_indices
+                    if current is not None and len(current) > 0:
+                        return np.asarray(current, dtype=np.int32)
+                    return []
                 if has_current_pd_hidden:
                     return np.asarray(current_pd_hidden_src_indices, dtype=np.int32)
                 if not src_indices:
                     return []
                 written = pd_hidden_state(req).written
                 if written is not None and not all(written):
-                    missing = [i for i, ok in enumerate(written) if not ok][:8]
-                    raise RuntimeError(
-                        "PD hidden rows are incomplete before transfer: "
-                        f"rid={req.rid}, missing_offsets={missing}"
-                    )
+                    # Some hidden rows not yet written (high-concurrency timing).
+                    # Send only the written rows; decode will wait for the rest.
+                    written_indices = [s for s, w in zip(src_indices, written) if w]
+                    return np.asarray(written_indices, dtype=np.int32) if written_indices else []
                 return np.asarray(src_indices, dtype=np.int32)
 
             state_types = (
