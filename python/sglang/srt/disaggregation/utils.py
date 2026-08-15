@@ -108,12 +108,31 @@ def _get_failure_prob() -> float:
 
 
 def _poll_with_failure_injection(pollers) -> List[int]:
+    def _poll_one(poller) -> int:
+        # A raising poll() used to escape BEFORE the rank's
+        # _padded_all_reduce_min, permanently offsetting that rank's
+        # per-group collective count by one — every later iteration then
+        # FIFO-mismatched into an unrecoverable wedge (health stays 200,
+        # zero crashes, all requests time out; py-spy shows one rank one
+        # loop-iteration ahead in recv_requests broadcast while the rest
+        # wait forever in pop_transferred's gloo all_reduce). Convert any
+        # exception into KVPoll.Failed here so the poll collective count
+        # stays rank-invariant no matter what a receiver throws, and stash
+        # the exception on the receiver so the Failed branch surfaces it.
+        try:
+            return int(poller.poll())
+        except Exception as e:  # noqa: BLE001
+            setattr(poller, "_stashed_poll_exception", e)
+            return int(KVPoll.Failed)
+
     if (failure_prob := _get_failure_prob()) > 0:
         return [
-            int(KVPoll.Failed) if random.random() < failure_prob else int(poller.poll())
+            int(KVPoll.Failed)
+            if random.random() < failure_prob
+            else _poll_one(poller)
             for poller in pollers
         ]
-    return [int(poller.poll()) for poller in pollers]
+    return [_poll_one(poller) for poller in pollers]
 
 
 def _is_fake_transfer(req: Req, server_args: ServerArgs) -> bool:
@@ -142,6 +161,12 @@ def _apply_metadata_gate(polls, decode_reqs, metadata_buffers, server_args) -> N
 
 
 
+# Forensic counter: per-process index of every _padded_all_reduce_min call.
+# On any residual collective failure (timeout/mismatch), the count is logged so
+# the diverging rank and call site can be pinpointed from logs alone.
+_PADDED_CALL_COUNT = 0
+
+
 def _padded_all_reduce_min(polls: list, gloo_group):
     """All_reduce a variable-length uint8 list with size synchronization.
 
@@ -149,13 +174,22 @@ def _padded_all_reduce_min(polls: list, gloo_group):
     sizes). This pads to the max length across ranks (255 = neutral for MIN)
     so gloo doesn't crash with size mismatch ("4 vs 1").
     """
+    global _PADDED_CALL_COUNT
+    _PADDED_CALL_COUNT += 1
     local_len = torch.tensor(len(polls), dtype=torch.int, device="cpu")
-    dist.all_reduce(local_len, op=dist.ReduceOp.MAX, group=gloo_group)
+    try:
+        dist.all_reduce(local_len, op=dist.ReduceOp.MAX, group=gloo_group)
 
-    max_len = max(1, local_len.item())
-    polls_padded = list(polls) + [255] * (max_len - len(polls))
-    tensor_to_reduce = torch.tensor(polls_padded, dtype=torch.uint8, device="cpu")
-    dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=gloo_group)
+        max_len = max(1, local_len.item())
+        polls_padded = list(polls) + [255] * (max_len - len(polls))
+        tensor_to_reduce = torch.tensor(polls_padded, dtype=torch.uint8, device="cpu")
+        dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=gloo_group)
+    except Exception as e:
+        logger.error(
+            f"[PADDED-AR-FAIL] count={_PADDED_CALL_COUNT} local_len={len(polls)} "
+            f"exc={e!r}"
+        )
+        raise
 
     return tensor_to_reduce.tolist()[:len(polls)]
 

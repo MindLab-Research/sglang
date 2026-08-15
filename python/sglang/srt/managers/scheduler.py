@@ -14,6 +14,7 @@
 """A scheduler that manages a tensor parallel GPU worker."""
 
 import dataclasses
+import datetime
 import faulthandler
 import logging
 import os
@@ -1177,8 +1178,14 @@ class Scheduler(
             # (health stays 200, requests time out, 0 crashes). A dedicated group
             # makes the poll sequence independent: each rank's per-group
             # collective stream stays aligned regardless of cross-group timing.
+            # The timeout bounds the blast radius of any residual count
+            # divergence (see the exception-safe poll wrapper in
+            # _poll_with_failure_injection): a wedged collective raises after
+            # 300s and crashes the scheduler loudly instead of hanging silently
+            # until the 1h watchdog.
             self._disagg_poll_gloo_group = torch.distributed.new_group(
-                backend="gloo"
+                backend="gloo",
+                timeout=datetime.timedelta(seconds=300),
             )
 
             # The decode requests polling kv cache

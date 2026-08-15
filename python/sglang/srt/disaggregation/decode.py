@@ -2533,11 +2533,24 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 )
                 is_propagated = False
                 if poll == KVPoll.Failed:
-                    try:
-                        decode_req.kv_receiver.failure_exception()
-                    except Exception as e:
-                        error_message += f" with exception {e}"
-                        is_propagated = getattr(e, "is_from_another_rank", False)
+                    # Surface an exception stashed by the exception-safe poll
+                    # wrapper (_poll_with_failure_injection) if present; it is
+                    # the original error that got converted to KVPoll.Failed to
+                    # keep the poll collective count rank-invariant.
+                    stashed = getattr(
+                        decode_req.kv_receiver, "_stashed_poll_exception", None
+                    )
+                    if stashed is not None:
+                        error_message += f" with exception {stashed}"
+                        is_propagated = getattr(
+                            stashed, "is_from_another_rank", False
+                        )
+                    else:
+                        try:
+                            decode_req.kv_receiver.failure_exception()
+                        except Exception as e:
+                            error_message += f" with exception {e}"
+                            is_propagated = getattr(e, "is_from_another_rank", False)
                 self._clean_hicache_prefetch_resources(decode_req)
                 # Mute error message for propagated exceptions to avoid duplicate logging
                 if is_propagated:
