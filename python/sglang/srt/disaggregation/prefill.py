@@ -2035,22 +2035,21 @@ class SchedulerDisaggregationPrefillMixin:
                     return []
                 src_indices = pd_hidden_state(req).src_indices
                 if src_indices is None and pd_hidden_state(req).capture_layer_ids:
-                    # Hidden states not yet captured (high-concurrency timing:
-                    # forward hasn't run yet when transfer is attempted). Skip
-                    # hidden transfer for this chunk — decode side will
-                    # self-generate draft KV from target KV. Raising here crashes
-                    # all 8 ranks under 64-concurrent bench.
-                    return []
+                    raise RuntimeError(
+                        "PD hidden row pool was not materialized before transfer: "
+                        f"rid={req.rid}"
+                    )
                 if has_current_pd_hidden:
                     return np.asarray(current_pd_hidden_src_indices, dtype=np.int32)
                 if not src_indices:
                     return []
                 written = pd_hidden_state(req).written
                 if written is not None and not all(written):
-                    # Some hidden rows not yet written (high-concurrency timing).
-                    # Transfer only the written rows; decode side handles gaps.
-                    written_indices = [s for s, w in zip(src_indices, written) if w]
-                    return np.asarray(written_indices, dtype=np.int32) if written_indices else []
+                    missing = [i for i, ok in enumerate(written) if not ok][:8]
+                    raise RuntimeError(
+                        "PD hidden rows are incomplete before transfer: "
+                        f"rid={req.rid}, missing_offsets={missing}"
+                    )
                 return np.asarray(src_indices, dtype=np.int32)
 
             state_types = (
