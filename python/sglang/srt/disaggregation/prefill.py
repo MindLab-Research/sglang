@@ -640,6 +640,20 @@ class PrefillBootstrapQueue:
         rids_to_check_set = set(rids_to_check) if rids_to_check is not None else None
 
         if len(self.queue) == 0:
+            # Keep the CP collective sequence rank-invariant. Bootstrap queue
+            # population is per-rank (TCP reception timing diverges across
+            # attn-CP ranks), so an early return here would skip
+            # poll_and_all_reduce_attn_cp_tp_group on this rank only —
+            # permanently offsetting its per-group collective count and
+            # wedging every CP rank in the next all_reduce (health stays 200,
+            # zero crashes, requests time out). Participate with an empty
+            # poller list to hold the sequence alignment.
+            if getattr(self.scheduler.server_args, "attn_cp_size", 1) > 1:
+                poll_and_all_reduce_attn_cp_tp_group(
+                    [],
+                    self.scheduler.attn_cp_cpu_group,
+                    self.scheduler.attn_tp_cpu_group,
+                )
             if return_failed_reqs is False:
                 return []
             else:
