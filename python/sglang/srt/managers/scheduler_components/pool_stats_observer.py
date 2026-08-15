@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import logging
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -310,6 +311,22 @@ class SchedulerPoolStatsObserver:
         else:
             full_token_usage = full_num_used / self.full_tokens_per_layer
         swa_token_usage = swa_num_used / self.swa_tokens_per_layer
+
+        # Decode-radix accounting canary: available + evictable exceeding pool
+        # size means some FULL/SWA slots were freed while the radix tree still
+        # owns them (double free / stale evictable entries) — a KV pollution
+        # hazard. Surface it loudly instead of silently printing negative usage.
+        if (full_num_used < 0 or swa_num_used < 0) and not self.enable_hisparse:
+            logging.getLogger(__name__).warning(
+                "[DRX-DIAG] pool over-release: full_num_used=%d swa_num_used=%d "
+                "full_avail=%d full_evictable=%d swa_avail=%d swa_evictable=%d",
+                full_num_used,
+                swa_num_used,
+                full_available_size,
+                full_evictable_size,
+                swa_available_size,
+                swa_evictable_size,
+            )
 
         return PoolStats(
             is_hybrid_swa=True,

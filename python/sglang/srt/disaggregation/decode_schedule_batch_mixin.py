@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, List
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -118,7 +119,22 @@ class ScheduleBatchDisaggregationDecodeMixin:
         last_tokens: List[int] = []
         for req in self.reqs:
             last_tokens.append(req.output_ids[-1])
+            _drx_diag = envs.SGLANG_DECODE_RADIX_DIAG.get()
+            if _drx_diag:
+                logger.info(
+                    f"[DRX-DIAG] insert(prebuilt) rid={req.rid} "
+                    f"fill_ids={len(req.get_fill_ids())} "
+                    f"kv_committed={req.kv_committed_len} "
+                    f"cache_protected={req.cache_protected_len} "
+                    f"swa_evicted={getattr(req.kv, 'swa_evicted_seqlen', 'NA')}"
+                )
             maybe_cache_unfinished_req(req, self.tree_cache)
+            if _drx_diag:
+                logger.info(
+                    f"[DRX-DIAG] insert(post) rid={req.rid} "
+                    f"prefix_indices={len(req.prefix_indices)} "
+                    f"cache_protected={req.cache_protected_len}"
+                )
             if req.grammar is not None:
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
                 try:

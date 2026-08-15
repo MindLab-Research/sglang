@@ -1238,6 +1238,20 @@ class Req(ReqDllmMixin):
             if reprefill_tail:
                 capped = max(0, input_len - reprefill_tail)
                 key_limit = capped if key_limit is None else min(key_limit, capped)
+            # PD-disagg prefill (DSpark hidden contract): clamp the radix match to
+            # what the decode side promised it already owns (decode_prefix_len).
+            # The KV/hidden protocol requires prefill to compute (and stream hidden
+            # for) exactly [decode_prefix_len, len); matching further skips tokens
+            # that decode does NOT have and cannot backfill (DSpark hidden states
+            # are not radix-cacheable), surfacing as "PD streaming hidden chunk
+            # arrived out of order" -> KVTransferError -> request abort.
+            _decode_prefix_len = getattr(self, "disagg_decode_prefix_len", None)
+            if isinstance(_decode_prefix_len, int) and _decode_prefix_len >= 0:
+                key_limit = (
+                    _decode_prefix_len
+                    if key_limit is None
+                    else min(key_limit, _decode_prefix_len)
+                )
             match_result = tree_cache.match_prefix(
                 MatchPrefixParams(
                     key=RadixKey(

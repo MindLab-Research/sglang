@@ -200,10 +200,18 @@ def build_kv_cache(
         and server_args.disaggregation_mode == "decode"
     ):
         if is_hybrid_swa:
-            raise ValueError(
-                "--disaggregation-decode-enable-radix-cache is incompatible "
-                "with sliding window attention (SWA) models"
-            )
+            if envs.SGLANG_DECODE_RADIX_ALLOW_SWA.get():
+                logger.warning(
+                    "EXPERIMENTAL (SGLANG_DECODE_RADIX_ALLOW_SWA=1): decode radix "
+                    "cache enabled on a hybrid-SWA model; SWA-tail prealloc path "
+                    "will be used. KV pollution risk — verify output correctness."
+                )
+            else:
+                raise ValueError(
+                    "--disaggregation-decode-enable-radix-cache is incompatible "
+                    "with sliding window attention (SWA) models (set "
+                    "SGLANG_DECODE_RADIX_ALLOW_SWA=1 to force-enable)"
+                )
         if is_hybrid_ssm:
             raise ValueError(
                 "--disaggregation-decode-enable-radix-cache is incompatible "
@@ -263,6 +271,18 @@ def build_kv_cache(
             tp_group=tp_group,
         )
     )
+
+    # Decode-disagg radix on hybrid-SWA models: the tree must not own/serve
+    # SWA. Every request's SWA window arrives fresh via the PD transfer, so
+    # matching is FULL-only and the trailing window is recomputed by prefill
+    # (see UnifiedRadixCache.swa_served_from_tree).
+    if (
+        server_args.disaggregation_decode_enable_radix_cache
+        and server_args.disaggregation_mode == "decode"
+        and is_hybrid_swa
+        and hasattr(tree_cache, "swa_served_from_tree")
+    ):
+        tree_cache.swa_served_from_tree = False
 
     embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
     init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)

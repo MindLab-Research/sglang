@@ -1011,6 +1011,14 @@ class Envs:
     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
     SGLANG_DSV4_MHC_PREWARM = EnvBool(True)
+    # Allow --disaggregation-decode-enable-radix-cache on hybrid-SWA models
+    # (DeepSeek V4). Downgrades the build-time ValueError to a warning so the
+    # SWA-aware decode prealloc path (_swa_tail_len / alloc_extend_swa_tail /
+    # swa_reserved) can run. Kill-switch: unset to restore the hard guard.
+    SGLANG_DECODE_RADIX_ALLOW_SWA = EnvBool(False)
+    # Verbose decode-radix diagnostics (match/insert/finish + pool accounting
+    # canary) for the decode-side radix feature. Log marker: DRX-DIAG.
+    SGLANG_DECODE_RADIX_DIAG = EnvBool(False)
     SGLANG_OPT_USE_TRITON_FUSED_MHC = EnvBool(True)
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)

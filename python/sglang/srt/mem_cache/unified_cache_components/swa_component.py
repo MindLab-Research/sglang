@@ -117,6 +117,12 @@ class SWAComponent(TreeComponent):
     def create_match_validator(
         self, match_device_only: bool = False
     ) -> Callable[[UnifiedTreeNode], bool]:
+        # Decode-disagg radix: SWA arrives per-request via the PD transfer and
+        # is never served from the tree -- do not gate FULL matching on tree
+        # SWA liveness (the tree SWA of a prior request slid past the current
+        # boundary and is legitimately dead).
+        if not getattr(self.cache, "swa_served_from_tree", True):
+            return lambda node: True
         sliding_window_size = self.sliding_window_size
         ct = self.component_type
         state = {"len": float("inf")}
@@ -183,6 +189,14 @@ class SWAComponent(TreeComponent):
         value_slice: torch.Tensor,
         params: InsertParams,
     ) -> int:
+        # Decode-disagg radix: the tree never holds SWA, so there is nothing
+        # to revive. Skipping this also skips
+        # _restore_device_value_with_locked_full, whose free of the request's
+        # incoming FULL slots (while req_to_token still references them, and
+        # with the finished-req insert freeing overlapping ranges again) was
+        # the double-free / pool over-release source.
+        if not getattr(self.cache, "swa_served_from_tree", True):
+            return prefix_len
         if params.prev_prefix_len >= total_prefix_len + prefix_len:
             return prefix_len
 
@@ -242,6 +256,9 @@ class SWAComponent(TreeComponent):
         total_prefix_len: int,
         params: InsertParams,
     ) -> None:
+        # Decode-disagg radix: tree holds no SWA; nothing to recover.
+        if not getattr(self.cache, "swa_served_from_tree", True):
+            return
         # _unevict_node_on_insert already wrote the request's fresh KV slice
         # into the base value. We just need to rebuild SWA from that slice for
         # the in-window portion. There is no old SWA slot to free here.
@@ -276,6 +293,11 @@ class SWAComponent(TreeComponent):
         result: InsertResult,
     ) -> None:
         if not is_new_leaf:
+            return
+        # Decode-disagg radix: keep the leaf a SWA tombstone -- the request's
+        # SWA ring is per-request state, translating tree FULL slots to SWA
+        # here would publish SWA values the tree does not really own.
+        if not getattr(self.cache, "swa_served_from_tree", True):
             return
 
         node_start = result.prefix_len

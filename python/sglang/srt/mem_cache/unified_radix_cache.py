@@ -808,6 +808,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
             # Free unaligned tail
             self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
+            # Decode-disagg radix (swa_served_from_tree=False): the tree never
+            # takes over the finished request's SWA window slots, so free them
+            # here. free_swa is mapping-filtered (out-of-window head positions
+            # map to 0 and are skipped) and page-granular; tree-owned FULL
+            # slots on those pages have zeroed mappings, so this only releases
+            # this request's live window. Route through free_swa directly --
+            # NOT free()/free_group, which would also free the FULL slots the
+            # tree just took over. Without this, every finished request leaks
+            # its window's SWA pages -> "[swa] pool memory leak detected".
+            if (
+                not self.swa_served_from_tree
+                and ComponentType.SWA in self.components
+            ):
+                self.token_to_kv_pool_allocator.free_swa(kv_indices[:page_aligned_len])
         else:
             self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
 
@@ -893,9 +907,25 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         assert (
             req.cache_protected_len <= len(new_indices) + self.page_size - 1
         ), f"{req.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
-        assert new_prefix_len <= len(
-            new_indices
-        ), f"{new_prefix_len=}, {len(new_indices)=}"
+        # new_prefix_len (insert depth, FULL-component view) can legitimately
+        # exceed the SWA-validated device match on hybrid-SWA models: an insert
+        # with req.kv.swa_evicted_seqlen>0 tombstones the out-of-window head,
+        # and the SWA match validator needs >= sliding_window tokens of live
+        # tail to accept any node — a fresh short tail (e.g. PD prebuilt with
+        # only the trailing window's SWA ring) yields new_indices=0. This is
+        # not corruption: everything downstream is driven by new_indices (the
+        # request keeps its own slots for the non-canonical head via the
+        # cat-with-kv_indices_orig branch below). Log instead of crashing the
+        # scheduler.
+        if new_prefix_len > len(new_indices):
+            logger.warning(
+                "[SWA-INSERT] insert depth exceeds SWA-validated match: "
+                f"rid={getattr(req, 'rid', '?')} new_prefix_len={new_prefix_len} "
+                f"len(new_indices)={len(new_indices)} "
+                f"swa_evicted_seqlen={getattr(req.kv, 'swa_evicted_seqlen', 'NA')} "
+                f"page_aligned_len={page_aligned_len} "
+                f"cache_protected={req.cache_protected_len}"
+            )
         self.req_to_token_pool.write(
             (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
             new_indices[req.cache_protected_len :],
@@ -3065,16 +3095,26 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         swa = self.components.get(ComponentType.SWA)
         return swa.sliding_window_size if swa else None
 
+    # Decode-disagg radix mode (set by kv_cache_builder when
+    # --disaggregation-decode-enable-radix-cache runs on a hybrid-SWA model):
+    # SWA KV arrives fresh with every PD transfer (prefill's _swa_payload
+    # sends the whole trailing window) and lives in per-request rings, so the
+    # radix tree NEVER serves SWA. While False:
+    #  - the SWA match validator is disabled (FULL matching ungated by tree
+    #    SWA liveness)
+    #  - SWA insert/revival paths are skipped (no tree SWA, and crucially no
+    #    frees of the request's incoming FULL slots)
+    #  - swa_reprefill_tail_tokens() reports window+page so matches are
+    #    capped and prefill recomputes the trailing window (fresh SWA).
+    swa_served_from_tree: bool = True
+
     def swa_reprefill_tail_tokens(self) -> int:
-        """
-        Only unified_kv + HiCache needs this: SWA lives in a per-request ring
-        (state_slot/pos), not content-stable and never offloaded to host, so a
-        reused prefix's trailing sliding window would read another request's
-        stale ring slots. Re-prefilling that window rewrites this request's ring
-        (what plain radix reuse does via its SWA match gate). 0 for every other
-        layout.
-        """
         swa = self.components.get(ComponentType.SWA)
+        if swa is not None and not self.swa_served_from_tree:
+            # Decode-disagg radix: leave a trailing window (+page margin so
+            # page floor still leaves >= window) for prefill to recompute,
+            # which re-transfers a fresh SWA window for this request.
+            return swa.sliding_window_size + self.page_size
         unified_compress_only_hicache = (
             self.cache_controller is not None
             and swa is not None

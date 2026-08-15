@@ -567,16 +567,40 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         Match a request against the decode-side radix cache, lock the matched
         node to prevent eviction, and return the matched prefix information.
         """
+        # Match against all but the LAST input token (mirrors the aggregated
+        # scheduler's _compute_max_prefix_len invariant): the final prompt
+        # token must always be recomputed by the prebuilt extend forward —
+        # it produces the first-token logits and (for DSpark) the hidden
+        # bootstrap rows. Without this cap, an identical-request replay hits
+        # a FULL prefix (total_prefix_len == len(origin_input_ids)) leaving
+        # pd_hidden_len == 0: the PD-hidden metadata path then packs None
+        # into state_indices and crashes (TypeError in pack_int_lists), and
+        # there would be no extend forward to start generation. Page
+        # alignment floors the match anyway, so capping by one token only
+        # affects the exact-replay edge case.
+        match_tokens = (
+            req.origin_input_ids[:-1]
+            if len(req.origin_input_ids) > 1
+            else req.origin_input_ids
+        )
         result = match_prefix_for_req(
             self.tree_cache,
             req,
-            req.origin_input_ids,
+            match_tokens,
             cow_mamba=self.tree_cache.supports_mamba(),
             include_req=True,
         )
         # Always lock to match aggregated scheduling behavior
         self.tree_cache.inc_lock_ref(result.last_device_node)
-        return self._build_decode_prefix_match(req, result)
+        match = self._build_decode_prefix_match(req, result)
+        if envs.SGLANG_DECODE_RADIX_DIAG.get():
+            logger.info(
+                f"[DRX-DIAG] match rid={req.rid} key_len={len(req.origin_input_ids)} "
+                f"extra_key={req.extra_key!r} l1={match.l1_prefix_len} "
+                f"l2_host={match.l2_host_hit_length} "
+                f"device_indices={len(match.prefix_indices)}"
+            )
+        return match
 
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
         prefill_info = self.kv_manager.prefill_info_table.get(_bootstrap_addr(req))
@@ -1510,10 +1534,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         first_slice_indices = next(
                             iter(pd_hidden_dst_indices_by_pp.values())
                         )
+                    # Never append None: pack_int_lists (bootstrap metadata)
+                    # calls len() on every element — a None crashes the
+                    # scheduler when the hidden pool yields no rows. An
+                    # empty int32 array packs as a zero-length list, which
+                    # prefill reads as "no hidden to transfer".
                     state_indices.append(
-                        None
-                        if first_slice_indices is None
-                        else np.asarray(first_slice_indices, dtype=np.int32)
+                        np.asarray(first_slice_indices, dtype=np.int32)
+                        if first_slice_indices is not None
+                        else np.empty(0, dtype=np.int32)
                     )
                 else:
                     state_indices.append(None)
