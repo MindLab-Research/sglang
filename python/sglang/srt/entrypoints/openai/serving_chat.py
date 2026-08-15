@@ -24,7 +24,7 @@ from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from jsonschema import Draft202012Validator, SchemaError
 
-from sglang.srt.entrypoints.openai import encoding_dsv4, encoding_dsv32
+from sglang.srt.entrypoints.openai import chat_encoding, encoding_dsv4, encoding_dsv32
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -220,6 +220,20 @@ class OpenAIServingChat(OpenAIServingBase):
         # Which Python-based chat encoder (if any) bypasses apply_chat_template.
         # Values: "dsv32", "dsv4", or custom values set by subclass. None for default.
         self.chat_encoding_spec = self._resolve_chat_encoding_spec()
+        self._dsv4_reasoning_effort_profile = (
+            chat_encoding.resolve_dsv4_reasoning_effort_profile(
+                model_path=self.tokenizer_manager.model_path,
+                revision=self.tokenizer_manager.server_args.revision,
+                override=(
+                    envs.SGLANG_DSV4_REASONING_EFFORT_PROFILE.get()
+                    or self.tokenizer_manager.model_config.hf_config.to_dict().get(
+                        chat_encoding.DSV4_REASONING_EFFORT_PROFILE_OVERRIDE
+                    )
+                ),
+            )
+            if self.chat_encoding_spec == "dsv4"
+            else None
+        )
 
         # Resolve the env-configured Inkling effort default once: the env var is
         # frozen for the server's lifetime, and a misconfigured value should
@@ -306,11 +320,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
         Override in subclass to add custom encoding specs.
         """
-        from sglang.srt.entrypoints.openai.chat_encoding import (
-            resolve_chat_encoding_spec,
-        )
-
-        return resolve_chat_encoding_spec(
+        return chat_encoding.resolve_chat_encoding_spec(
             hf_config=self.tokenizer_manager.model_config.hf_config,
             tokenizer=self.tokenizer_manager.tokenizer,
             tool_call_parser=self.tool_call_parser,
@@ -789,6 +799,17 @@ class OpenAIServingChat(OpenAIServingBase):
             if effort is not None and request.reasoning_effort is None:
                 request.reasoning_effort = effort
 
+        # Port #28288: SGLANG_DEFAULT_THINKING must drive BOTH the dsv4 prompt
+        # encoder AND the reasoning parser. Without this, the prompt ends with
+        # <think> (thinking mode) but the parser treats the request as
+        # non-thinking, so the model's reasoning text and </think> marker leak
+        # into content. Scoped to custom encoder path (dsv4/dsv32) — the only
+        # path SGLANG_DEFAULT_THINKING drives.
+        if self.chat_encoding_spec is not None:
+            ctk = dict(request.chat_template_kwargs or {})
+            ctk.setdefault("thinking", envs.SGLANG_DEFAULT_THINKING.get())
+            request.chat_template_kwargs = ctk
+
         # GptOss model needs to keep special tokens for harmony parsing
         if self.is_gpt_oss or self.is_gemma4:
             request.skip_special_tokens = False
@@ -951,7 +972,8 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Default encoding (dsv4/dsv32)
             if self.chat_encoding_spec == "dsv4":
-                # V4 encoder only accepts "max" / "high" / None.
+                # V4 effort levels depend on the checkpoint's bundled encoder
+                # profile: preview accepts "high"/"max", official also "low".
                 # OpenAI protocol defaults to "medium" which V4 rejects; drop it.
                 # Fallback: if request didn't set it, try env SGLANG_DSV4_REASONING_EFFORT.
                 effort_source = request.reasoning_effort
@@ -959,8 +981,13 @@ class OpenAIServingChat(OpenAIServingBase):
                     env_val = envs.SGLANG_DSV4_REASONING_EFFORT.get()
                     if env_val:
                         effort_source = env_val
+                reasoning_effort_profile = self._dsv4_reasoning_effort_profile
+                assert reasoning_effort_profile is not None
+                accepted_efforts = encoding_dsv4.REASONING_EFFORT_PROFILES[
+                    reasoning_effort_profile
+                ]
                 v4_reasoning_effort = (
-                    effort_source if effort_source in ("max", "high") else None
+                    effort_source if effort_source in accepted_efforts else None
                 )
                 if request.task is not None:
                     encoding_dsv4.attach_task_to_last_user_message(
@@ -970,6 +997,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     messages,
                     thinking_mode=thinking_mode,
                     reasoning_effort=v4_reasoning_effort,
+                    reasoning_effort_profile=reasoning_effort_profile,
                 )
                 prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
             else:

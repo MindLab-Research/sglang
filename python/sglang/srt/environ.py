@@ -998,9 +998,13 @@ class Envs:
     # Set False when using FP4-to-FP8 converted DeepSeek V4 checkpoint.
     SGLANG_DSV4_FP4_EXPERTS = EnvBool(True)
     SGLANG_DSV4_FP4_DEQUANT = EnvBool(False)
-    # Default reasoning_effort for dsv4 chat encoder when request doesn't set it.
-    # Accepts "", "max", "high" (empty string means unset); other values filtered to None.
+    # Flash-0731 also accepts "low"; the active profile is checkpoint-resolved.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")
+    # Override the dsv4 reasoning-effort profile ("preview" or "official")
+    # instead of detecting it from the checkpoint's bundled encoder. Empty
+    # falls back to --json-model-override-args {"dsv4_reasoning_effort_profile": ...}
+    # and then to checkpoint detection.
+    SGLANG_DSV4_REASONING_EFFORT_PROFILE = EnvStr("")
 
     # CUDA kernels
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
