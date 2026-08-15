@@ -223,8 +223,14 @@ def poll_and_all_reduce_attn_cp_tp_group(
     # shard observe the same status transitions. Use _padded_all_reduce_min to
     # handle variable-length pollers lists (different ranks may have different
     # numbers of inflight requests, causing tensor shape mismatch -> deadlock).
+    # _poll_with_failure_injection converts a raising poll() (e.g. propagated
+    # KVTransferError under client-abort storms) into KVPoll.Failed instead of
+    # letting it escape BEFORE the collectives — an escaping exception skipped
+    # that rank's _padded_all_reduce_min and permanently offset its per-group
+    # collective count, wedging all CP ranks in pop_bootstrapped (health 200,
+    # zero crashes, requests time out; py-spy: every rank parked here).
     polls = _padded_all_reduce_min(
-        [int(poller.poll()) for poller in pollers], attn_tp_cpu_group
+        _poll_with_failure_injection(pollers), attn_tp_cpu_group
     )
 
     # Then sync across attn-cp ranks, so all TPxCP participants in one DP shard
