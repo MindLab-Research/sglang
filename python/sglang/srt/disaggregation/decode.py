@@ -1620,15 +1620,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 np.int32
             )
             if dcp_enabled():
-                import logging as _lg
-                _lg.getLogger(__name__).warning(
-                    f"[DCP-PD-IDX] rid={decode_req.req.rid} prefix_len={total_prefix_len}"
-                    f" origin_len={origin_input_len} to_send={len(kv_indices)}"
-                    f" page_size={kv_transfer_page_size}"
-                    f" page_indices={page_indices.tolist()}"
-                    f" kv_indices[:8]={kv_indices[:8].tolist()}"
-                    f" kv_indices[-4:]={kv_indices[-4:].tolist()}"
-                )
+                if envs.SGLANG_DEBUG_DIAG.get():
+                    import logging as _lg
+                    _lg.getLogger(__name__).warning(
+                        f"[DCP-PD-IDX] rid={decode_req.req.rid} prefix_len={total_prefix_len}"
+                        f" origin_len={origin_input_len} to_send={len(kv_indices)}"
+                        f" page_size={kv_transfer_page_size}"
+                        f" page_indices={page_indices.tolist()}"
+                        f" kv_indices[:8]={kv_indices[:8].tolist()}"
+                        f" kv_indices[-4:]={kv_indices[-4:].tolist()}"
+                    )
                 # PD transfer with conn.py rank-filtering + //dcp mapping
                 # writes KV directly to DCP page layout. No inplace_shard_dcp
                 # needed — it would move data to page_idx//dcp//dcp (wrong).
@@ -2898,11 +2899,12 @@ class SchedulerDisaggregationDecodeMixin:
         if len(can_run_list) == 0:
             return None
 
-        logger.info(
-            "[DEBUG-CAN] can_run=%s num_not_used=%s pool_avail=%s",
-            len(can_run_list), num_not_used_batch,
-            self.req_to_token_pool.available_size(),
-        )
+        if envs.SGLANG_DEBUG_DIAG.get():
+            logger.info(
+                "[DEBUG-CAN] can_run=%s num_not_used=%s pool_avail=%s",
+                len(can_run_list), num_not_used_batch,
+                self.req_to_token_pool.available_size(),
+            )
 
         set_time_batch(can_run_list, "set_forward_entry_time")
 
@@ -2916,10 +2918,11 @@ class SchedulerDisaggregationDecodeMixin:
             self.enable_overlap,
             self.spec_algorithm,
         )
-        logger.info(
-            "[DEBUG-INIT] init_new_reqs=%s can_run=%s",
-            len(new_batch.reqs), len(can_run_list),
-        )
+        if envs.SGLANG_DEBUG_DIAG.get():
+            logger.info(
+                "[DEBUG-INIT] init_new_reqs=%s can_run=%s",
+                len(new_batch.reqs), len(can_run_list),
+            )
 
         # construct fake completed prefill
         new_batch.prepare_for_prebuilt()

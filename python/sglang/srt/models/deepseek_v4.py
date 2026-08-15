@@ -2315,12 +2315,13 @@ class DeepseekV4Model(nn.Module):
         if dspark_layers_to_capture is None:
             dspark_layers_to_capture = self.dspark_layers_to_capture
         capture_dspark = dspark_layers_to_capture is not None
-        if capture_dspark and dsa_use_prefill_cp(forward_batch):
-            raise NotImplementedError(
-                "DSpark aux hidden-state capture is not supported together with "
-                "DeepSeek-V4 prefill context parallelism (attn_cp_size > 1). Disable one "
-                "of them: DSpark static-verify is CP-off for v1."
-            )
+        # NOTE: DSpark aux capture IS supported under DSV4 prefill CP. Each CP
+        # rank captures hidden rows for its round-robin token shard inside the
+        # layer loop; after the loop we reassemble the full-sequence rows with
+        # the same cp_all_gather_rerange_output used for the final hidden
+        # states, so every rank ends up with identical full rows and the
+        # existing PD hidden pipeline (per-rank pool write -> owner-direct
+        # mooncake send -> decode drain) works unchanged.
         pd_aux_hidden_states: List[torch.Tensor] = list(
             incoming_pd_aux_hidden_states
         )
@@ -2379,6 +2380,21 @@ class DeepseekV4Model(nn.Module):
                 forward_batch,
                 torch.cuda.current_stream(),
             )
+            if capture_dspark and pd_aux_hidden_states:
+                # Reassemble each captured aux layer from round-robin CP shards
+                # into identical full-sequence rows on every rank (same helper
+                # as the final hidden states above). Chunked prefill bounds the
+                # per-forward row count (<= chunked_prefill_size), so the
+                # replicated transient is small.
+                pd_aux_hidden_states = [
+                    cp_all_gather_rerange_output(
+                        aux_hidden,
+                        self.cp_size,
+                        forward_batch,
+                        torch.cuda.current_stream(),
+                    )
+                    for aux_hidden in pd_aux_hidden_states
+                ]
 
         if not self.pp_group.is_last_rank:
             # Flatten 3D mHC tensor for PP IPC.

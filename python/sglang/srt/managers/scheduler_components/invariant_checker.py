@@ -456,6 +456,14 @@ class SchedulerInvariantChecker:
         return has_leak, messages
 
     def _check_tree_cache(self):
+        # sanity_check() is O(all tree nodes) multi-pass and has high latency
+        # (its own TODO admits this). On large decode-radix trees (DSV4
+        # hybrid-SWA: is_tree_cache() and is_hybrid_swa and supports_swa() are
+        # ALL true once --disaggregation-decode-enable-radix-cache is on), it
+        # runs on EVERY idle and drags decode throughput to ~1 tok/s — the
+        # "health 200 but stuck" signature. Debug-only; off by default.
+        if not envs.SGLANG_ENABLE_TREE_SANITY_CHECK.get():
+            return
         if (
             self.tree_cache.is_tree_cache()
             and (self.is_hybrid_swa and self.tree_cache.supports_swa())

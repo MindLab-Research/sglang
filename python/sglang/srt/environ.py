@@ -1019,6 +1019,16 @@ class Envs:
     # Verbose decode-radix diagnostics (match/insert/finish + pool accounting
     # canary) for the decode-side radix feature. Log marker: DRX-DIAG.
     SGLANG_DECODE_RADIX_DIAG = EnvBool(False)
+    # Hot-path diagnostic logs (DSP-STAGE/DSP-ACCEPT/DSP-WIN/DSP-ALLOC/
+    # DCP-XFER/DCP-PD-IDX/DEBUG-CAN/DEBUG-INIT/CACHE_UNFINISHED etc.) fire on
+    # EVERY decode step / request / chunk across 8 ranks (~1300 lines/s,
+    # 3-5ms/step of pure Python format+write tax). Off by default; enable only
+    # when debugging. Log markers: grep the same tags.
+    SGLANG_DEBUG_DIAG = EnvBool(False)
+    # Tree sanity_check() on idle is O(all nodes) multi-pass and very slow on
+    # large decode-radix trees (DSV4 hybrid-SWA) — it runs every idle and
+    # collapses decode throughput to ~1 tok/s. Debug-only; disabled by default.
+    SGLANG_ENABLE_TREE_SANITY_CHECK = EnvBool(False)
     SGLANG_OPT_USE_TRITON_FUSED_MHC = EnvBool(True)
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)

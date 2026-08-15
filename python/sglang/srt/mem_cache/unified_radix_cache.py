@@ -937,10 +937,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             cd = node.component_data[ComponentType.FULL]
             return cd.lock_ref if cd.value is not None else None
         if req.last_node is not None:
-            logger.warning(
-                f"CACHE_UNFINISHED rid={req.rid} last_node={req.last_node.id} "
-                f"lock_ref={_get_lr(req.last_node)} cache_protected={req.cache_protected_len}"
-            )
+            if envs.SGLANG_DEBUG_DIAG.get():
+                logger.warning(
+                    f"CACHE_UNFINISHED rid={req.rid} last_node={req.last_node.id} "
+                    f"lock_ref={_get_lr(req.last_node)} cache_protected={req.cache_protected_len}"
+                )
             self.dec_lock_ref(
                 req.last_node,
                 DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),

@@ -75,6 +75,12 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
         )
 
     server_args.enable_dsa_prefill_context_parallel = True
+    # The alias normalizer (_handle_prefill_cp_aliases) runs BEFORE this hook
+    # and may have set the MLA-path alias `enable_prefill_context_parallel`
+    # True (it cannot see the dsv4 backend yet). The two aliases are mutually
+    # exclusive in _handle_context_parallelism; NSA/DSA CP is the ONLY valid
+    # path for DeepSeekV4, so force-clear the MLA alias here.
+    server_args.enable_prefill_context_parallel = False
     server_args.dsa_prefill_cp_mode = "round-robin-split"
     server_args.enable_dp_attention = True
     server_args.moe_dense_tp_size = 1

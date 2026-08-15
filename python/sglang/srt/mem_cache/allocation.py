@@ -5,6 +5,8 @@ from collections import defaultdict
 from typing import TYPE_CHECKING, Optional
 
 import torch
+
+from sglang.srt.environ import envs
 import triton
 import triton.language as tl
 
@@ -594,9 +596,10 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
             (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
         )
 
-    import logging as _lg
-    _lg.getLogger(__name__).info(
-        f"[DSP-ALLOC] token_per_req={token_per_req} out_cache_loc[:8]={out_cache_loc[:8].tolist() if hasattr(out_cache_loc[:8], 'tolist') else out_cache_loc}"
+    if envs.SGLANG_DEBUG_DIAG.get():
+        import logging as _lg
+        _lg.getLogger(__name__).info(
+            f"[DSP-ALLOC] token_per_req={token_per_req} out_cache_loc[:8]={out_cache_loc[:8].tolist() if hasattr(out_cache_loc[:8], 'tolist') else out_cache_loc}"
         f" locs={locs[:2].tolist() if hasattr(locs, 'tolist') else locs}"
         f" req_pool={batch.req_pool_indices.tolist() if hasattr(batch.req_pool_indices, 'tolist') else batch.req_pool_indices}"
         f" spec={batch.spec_algorithm}"

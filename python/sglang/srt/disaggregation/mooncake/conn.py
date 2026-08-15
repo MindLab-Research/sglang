@@ -88,6 +88,16 @@ class TransferInfo:
     dcp_size: int = 1
     dcp_rank: int = 0
     spec_metadata: Optional[dict] = None
+    # Decode-side engine_rank (global TP rank). Used for diagonal PD-hidden
+    # pairing under prefill CP: when prefill's attn_tp is diluted by attn_cp
+    # (attn_tp_size=1, 8 CP ranks), decode's rank-mapping broadcasts every
+    # prefill sender to ALL decode ranks (required_dst_info_num=8). PD hidden
+    # must NOT be broadcast — each decode rank drains exactly one ordered
+    # stream per room, so 8 duplicate ready-notifications trip the
+    # "out of order" guard. Filter: only the req whose decode_engine_rank ==
+    # prefill_unique_rank carries the hidden payload + notification.
+    # -1 = legacy decode (frame absent) -> keep old behavior (send to all).
+    decode_engine_rank: int = -1
     # Note: always put the optional staging field at the final (it will be set through 'STAGING_RSP' pkg when needed)
     staging: Optional[StagingTransferInfo] = None
 
@@ -124,6 +134,13 @@ class TransferInfo:
                 _spec_metadata = json.loads(msg[11].decode("utf-8"))
             except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
                 pass
+        # Frame 12: decode engine_rank for diagonal PD-hidden pairing.
+        _decode_engine_rank = -1
+        if len(msg) > 12 and msg[12] not in (b"", None):
+            try:
+                _decode_engine_rank = int(msg[12].decode("ascii"))
+            except (ValueError, UnicodeDecodeError):
+                pass
         return cls(
             room=int(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
@@ -140,6 +157,7 @@ class TransferInfo:
             dcp_size=_dcp_size,
             dcp_rank=_dcp_rank,
             spec_metadata=_spec_metadata,
+            decode_engine_rank=_decode_engine_rank,
         )
 
 
@@ -1786,7 +1804,9 @@ class MooncakeKVManager(CommonKVManager):
                         _, skip_state = self._get_dsa_cache_transfer_skip_flags(
                             target_rank_registration_info
                         )
-                        if not skip_state:
+                        if not skip_state and (
+                            req.decode_engine_rank in (-1, prefill_unique_rank)
+                        ):
                             pd_hidden_expected += 1
 
                     waiting_for_ack = (
@@ -1831,6 +1851,17 @@ class MooncakeKVManager(CommonKVManager):
                                     req.mooncake_session_id in self.failed_sessions
                                 )
                             if session_failed:
+                                continue
+                            # Diagonal PD-hidden pairing: under prefill CP the
+                            # rank mapping broadcasts every prefill sender to
+                            # every decode rank; the hidden stream must be
+                            # single-sender per decode rank. Only the req whose
+                            # decode_engine_rank matches this sender carries the
+                            # hidden packet + ready notification (-1 = legacy).
+                            if req.decode_engine_rank not in (
+                                -1,
+                                prefill_unique_rank,
+                            ):
                                 continue
                             target_rank_registration_info = self.decode_kv_args_table[
                                 req.mooncake_session_id
@@ -2006,22 +2037,24 @@ class MooncakeKVManager(CommonKVManager):
                                 _orig_len = _n
                                 _transfer_indices = _transfer_indices[_mask]
                                 _dst_indices = (_dst_indices[_mask] // _dcp_size).astype(np.int32)
-                                logger.info(
-                                    f"[DCP-XFER] room={kv_chunk.room} dcp_rank={_dcp_rank}"
-                                    f" dcp_size={_dcp_size} cp_rank={self.attn_cp_rank}"
-                                    f" pages: {_orig_len}→{len(_transfer_indices)}"
-                                    f" src[0:3]={_transfer_indices[:3].tolist() if _orig_len>0 else []}"
-                                    f" dst[0:3]={_dst_indices[:3].tolist()}"
-                                    f" max_dst={int(_dst_indices.max()) if len(_dst_indices)>0 else -1}"
-                                )
+                                if envs.SGLANG_DEBUG_DIAG.get():
+                                    logger.info(
+                                        f"[DCP-XFER] room={kv_chunk.room} dcp_rank={_dcp_rank}"
+                                        f" dcp_size={_dcp_size} cp_rank={self.attn_cp_rank}"
+                                        f" pages: {_orig_len}→{len(_transfer_indices)}"
+                                        f" src[0:3]={_transfer_indices[:3].tolist() if _orig_len>0 else []}"
+                                        f" dst[0:3]={_dst_indices[:3].tolist()}"
+                                        f" max_dst={int(_dst_indices.max()) if len(_dst_indices)>0 else -1}"
+                                    )
                             else:
-                                logger.info(
-                                    f"[DCP-XFER-BROADCAST] room={kv_chunk.room} dcp_rank={_dcp_rank}"
-                                    f" dcp_size={_dcp_size} dsv4_kv_broadcast"
-                                    f" pages: {len(_transfer_indices)}"
-                                    f" src[0:3]={_transfer_indices[:3].tolist() if len(_transfer_indices)>0 else []}"
-                                    f" dst[0:3]={_dst_indices[:3].tolist() if len(_dst_indices)>0 else []}"
-                                )
+                                if envs.SGLANG_DEBUG_DIAG.get():
+                                    logger.info(
+                                        f"[DCP-XFER-BROADCAST] room={kv_chunk.room} dcp_rank={_dcp_rank}"
+                                        f" dcp_size={_dcp_size} dsv4_kv_broadcast"
+                                        f" pages: {len(_transfer_indices)}"
+                                        f" src[0:3]={_transfer_indices[:3].tolist() if len(_transfer_indices)>0 else []}"
+                                        f" dst[0:3]={_dst_indices[:3].tolist() if len(_dst_indices)>0 else []}"
+                                    )
 
                         if len(chunked_dst_kv_indice) < len(_transfer_indices):
                             logger.warning(
@@ -2345,6 +2378,14 @@ class MooncakeKVManager(CommonKVManager):
                     hidden_start = int(msg[3].decode("ascii"))
                     row_len = int(msg[4].decode("ascii"))
                     is_last_hidden_chunk = msg[5] == b"1"
+                    if envs.SGLANG_DEBUG_DIAG.get():
+                        logger.info(
+                            f"[PDH-RECV] engine_rank={self.kv_args.engine_rank} "
+                            f"rank_port={self.rank_port} room={room} "
+                            f"prefill_rank={prefill_rank} "
+                            f"start={hidden_start} row_len={row_len} "
+                            f"last={is_last_hidden_chunk}"
+                        )
                     dst_indices = (
                         list(np.frombuffer(msg[6], dtype=np.int32).astype(np.int64))
                         if len(msg[6]) > 0
@@ -2854,6 +2895,10 @@ class MooncakeKVReceiver(CommonKVReceiver):
                             if local_spec_metadata
                             else b""
                         ),
+                        # Frame 12: decode engine_rank — enables diagonal
+                        # PD-hidden pairing when prefill CP dilutes attn_tp
+                        # (see TransferInfo.decode_engine_rank).
+                        str(self.kv_mgr.kv_args.engine_rank).encode("ascii"),
                     ]
                 )
         self.init_time = time.time()

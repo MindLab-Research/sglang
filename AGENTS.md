@@ -305,3 +305,4 @@ rsync -avz --exclude='__pycache__' --exclude='*.pyc' "$SRC" root@<node>:"$DEST"
 | `docs/agent/b300-compile-fixes.md` | 三个编译层修复：DeepGEMM sm_103a nvcc wrapper、tilelang flock 跨进程锁、tilelang CCCL include |
 | `docs/agent/dspark-pd-deadlocks.md` | DSPARK PD 五个死锁修复链（专用 gloo group / 异常安全 poll / prefill 空分支补偿 / spec_info DSPARK 分支 / hidden materialize），py-spy 死锁形态识别方法 |
 | `docs/agent/decode-radix-swa.md` | DSV4 PD 双端 radix 全链路：为何 DSpark 必须两端同开、`swa_served_from_tree=False` 设计（树不持有 SWA）、四层 bug 修复链（hidden clamp / len-1 match / SWA validator / SWA 池泄漏）、诊断 env 与验证数据 |
+| `docs/agent/dsv4-cp-dspark.md` | DSV4 prefill CP + DSpark PD hidden 共存：三层修复链（hook flag 顺序 / aux hidden all-gather 重组 / decode_engine_rank 对角配对防 8 倍重复发送）、flag 语义辨析（V4 用 interleave 非 GLM layersplit）、SGLANG_DEBUG_DIAG 日志 gate、3.5× 长上下文实测数据 |

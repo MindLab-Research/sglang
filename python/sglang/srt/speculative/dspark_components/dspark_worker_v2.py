@@ -613,10 +613,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                 draft_tokens=draft_tokens,
                 confidence_tap=proposal.confidence_tap,
             )
-        print(
-            f"DSP-STAGE propose done bs={bs} draft_ids_n={draft_block_ids.shape if hasattr(draft_block_ids, 'shape') else 'NA'} confidence={'None' if confidence is None else confidence.shape}",
-            flush=True,
-        )
+        if envs.SGLANG_DEBUG_DIAG.get():
+            print(
+                f"DSP-STAGE propose done bs={bs} draft_ids_n={draft_block_ids.shape if hasattr(draft_block_ids, 'shape') else 'NA'} confidence={'None' if confidence is None else confidence.shape}",
+                flush=True,
+            )
 
         verify_token_budget = self._verify_planner.resolve_verify_token_budget(
             draft_input=draft_input,
@@ -654,10 +655,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             and self._simulate_acc_len <= 0
         )
         with self._observers.segment(InfoSegment.TARGET_VERIFY):
-            print(
-                f"DSP-STAGE verify start run_compact={run_compact} bs={bs} draft_ids_2d={list(verify_ids_2d.shape)} layout={'compact' if run_compact else 'non_compact'}",
-                flush=True,
-            )
+            if envs.SGLANG_DEBUG_DIAG.get():
+                print(
+                    f"DSP-STAGE verify start run_compact={run_compact} bs={bs} draft_ids_2d={list(verify_ids_2d.shape)} layout={'compact' if run_compact else 'non_compact'}",
+                    flush=True,
+                )
             if run_compact:
                 target_verify, hidden_strided = self._verify_executor.run_compact(
                     batch=batch,
@@ -742,12 +744,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             bonus_tokens=accept.bonus,
             new_seq_lens=accept.new_seq_lens,
         )
-        print(
-            f"DSP-ACCEPT bs={bs} commit_lens={accept.commit_lens.tolist() if hasattr(accept.commit_lens, 'tolist') else accept.commit_lens}"
-            f" out_tokens={accept.out_tokens.tolist() if hasattr(accept.out_tokens, 'tolist') else accept.out_tokens}"
-            f" bonus={accept.bonus.tolist() if hasattr(accept.bonus, 'tolist') else accept.bonus}",
-            flush=True,
-        )
+        if envs.SGLANG_DEBUG_DIAG.get():
+            print(
+                f"DSP-ACCEPT bs={bs} commit_lens={accept.commit_lens.tolist() if hasattr(accept.commit_lens, 'tolist') else accept.commit_lens}"
+                f" out_tokens={accept.out_tokens.tolist() if hasattr(accept.out_tokens, 'tolist') else accept.out_tokens}"
+                f" bonus={accept.bonus.tolist() if hasattr(accept.bonus, 'tolist') else accept.bonus}",
+                flush=True,
+            )
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=accept.out_tokens.reshape(-1),

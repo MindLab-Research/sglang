@@ -2101,6 +2101,14 @@ class SchedulerDisaggregationPrefillMixin:
                 if streaming_pd_hidden
                 else pd_hidden_state(req).src_indices,
             )
+            if envs.SGLANG_DEBUG_DIAG.get():
+                logger.info(
+                    f"[PDH-SEND] tp_rank={self.ps.tp_rank} rid={req.rid} "
+                    f"room={req.bootstrap_room} start={current_pd_hidden_start} "
+                    f"row_len={current_pd_hidden_row_len} "
+                    f"is_last={pd_hidden_state(req).current_is_last} "
+                    f"streaming={streaming_pd_hidden}"
+                )
         req.disagg_kv_sender.send(page_indices, state_indices)
         if has_current_pd_hidden and streaming_pd_hidden:
             pd_hidden_state(req).src_indices = None

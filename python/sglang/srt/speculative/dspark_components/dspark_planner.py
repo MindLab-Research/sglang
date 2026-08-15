@@ -840,12 +840,13 @@ def alloc_verify_window(
 ) -> VerifyWindow:
     prefix_lens = batch.seq_lens
     verify_w = verify_num_draft_tokens
-    import logging as _lg
-    _lg.getLogger(__name__).info(
-        f"[DSP-WIN] seq_lens={prefix_lens.tolist() if hasattr(prefix_lens, 'tolist') else prefix_lens}"
-        f" verify_w={verify_w} req_pool={batch.req_pool_indices.tolist() if hasattr(batch.req_pool_indices, 'tolist') else batch.req_pool_indices}"
-        f" fwd_iter={getattr(batch, 'forward_iter', None)}"
-    )
+    if envs.SGLANG_DEBUG_DIAG.get():
+        import logging as _lg
+        _lg.getLogger(__name__).info(
+            f"[DSP-WIN] seq_lens={prefix_lens.tolist() if hasattr(prefix_lens, 'tolist') else prefix_lens}"
+            f" verify_w={verify_w} req_pool={batch.req_pool_indices.tolist() if hasattr(batch.req_pool_indices, 'tolist') else batch.req_pool_indices}"
+            f" fwd_iter={getattr(batch, 'forward_iter', None)}"
+        )
     positions_2d = prefix_lens.unsqueeze(1) + block_pos_offsets
     verify_cache_loc = assign_extend_cache_locs_func(
         req_pool_indices=batch.req_pool_indices,
