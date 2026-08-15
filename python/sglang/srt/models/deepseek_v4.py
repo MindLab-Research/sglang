@@ -3005,6 +3005,18 @@ class DeepseekV4ForCausalLM(nn.Module):
                                     wgate = loaded_weight if is_wgate else cached_weight
                                     fused_weight = torch.cat([kv, wgate], dim=0)
                                     param_name = key + ".wkv_gate.weight"
+                                    if param_name not in params_dict:
+                                        # V4 Pro 0813: some layers have
+                                        # compress_ratio=0 (no compressor) but
+                                        # the checkpoint still ships compressor
+                                        # weights for them. Skip gracefully.
+                                        logger.debug(
+                                            "Skipping compressor weight for "
+                                            "layer without compressor module: "
+                                            f"{param_name}"
+                                        )
+                                        cache_compressor_weight.pop(key, None)
+                                        continue
                                     param = params_dict[param_name]
                                     weight_loader = auto_weight_loader(param)
                                     maybe_executor_submit(

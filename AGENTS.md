@@ -295,3 +295,12 @@ rsync -avz --exclude='__pycache__' --exclude='*.pyc' "$SRC" root@<node>:"$DEST"
 - **⛔ DSPARK PD 要求两端 radix 策略一致（2026-08-15）**：#31466 的握手检查 `DSpark hidden PD requires matching prefill/decode radix cache policies: prefill=True, decode=False` → 500。DSPARK PD 部署时 **prefill 必须去掉 HiCache/radix**（`--disable-radix-cache`，删 `--enable-hierarchical-cache --hicache-* --file-storage-path`；上游 #31466 自己的测试 `test_pd_prefill_dspark_rejects_hierarchical_cache` 正是这个约束）。prefill 备份在 `/root/start_v4_prefill.sh.bak_hicache`。
 - **⛔ tilelang JIT 并发编译崩溃（2026-08-15 修复，prefill 空闲后 16 并发崩的根因）**：tilelang 的 KernelCache 只用 `threading.Lock`（**进程内**），8 个 scheduler 是独立进程——空闲后首个并发请求 burst 让 8 rank 同时 cache-miss → 同时 `tilelang.lower`/`BuildTileLangCUDA` → 共享 staging 目录/disk cache 竞争 → **TVM C 层崩溃**（8 rank 齐崩，非死锁）。**修复**：patch 两端 `tilelang/cache/kernel_cache.py`（备份 `.orig`）——cache-miss 编译段包 `fcntl.flock` 跨进程文件锁（`.compile.flock`）+ 锁内 double-check `_load_kernel_from_disk`（先到的进程编译，后到的直接加载产物）。同时把 `SGLANG_DSV4_MHC_PREWARM` 从 0 改 1（load 时预热 mhc kernel，barrier 同步——锁 patch 后预热并发安全），把 JIT 编译移出 serving 路径。
 - **⛔ tilelang `cuda/atomic` 头文件缺失（2026-08-15 修复）**：tilelang 的 `lower.py` 只传 `-I TILELANG_TEMPLATE_PATH` 和 `-I CUTLASS_INCLUDE_DIR`，缺 `-I nvidia/cuda_cccl/include`（`cuda/atomic` 所在路径）。CUDA 13.2 的 nvcc 不自带 CCCL include（旧版自带）。**修复**：patch 两端 `tilelang/engine/lower.py`——在 options 列表里加 `"-I<venv>/lib/python3.12/site-packages/nvidia/cuda_cccl/include"`。三个编译问题都表现为 prefill crash → decode 报 `reconnect to 8998`（断连是后果非根因）。修复后 v39 验证 72/72 全通过（含 16 并发+abort 洪峰+空闲后 16 并发×2）。
+- **⛔ V4 Pro 0813 当前生产模型（2026-08-15）**：集群已切换到 `deepseek-v4-pro-0813`（FP4 expert + FP8 attention，853GB 官方权重）。**本地旧权重是第三方重打包变体**（config 全错 + 6-bit 两级缩放 tensor 1.5× 尺寸），官方权重在 `/root/dsv4_pro_official`（硬链接到运行目录），坏权重备份在 `_repacked_bad`。识别/部署方法见 `docs/agent/v4-pro-deploy.md`。decode 只加 `--speculative-algorithm DSPARK`（Pro 自带 DSpark head，不加 EAGLE flags）；MoE 用 `--moe-runner-backend flashinfer_mxfp4`（SM100 走 trtllm FP4 kernel）。>1M token 请求 400（agent 侧 token 估算偏差所致，非服务 bug）。
+
+## 8. 知识文件索引（docs/agent/）
+
+| 文件 | 内容 |
+|---|---|
+| `docs/agent/v4-pro-deploy.md` | V4 Pro 0813 部署全流程：集群拓扑、重打包 checkpoint 识别（HTTP Range 验证法）、官方权重下载/验证/替换、DSpark/FP4 配置、容量与 bench 数据 |
+| `docs/agent/b300-compile-fixes.md` | 三个编译层修复：DeepGEMM sm_103a nvcc wrapper、tilelang flock 跨进程锁、tilelang CCCL include |
+| `docs/agent/dspark-pd-deadlocks.md` | DSPARK PD 五个死锁修复链（专用 gloo group / 异常安全 poll / prefill 空分支补偿 / spec_info DSPARK 分支 / hidden materialize），py-spy 死锁形态识别方法 |
