@@ -352,6 +352,12 @@ class MooncakeKVManager(CommonKVManager):
     def _handle_pd_hidden_chunk_ack(
         self, room: int, prefill_rank: int, hidden_start: int
     ) -> None:
+        if envs.SGLANG_DEBUG_DIAG.get():
+            logger.info(
+                f"[PDH-ACK] prefill got ack rank_port={self.rank_port} "
+                f"room={room} prefill_rank={prefill_rank} "
+                f"start={hidden_start}"
+            )
         self.pd_hidden_events.handle_chunk_ack(room, prefill_rank, hidden_start)
 
     def pop_pd_hidden_ready_chunks(self, room: int) -> List[dict]:
@@ -368,6 +374,13 @@ class MooncakeKVManager(CommonKVManager):
         hidden_start: int,
         is_last_hidden_chunk: bool,
     ) -> None:
+        if envs.SGLANG_DEBUG_DIAG.get():
+            logger.info(
+                f"[PDH-ACK-SUBMIT] decode submitting ack engine_rank="
+                f"{self.kv_args.engine_rank} room={room} "
+                f"prefill_rank={prefill_rank} start={hidden_start} "
+                f"last={is_last_hidden_chunk} to={remote}:{dst_port}"
+            )
         self.pd_hidden_events.submit_chunk_ack(
             event=event,
             remote=remote,

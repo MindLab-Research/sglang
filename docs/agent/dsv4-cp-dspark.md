@@ -57,3 +57,30 @@ attn_cp_size=8`。**不支持 zigzag，只支持 interleave**。
 另：`SGLANG_ENABLE_TREE_SANITY_CHECK`（默认关）gate decode idle 的 radix
 `sanity_check()`——O(全树) 多遍，DSV4+decode-radix 首次满足触发条件，大树每次 idle 卡数秒
 （"health 200 但卡死"、吞吐塌到 0.81 tok/s 的根因）。
+
+## 6. ⛔ PD hidden 双侧 pool 必须配对（2026-08-15 深夜死锁修复）
+
+**streaming hidden 是配对滚动窗口协议**：decode recv pool（`SGLANG_PD_HIDDEN_RECV_POOL_TOKENS`，
+默认=max_prefill_tokens）决定窗口尺寸（dst_indices 长度）；prefill sender pool
+（`SGLANG_PD_HIDDEN_POOL_TOKENS`，默认同）必须装得下同尺寸窗口，且**源行只在对侧 ACK
+后才释放**（`Streaming source rows are released only after the matching hidden chunk ACK`）。
+
+**死锁链（撞过一次）**：只扩 decode pool（8192→65536）不扩 prefill（16384）→ 大请求
+窗口 65536 > prefill 池 → `hidden rows exceed prefill hidden pool capacity` 传输失败 →
+abort 后 decode 侧已占的 65536 行**不释放**（失败路径泄漏）→ 后续一切请求
+`PD decode hidden pool blocked prealloc: free_rows=0` → "发个请求把服务卡死"。
+
+**修复 = 两侧对齐 65536**（两端启动脚本 env；显存代价 prefill+decode 各 ~2.8GB，B300 可承受）：
+```bash
+# prefill 脚本: export SGLANG_PD_HIDDEN_POOL_TOKENS="65536"
+# decode  脚本: export SGLANG_PD_HIDDEN_RECV_POOL_TOKENS="65536"
+```
+验证（2026-08-16 00:00）：100K E2E 200/5.8s；**630K（真实场景）E2E 200/23.6s**；
+ACK 对账 SEND=480=ACK=480 完全闭环；事后小请求 0.55s。
+
+**已知残留**：传输失败路径的 decode 窗口行释放仍可疑（池对齐后失败本身罕见，未复现）；
+换 pool 尺寸时**两侧必须同时改**；验证大请求必须等端到端 200，不能只看 prefill 吞吐
+（"3.5× 全绿"曾是假阴性——出师表单窗口 + 吞吐采样都不触发多窗口 ACK 滚动）。
+
+ACK 链诊断（DIAG 开时）：`[PDH-SEND]`（prefill 发窗口）/`[PDH-RECV]`（decode 收通知）/
+`[PDH-ACK-SUBMIT]`（decode 发 ACK）/`[PDH-ACK]`（prefill 收 ACK），按 (rid,start) 对账即知断在哪跳。
