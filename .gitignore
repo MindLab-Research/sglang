@@ -290,3 +290,6 @@ python/sglang/srt/**/csgmv_configs/
 
 # Internal, non-published docs
 internal-docs/
+
+# xbot local agent config
+.xbot/

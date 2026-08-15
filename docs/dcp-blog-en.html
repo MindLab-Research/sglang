@@ -1,0 +1,961 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Page-Level 2D KV Resharding for DCP + PD Disaggregation + CP Layer-Split</title>
+<script>
+  MathJax = {
+    tex: { inlineMath: [['$', '$'], ['\\(', '\\)']], displayMath: [['$$', '$$'], ['\\[', '\\]']] },
+    svg: { fontCache: 'global' }
+  };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"></script>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&family=JetBrains+Mono:wght@400;500&family=Newsreader:ital,wght@0,400;0,600;1,400&display=swap');
+
+:root {
+  --bg: #0c0d10; --surface: #15171c; --surface2: #1a1d24; --border: rgba(255,255,255,0.06);
+  --text: #e8eaed; --text2: #b4b8c0; --dim: #6b7280;
+  --accent: #8ab4f8; --green: #81c995; --red: #f28b82; --yellow: #fdd663;
+  --purple: #c586f0; --cyan: #56c8d8; --orange: #f9a825;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background: var(--bg); color: var(--text);
+  font-family: 'DM Sans', 'Noto Sans SC', sans-serif;
+  line-height: 1.75; -webkit-font-smoothing: antialiased;
+}
+.container { max-width: 880px; margin: 0 auto; padding: 48px 24px 96px; }
+
+/* Header */
+.header { margin-bottom: 56px; }
+.header .eyebrow { font-family: 'JetBrains Mono', monospace; font-size: 0.72em; color: var(--accent); letter-spacing: 0.08em; text-transform: uppercase; margin-bottom: 12px; }
+.header h1 { font-family: 'Newsreader', serif; font-size: 2.1em; font-weight: 600; line-height: 1.3; margin-bottom: 12px; color: var(--text); }
+.header .subtitle { color: var(--text2); font-size: 1.05em; line-height: 1.6; max-width: 680px; }
+.header .meta { color: var(--dim); font-size: 0.78em; margin-top: 16px; font-family: 'JetBrains Mono', monospace; }
+.header .divider { height: 1px; background: linear-gradient(90deg, var(--accent), transparent); margin-top: 32px; }
+
+/* Typography */
+h2 { font-family: 'Newsreader', serif; font-size: 1.45em; font-weight: 600; margin: 56px 0 20px; color: var(--text); }
+h3 { font-size: 1.05em; font-weight: 700; margin: 28px 0 12px; color: var(--accent); font-family: 'DM Sans', sans-serif; }
+p { color: var(--text2); font-size: 0.95em; margin-bottom: 16px; line-height: 1.85; }
+p strong { color: var(--text); font-weight: 600; }
+ul, ol { color: var(--text2); font-size: 0.95em; margin: 8px 0 20px 24px; line-height: 1.85; }
+li { margin-bottom: 6px; }
+li strong { color: var(--text); }
+
+/* Cards */
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 16px; padding: 28px; margin: 24px 0; }
+.card h3 { margin-top: 0; }
+
+/* Formula */
+.formula { background: var(--surface2); border: 1px solid var(--border); border-radius: 12px; padding: 20px 24px; margin: 16px 0; overflow-x: auto; }
+.formula .label { color: var(--accent); font-size: 0.75em; font-family: 'JetBrains Mono', monospace; margin-bottom: 12px; letter-spacing: 0.04em; }
+
+/* Pseudocode */
+.pseudo { background: var(--surface2); border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin: 16px 0; font-family: 'JetBrains Mono', monospace; font-size: 0.84em; line-height: 1.7; color: var(--text2); overflow-x: auto; white-space: pre-wrap; word-wrap: break-word; }
+.pseudo .kw { color: var(--purple); }
+.pseudo .fn { color: var(--cyan); }
+.pseudo .cmt { color: var(--dim); font-style: italic; }
+
+/* Callouts */
+.info { background: rgba(138,180,248,0.06); border: 1px solid rgba(138,180,248,0.15); border-radius: 12px; padding: 16px 20px; font-size: 0.9em; color: var(--accent); margin: 16px 0; line-height: 1.75; }
+.warn { background: rgba(242,139,130,0.06); border: 1px solid rgba(242,139,130,0.15); border-radius: 12px; padding: 16px 20px; font-size: 0.9em; color: var(--red); margin: 16px 0; line-height: 1.75; }
+.success { background: rgba(129,201,149,0.06); border: 1px solid rgba(129,201,149,0.15); border-radius: 12px; padding: 16px 20px; font-size: 0.9em; color: var(--green); margin: 16px 0; line-height: 1.75; }
+
+/* Tables */
+table { width: 100%; border-collapse: collapse; margin: 16px 0; font-size: 0.88em; }
+th { text-align: left; padding: 10px 14px; border-bottom: 1px solid rgba(255,255,255,0.1); color: var(--accent); font-weight: 600; font-size: 0.85em; }
+td { padding: 10px 14px; border-bottom: 1px solid var(--border); color: var(--text2); }
+td strong { color: var(--text); }
+tr:hover td { background: rgba(255,255,255,0.02); }
+
+/* Footer */
+.footer { margin-top: 64px; padding-top: 24px; border-top: 1px solid var(--border); }
+.footer p { font-size: 0.8em; color: var(--dim); text-align: center; margin-bottom: 4px; }
+
+/* Animation containers */
+.anim-container { background: var(--surface); border: 1px solid var(--border); border-radius: 16px; padding: 24px; margin: 24px 0; }
+.anim-label { font-size: 0.82em; font-weight: 600; color: var(--accent); margin-bottom: 16px; font-family: 'JetBrains Mono', monospace; }
+.anim-controls { text-align: center; margin-top: 16px; }
+.anim-btn { padding: 6px 20px; border-radius: 8px; font-size: 0.8em; font-weight: 600; cursor: pointer; border: none; color: #fff; background: var(--accent); transition: all 0.2s; font-family: 'DM Sans', sans-serif; }
+.anim-btn:hover { background: var(--green); transform: translateY(-1px); }
+
+/* Page grid */
+.page-grid { display: flex; gap: 4px; flex-wrap: wrap; margin: 12px 0; }
+.page-cell { width: 38px; height: 32px; line-height: 32px; text-align: center; border-radius: 6px; font-size: 0.68em; font-weight: 700; color: #fff; transition: all 0.4s; border: 1px solid; }
+
+/* layers bar */
+.layer-bar { display: flex; gap: 3px; margin: 16px 0; flex-wrap: wrap; }
+.layer-cell { width: 24px; height: 30px; border-radius: 4px; transition: all 0.4s; font-size: 0.62em; text-align: center; line-height: 30px; color: #fff; font-weight: 700; flex: 0 0 auto; }
+
+/* Reshard matrix */
+.reshard-matrix { display: grid; grid-template-columns: 110px repeat(4, 1fr); gap: 3px; margin: 16px 0; }
+.reshard-matrix > div { padding: 10px 8px; text-align: center; font-size: 0.74em; border-radius: 6px; transition: all 0.4s; }
+.matrix-h { font-weight: 700; color: var(--accent); background: var(--surface2); }
+.matrix-l { color: var(--text2); text-align: right; font-weight: 600; background: var(--surface2); }
+
+/* Arch animation */
+.arch-box { opacity: 0.4; transition: all 0.5s; }
+.arch-box.active { opacity: 1; transform: scale(1.04); }
+.mini-pages { display: flex; gap: 1px; }
+.mini-page { width: 8px; height: 14px; border-radius: 2px; transition: all 0.3s; }
+.arch-arrow { transition: all 0.5s; }
+
+/* Stat highlight */
+.stat-highlight { display: inline-block; background: rgba(138,180,248,0.1); border: 1px solid rgba(138,180,248,0.2); border-radius: 6px; padding: 2px 8px; font-family: 'JetBrains Mono', monospace; font-size: 0.85em; color: var(--accent); }
+</style>
+</head>
+<body>
+<div class="container">
+
+<div class="header">
+  <div class="eyebrow">Systems · Inference Infrastructure</div>
+  <h1>Page-Level 2D KV Resharding for DCP + PD Disaggregation + CP Layer-Split</h1>
+  <div class="subtitle">When Prefill Layer-Split Meets Decode Sequence Sharding: Correctness Guarantees for Cross-Node KV Transfer</div>
+  <div class="meta">sglang b300-glm52 · GLM-5.2-FP8 · 256 experts · 78 layers · CP=8 (layer-split) + DCP=4 + EAGLE</div>
+  <div class="divider"></div>
+</div>
+
+<h2>1. Motivation</h2>
+
+<p>When loading 4 LoRA experts + GLM-5.2 FP8 weights + EAGLE draft model simultaneously, the available KV cache memory per GPU on the Decode side is severely limited. On B300 (Blackwell Ultra, 288GB HBM3e), <strong>DCP=1 (no sequence sharding) allows only ~1.17M tokens of KV cache per rank</strong> (EAGLE draft model consumes extra memory; ~2.0M without EAGLE). This severely limits Decode concurrency: when multiple long-context requests (e.g., 500K–1M tokens) arrive simultaneously, insufficient KV cache capacity causes request queuing and TTFT degradation.</p>
+
+<div class="info">
+<strong>Configuration Choice: CP=8 + DCP=4</strong>. After balancing memory vs speed, we adopt Prefill-side CP=8 (8 CP ranks, each holding 78/8≈10 layers) + Decode-side DCP=4 (4 DCP ranks, each holding 1/4 pages). CP=8 maximizes Prefill-side memory savings from layer splitting, while DCP=4 provides 4× KV capacity expansion on the Decode side with acceptable TPOT overhead (~5–15%).<strong>All examples in this paper use CP=8 + DCP=4, but the algorithm is fully general—$N_{cp}$ and $N_{dcp}$ can be independently configured to any value.</strong>
+</div>
+
+<div class="card">
+<h3>KV Cache Capacity vs DCP Scaling (Measured, B300 TP8, FP8, page size 64)</h3>
+<table>
+<tr><th>DCP</th><th>KV Cap (M tok, no EAGLE)</th><th>KV Cap (M tok, +EAGLE)</th><th>TPOT c1 (ms)</th><th>TPOT c16 (ms)</th><th>TPOT c32 (ms)</th><th>TPOT c1 +EAGLE (ms)</th></tr>
+<tr><td><strong>1</strong></td><td>2.00</td><td><strong>1.17</strong></td><td>27.9</td><td>36.4</td><td>48.2</td><td>—</td></tr>
+<tr><td><strong>2</strong></td><td>4.00</td><td>2.34</td><td>28.8</td><td>37.7</td><td>50.0</td><td>—</td></tr>
+<tr><td><strong>4</strong></td><td>8.00</td><td>4.67</td><td>29.3</td><td>38.6</td><td>51.6</td><td>—</td></tr>
+<tr><td><strong>8</strong></td><td>16.0</td><td>9.34</td><td>30.8</td><td>41.0</td><td>55.3</td><td><strong>8.6</strong></td></tr>
+</table>
+<p style="font-size:0.82em; color: var(--dim); margin-top: 12px;">With DCP=1 + EAGLE, KV capacity is only 1.17M tokens; DCP=4 scales to 4.67M (4×), DCP=8 to 9.34M (8×). TPOT overhead is only ~5–15% (DCP1→DCP8), while EAGLE at DCP8 reduces TPOT from 30.8ms to 8.6ms (3.6×).</p>
+</div>
+
+<p>The core value of DCP: <strong>with $N$ DCP ranks, KV cache capacity scales linearly by $N$×</strong>, while TPOT increases only ~5–15%. This means DCP=4 can serve 4× more concurrent long-context requests on the same hardware with minimal latency cost. EAGLE speculative decoding further reduces TPOT: at DCP=8, EAGLE brings TPOT from <span class="stat-highlight">30.8ms</span> down to <span class="stat-highlight">8.6ms</span> (3.6× speedup), achieving low latency while maintaining high concurrency.</p>
+
+<div class="info">
+<strong>Technical Challenge</strong>: DCP shards the sequence by page across multiple ranks on the Decode side, while the Prefill side uses CP Layer-Split (by layer). The two sharding dimensions are orthogonal, requiring <strong>page-level 2D reshard</strong> for KV transfer—simultaneously rearranging both layer and sequence dimensions, with correctness guarantees for cross-rank collectives (rank-invariant gates + size-broadcast + consensus prefix).
+</div>
+
+<h2>2. Problem Statement</h2>
+
+<p>In PD disaggregated inference, Prefill and Decode run on separate nodes, with KV cache transferred via mooncake RDMA. The two sides shard KV along orthogonal dimensions, forming a <strong>2D reshard</strong> problem:</p>
+
+<table>
+<tr><th>Dimension</th><th>Prefill (CP Layer-Split)</th><th>Decode (DCP)</th></tr>
+<tr><td><strong>Shard axis</strong></td><td><strong>Layers</strong>(layer dimension)</td><td><strong>Sequence</strong>(page dimension)</td></tr>
+<tr><td><strong>Per-rank holdings</strong></td><td>All pages × owned 1/8 layers</td><td>1/4 pages × all 78 layers</td></tr>
+<tr><td><strong>CP size</strong></td><td>8 (78 layers in 8 groups: 10×6+9×2)</td><td>4(page by page_idx % 4)</td></tr>
+<tr><td><strong>Transfer granularity</strong></td><td colspan="2"><strong>page-level</strong>(64 tokens/page, physical page_size)</td></tr>
+</table>
+
+<p>Let the Prefill side have $N_{cp}$ CP ranks and the Decode side have $N_{dcp}$ DCP ranks. Each Prefill CP rank $r$ holds layer set $\mathcal{L}_r \subset \{0, \ldots, 77\}$ and all pages $\mathcal{P}_{\text{full}}$. Each Decode DCP rank $d$ holds page subset $\mathcal{P}_d = \{p \mid p \bmod N_{dcp} = d\}$ and all layers. Transfer target: for each path $(r, d)$, transfer $\mathcal{L}_r \times \mathcal{P}_d$ KV from Prefill rank $r$ to Decode rank $d$.</p>
+
+<div class="formula">
+<div class="label">2D Reshard Target</div>
+$$\forall r \in [0, N_{cp}), \; \forall d \in [0, N_{dcp}): \quad \text{Transfer}(\mathcal{L}_r, \; \mathcal{P}_d, \; r \to d)$$
+</div>
+
+<h2>3. Architecture Overview</h2>
+
+<div class="anim-container" style="padding: 28px;">
+  <div class="anim-label">📡 2D Reshard architecture animation: Physical GPU layout + CP by layer × DCP by page → interleaved transfer</div>
+  <div style="display: flex; justify-content: center; align-items: flex-start; gap: 16px; flex-wrap: wrap;">
+    <!-- Prefill node -->
+    <div style="text-align: center;">
+      <div style="font-size: 0.72em; font-weight: 700; color: var(--accent); margin-bottom: 8px; font-family: 'JetBrains Mono', monospace;">PREFILL NODE<br><span style="color:var(--dim);font-weight:400;">8 GPUs (TP=8) → 8 CP Ranks</span></div>
+      <!-- GPU card layout: 8 GPUs in 2 rows, grouped by CP rank -->
+      <div id="pf-gpu-grid" style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; margin-bottom: 8px;"></div>
+      <!-- KV grid: layers (rows) × pages (cols) -->
+      <div style="font-size: 0.58em; color: var(--dim); margin-bottom: 4px;">KV Layout: Layers (rows) × Pages (cols)</div>
+      <div id="pf-grid" style="display: grid; grid-template-columns: 24px repeat(8, 26px); gap: 2px;"></div>
+      <div style="font-size: 0.55em; color: var(--dim); margin-top: 6px;">Horizontal bands = CP by layer<br>Each CP rank holds all pages</div>
+    </div>
+    <!-- Transfer -->
+    <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 200px; gap: 8px;">
+      <div id="xfer-label" style="font-size: 0.62em; color: var(--yellow); font-weight: 700; text-align: center; font-family: 'JetBrains Mono', monospace; transition: all 0.5s; max-width: 120px;">
+        filter<br>p%4=d<br>→ ⌊p/4⌋
+      </div>
+      <div id="xfer-arrow" style="font-size: 1.8em; color: var(--dim); transition: all 0.5s;">→</div>
+      <div style="font-size: 0.55em; color: var(--purple); font-family: 'JetBrains Mono', monospace; text-align: center;">RDMA<br>64 tok/page</div>
+    </div>
+    <!-- Decode node -->
+    <div style="text-align: center;">
+      <div style="font-size: 0.72em; font-weight: 700; color: var(--green); margin-bottom: 8px; font-family: 'JetBrains Mono', monospace;">DECODE NODE<br><span style="color:var(--dim);font-weight:400;">8 GPUs (TP=8) → 4 DCP Ranks</span></div>
+      <!-- GPU card layout: 8 GPUs in 2 rows, grouped by DCP rank -->
+      <div id="dc-gpu-grid" style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; margin-bottom: 8px;"></div>
+      <!-- KV grid -->
+      <div style="font-size: 0.58em; color: var(--dim); margin-bottom: 4px;">KV Layout: Layers (rows) × Pages (cols)</div>
+      <div id="dc-grid" style="display: grid; grid-template-columns: 24px repeat(8, 26px); gap: 2px;"></div>
+      <div style="font-size: 0.55em; color: var(--dim); margin-top: 6px;">Vertical bands = DCP by page<br>Each DCP rank holds all layers</div>
+    </div>
+  </div>
+  <!-- Legend -->
+  <div style="display: flex; justify-content: center; gap: 12px; margin-top: 16px; flex-wrap: wrap;">
+    <div style="display:flex;align-items:center;gap:4px;"><div style="width:12px;height:12px;background:#8ab4f8;border-radius:3px;"></div><span style="font-size:0.72em;color:var(--text2);">CP0/DCP0</span></div>
+    <div style="display:flex;align-items:center;gap:4px;"><div style="width:12px;height:12px;background:#81c995;border-radius:3px;"></div><span style="font-size:0.72em;color:var(--text2);">CP1/DCP1</span></div>
+    <div style="display:flex;align-items:center;gap:4px;"><div style="width:12px;height:12px;background:#c586f0;border-radius:3px;"></div><span style="font-size:0.72em;color:var(--text2);">CP2/DCP2</span></div>
+    <div style="display:flex;align-items:center;gap:4px;"><div style="width:12px;height:12px;background:#f9a825;border-radius:3px;"></div><span style="font-size:0.72em;color:var(--text2);">CP3/DCP3</span></div>
+    <div style="display:flex;align-items:center;gap:4px;"><div style="width:12px;height:12px;background:#f28b82;border-radius:3px;"></div><span style="font-size:0.72em;color:var(--text2);">CP4</span></div>
+    <div style="display:flex;align-items:center;gap:4px;"><div style="width:12px;height:12px;background:#56c8d8;border-radius:3px;"></div><span style="font-size:0.72em;color:var(--text2);">CP5</span></div>
+    <div style="display:flex;align-items:center;gap:4px;"><div style="width:12px;height:12px;background:#fdd663;border-radius:3px;"></div><span style="font-size:0.72em;color:var(--text2);">CP6</span></div>
+    <div style="display:flex;align-items:center;gap:4px;"><div style="width:12px;height:12px;background:#c586f0;border-radius:3px;"></div><span style="font-size:0.72em;color:var(--text2);">CP7</span></div>
+  </div>
+  <div style="text-align: center; margin-top: 12px; font-size: 0.72em; color: var(--text2); font-family: 'JetBrains Mono', monospace;">
+    <span id="arch-status">Animation: 32 paths cycling(8 CP × 4 DCP), highlighting current 2D cross-block + corresponding physical GPUs</span>
+  </div>
+  <div class="anim-controls">
+    <button class="anim-btn" id="arch-btn" onclick="toggleAnim()">⏸ Pause</button>
+  </div>
+</div>
+
+<style>
+.grid-cell { width: 26px; height: 22px; border-radius: 3px; transition: all 0.4s; }
+.grid-label { font-size: 0.55em; color: var(--dim); text-align: right; padding-right: 4px; line-height: 22px; font-family: 'JetBrains Mono', monospace; }
+.gpu-card { border-radius: 6px; padding: 6px 4px; text-align: center; transition: all 0.4s; border: 1.5px solid; }
+.gpu-card .gpu-label { font-size: 0.55em; font-weight: 700; font-family: 'JetBrains Mono', monospace; }
+.gpu-card .gpu-rank { font-size: 0.5em; }
+</style>
+
+<p><strong>Transfer Path</strong>: each Prefill CP rank $r$ iterates over its owned layers $\mathcal{L}_r$, applies page-level DCP filtering to all pages per layer, and writes via mooncake RDMA to the target Decode DCP rank $d$'s local physical page slots. $N_{cp}$ CP ranks cover all 78 layers, $N_{dcp}$ DCP ranks cover all pages. <strong>Left: horizontal bands = CP by layer (per-rank holds all pages). Right: vertical bands = DCP by page (per-rank holds all layers). Highlighted 2D cross-block during transfer = current $(r, d)$ path's KV data.</strong></p>
+
+<h2>4. CP Layer-Split (Prefill Side)</h2>
+
+<h3>4.1 Layer Assignment</h3>
+
+<p>78 Transformer layers are contiguously partitioned across CP ranks. $\lfloor 78/8 \rfloor = 9$, remainder $78 \bmod 8 = 6$; the first 6 ranks get 10 layers ($9+1$), the last 2 get 9:</p>
+
+<div class="formula">
+<div class="label">Layer Range</div>
+$$\mathcal{L}_r = \left[ r \cdot \left\lceil \frac{L}{N_{cp}} \right\rceil, \;\; (r+1) \cdot \left\lceil \frac{L}{N_{cp}} \right\rceil \right), \quad r = 0, \ldots, N_{cp}-1$$
+</div>
+
+<div class="pseudo">
+<span class="cmt"># Layer assignment: 78 layers → 8 CP ranks</span>
+<span class="kw">function</span> <span class="fn">cp_layersplit_layer_range</span>(N_layers, N_cp, r):
+    per ← N_layers <span class="kw">div</span> N_cp    <span class="cmt"># 78 / 8 = 9 (remainder 6)</span>
+    <span class="kw">return</span> [r × per, (r+1) × per)   <span class="cmt"># half-open interval</span>
+
+<span class="cmt"># Result:</span>
+<span class="cmt"># Rank 0: L[0, 10)   → 10 layers</span>
+<span class="cmt"># Rank 1: L[10, 20)  → 10 layers</span>
+<span class="cmt"># Rank 2: L[20, 30)  → 10 layers</span>
+<span class="cmt"># Rank 3: L[30, 40)  → 10 layers
+# Rank 4: L[40, 50)  → 10 layers
+# Rank 5: L[50, 60)  → 10 layers
+# Rank 6: L[60, 69)  → 9 layers (remainder)
+# Rank 7: L[69, 78)  → 9 layers (remainder)</span>
+
+<span class="cmt"># KV pool: per+1 slots per rank (owned layers + 1 transient for broadcast)</span>
+<span class="kw">function</span> <span class="fn">local_layer_count</span>(N_layers, N_cp, r):
+    [start, end) ← <span class="fn">cp_layersplit_layer_range</span>(N_layers, N_cp, r)
+    <span class="kw">return</span> (end - start) + 1   <span class="cmt"># +1 = transient slot</span>
+</div>
+
+<div class="anim-container">
+  <div class="anim-label">78 Layers → 8 CP Rank Assignment (highlighting current rank's layers)</div>
+  <div class="layer-bar" id="layer-bar"></div>
+  <div style="display: flex; gap: 20px; margin-top: 12px; flex-wrap: wrap;">
+    <div style="display:flex;align-items:center;gap:6px;"><div style="width:14px;height:14px;background:#8ab4f8;border-radius:3px;"></div><span style="font-size:0.78em;color:var(--text2);">CP0: L0-9</span></div>
+    <div style="display:flex;align-items:center;gap:6px;"><div style="width:14px;height:14px;background:#81c995;border-radius:3px;"></div><span style="font-size:0.78em;color:var(--text2);">CP1: L10-19</span></div>
+    <div style="display:flex;align-items:center;gap:6px;"><div style="width:14px;height:14px;background:#c586f0;border-radius:3px;"></div><span style="font-size:0.78em;color:var(--text2);">CP2: L20-29</span></div>
+    <div style="display:flex;align-items:center;gap:6px;"><div style="width:14px;height:14px;background:#f9a825;border-radius:3px;"></div><span style="font-size:0.78em;color:var(--text2);">CP3: L30-39</span></div>
+    <div style="display:flex;align-items:center;gap:6px;"><div style="width:14px;height:14px;background:#f28b82;border-radius:3px;"></div><span style="font-size:0.78em;color:var(--text2);">CP4: L40-49</span></div>
+    <div style="display:flex;align-items:center;gap:6px;"><div style="width:14px;height:14px;background:#56c8d8;border-radius:3px;"></div><span style="font-size:0.78em;color:var(--text2);">CP5: L50-59</span></div>
+    <div style="display:flex;align-items:center;gap:6px;"><div style="width:14px;height:14px;background:#fdd663;border-radius:3px;"></div><span style="font-size:0.78em;color:var(--text2);">CP6: L60-68</span></div>
+    <div style="display:flex;align-items:center;gap:6px;"><div style="width:14px;height:14px;background:#c586f0;border-radius:3px;"></div><span style="font-size:0.78em;color:var(--text2);">CP7: L69-77</span></div>
+  </div>
+</div>
+
+<h3>4.2 Prefix KV Broadcast: Size-Broadcast Protocol</h3>
+
+<p>Non-owner ranks need prefix KV from the owner rank. HiCache local-only prefetch may cause prefix lengths to differ across ranks. The size-broadcast protocol ensures all ranks participate in the same number of NCCL broadcasts:</p>
+
+<div class="formula">
+<div class="label">Size-Broadcast Protocol</div>
+$$n = |\text{slots}_{\text{owner}}| \quad \text{(broadcast } n \text{ to all ranks first)}$$
+$$\text{if } n = 0: \;\; \forall r: \text{skip} \quad (\text{consistent})$$
+$$\text{if } n > 0: \;\; \forall r: \text{broadcast } n \text{ KV elements} \quad (\text{all ranks participate})$$
+</div>
+
+<div class="pseudo">
+<span class="kw">function</span> <span class="fn">broadcast_owner_layer_prefix</span>(layer_id, forward_batch, kind):
+    owner ← <span class="fn">cp_layersplit_owner_rank</span>(layer_id, ...)
+    prefix_lens ← forward_batch.extend_prefix_lens_cpu
+
+    <span class="cmt"># None guard: normalize to zeros (prevent per-rank None divergence)</span>
+    <span class="kw">if</span> prefix_lens = <span class="kw">None</span>:
+        prefix_lens ← zeros(len(req_pool_indices))
+
+    <span class="cmt"># Step 1: compute element count</span>
+    count ← |prefix_slots|
+
+    <span class="cmt"># Step 2: broadcast count to ALL ranks (1-element, mandatory)</span>
+    n_tensor ← tensor([count])
+    <span class="fn">broadcast</span>(n_tensor, src=owner, group=cp_group)
+    n ← n_tensor.item()
+
+    <span class="cmt"># Step 3: consistent skip or consistent broadcast</span>
+    <span class="kw">if</span> n = 0: <span class="kw">return</span>   <span class="cmt"># ALL ranks skip</span>
+    <span class="cmt"># Step 4-5: broadcast n KV elements; non-owner writes to transient_pool</span>
+</div>
+
+<h2>5. DCP (Decode Side)</h2>
+
+<h3>5.1 Page-Level Round-Robin Sharding</h3>
+
+<p>Decode-side KV cache is allocated in <strong>pages (64 tokens each)</strong> via round-robin. The DCP allocator size is $M \times N_{dcp}$ (virtual slots), with each DCP rank holding $1/N_{dcp}$ of pages:</p>
+
+<div class="formula">
+<div class="label">DCP Page Ownership</div>
+$$\text{owner}(p) = p \bmod N_{dcp}, \quad p \in \{0, \ldots, M \cdot N_{dcp} - 1\}$$
+$$\text{slot}_{\text{local}}(p) = \left\lfloor \frac{p}{N_{dcp}} \right\rfloor \in \{0, \ldots, M - 1\}$$
+</div>
+
+<div class="anim-container">
+  <div class="anim-label">Page Sharding Animation(16 pages → 4 DCP ranks, page_idx % 4)</div>
+  <div style="font-size:0.82em;color:var(--text2);margin-bottom:8px;">Original pages (page_idx 0-15, each page = 64 tokens):</div>
+  <div class="page-grid" id="page-grid"></div>
+  <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:10px;margin-top:16px;" id="dcp-ranks"></div>
+</div>
+
+<h3>5.2 DCP Attention: All-Gather + LSE Merge</h3>
+
+<p>Each DCP rank holds only $1/N_{dcp}$ of KV pages; attention output requires all-gather + LSE merge to combine:</p>
+
+<div class="formula">
+<div class="label">DCP Attention Output Correction</div>
+$$O_{\text{full}} = \text{AllGather}(O_{\text{local}}) \quad \text{(concat along seq dim)}$$
+$$\text{LSE}_{\text{merged}} = \log\!\left(\sum_{d=0}^{N_{dcp}-1} \exp(\text{LSE}_d)\right) \quad \text{(merge across DCP ranks)}$$
+</div>
+
+<h3>5.3 Communication Overhead Analysis</h3>
+
+<p>DCP introduces two sources of communication overhead per decode step:</p>
+
+<div class="card">
+<h3>Overhead Breakdown (DCP=4, TP=8, 78 layers)</h3>
+<table>
+<tr><th>Operation</th><th>Frequency</th><th>Volume per step</th><th>Impact</th></tr>
+<tr><td><strong>All-gather KV</strong></td><td>Per attention layer</td><td>~78 × (hidden_dim × seq_len / N_dcp) bytes</td><td>~3× extra KV read vs DCP=1</td></tr>
+<tr><td><strong>LSE merge</strong></td><td>Per attention layer</td><td>N_dcp scalars (negligible)</td><td>O(N_dcp) all-reduce</td></tr>
+<tr><td><strong>PD transfer (2D reshard)</strong></td><td>Per request (prefill→decode)</td><td>Full KV × 1/N_dcp pages per path</td><td>32 paths (8 CP × 4 DCP), <strong>parallel</strong> via mooncake RDMA</td></tr>
+</table>
+<p style="font-size:0.82em; color: var(--dim); margin-top: 12px;">
+The 32 PD transfer paths execute <strong>in parallel</strong>—each Prefill CP rank independently sends to each Decode DCP rank via mooncake RDMA, so transfer latency ≈ single-path latency (not 32×). The dominant overhead is the per-step all-gather in DCP attention, which grows linearly with N_dcp but is amortized by EAGLE's speculative decoding (5 steps × 6 draft tokens = 30 tokens verified per step, with accept rate ~39% reducing effective decode steps).
+</p>
+</div>
+
+<p><strong>TTFT impact</strong>: PD disaggregation adds one RTT for KV transfer (mooncake RDMA, ~0.5-2ms for typical 4K-32K token sequences). The 2D reshard adds page-level filtering overhead (~0.1ms for 256 pages × 4 DCP ranks), negligible compared to prefill compute time. Measured TTFT on B300: 0.38s (DCP=4, 1K input) to 1.7s (DCP=4, 32K input), dominated by prefill compute, not transfer. For 500K+ token sequences, DCP=4's 4× KV capacity is essential—a single 500K request consumes ~7.8K pages, exceeding DCP=1's 1.17M token capacity per rank.</p>
+
+<h2>6. Page-Level 2D Resharding (Core)</h2>
+
+<h3>6.1 Design Evolution: From Token-Level to Transfer-Time Sharding</h3>
+
+<p>The current design—page-level sharding during RDMA transfer—was not the initial approach. The design went through two iterations:</p>
+
+<ul>
+<li><strong>Initial approach: decouple sharding from transfer</strong>. The original idea was to shard KV at the token level for maximum flexibility, and keep the sharding logic separate from the PD transfer. Concretely, Prefill would transfer the full, unsharded KV to Decode via RDMA, then Decode would run an <code>inplace_shard_dcp</code> pass to redistribute tokens into the DCP rank layout. This is simple to reason about—the transfer knows nothing about DCP—but wasteful: the full sequence is transferred to every DCP rank (each rank receives $N_{dcp}\times$ the data it needs), only to discard $\frac{N_{dcp}-1}{N_{dcp}}$ of it during the in-place reshard.</li>
+<li><strong>Final design: shard during transfer</strong>. We realized that the transfer itself is the natural sharding point. Since mooncake RDMA operates at <strong>page granularity</strong> (the physical page_size = 64 tokens), and DCP already shards by page (<code>owner(p) = p mod N_dcp</code>), we can filter page indices <em>before</em> the RDMA write—sending only the $1/N_{dcp}$ pages each DCP rank actually needs. The RDMA write lands directly in the correct DCP-local slot, eliminating the post-transfer reshard entirely (<code>dcp_kv_shard_pages = None</code>).</li>
+</ul>
+
+<div class="info">
+<strong>Key insight</strong>: The transfer unit <em>is</em> the sharding unit. Because RDMA transfers at page granularity and DCP shards by page, filtering at the source (Prefill) naturally produces the correct destination (Decode) layout—no intermediate full-sequence copy, no post-processing. The sharding is not a separate step; it is the transfer itself.
+</div>
+
+<h3>6.2 Page Index Filter</h3>
+
+<p>This is the core of 2D reshard. Before RDMA send, the Prefill side applies DCP filtering to <strong>page indices</strong> per layer:</p>
+
+<div class="formula">
+<div class="label">filter_kv_indices_for_dcp_rank</div>
+$$\text{mask}(p, d) = \mathbb{1}\!\left[p \bmod N_{dcp} = d\right]$$
+$$\text{filtered}(p, d) = \left\lfloor \frac{p}{N_{dcp}} \right\rfloor \quad \text{(compress to local slot)}$$
+$$\mathcal{P}_{r \to d} = \left\{ \left\lfloor \frac{p}{N_{dcp}} \right\rfloor \;\middle|\; p \in \mathcal{P}_{\text{full}}, \; p \bmod N_{dcp} = d \right\}$$
+</div>
+
+<div class="pseudo">
+<span class="cmt"># Input:  kv_indices = prefill-side global logical page indices (full set)</span>
+<span class="cmt"># Output: only pages owned by DCP rank d, mapped to local physical slots</span>
+<span class="kw">function</span> <span class="fn">filter_kv_indices_for_dcp_rank</span>(kv_indices, N_dcp, d):
+    <span class="kw">if</span> N_dcp ≤ 1: <span class="kw">return</span> kv_indices
+    mask ← kv_indices <span class="kw">mod</span> N_dcp = d       <span class="cmt"># page ownership test</span>
+    <span class="kw">return</span> kv_indices[mask] <span class="kw">div</span> N_dcp    <span class="cmt"># compress to local slot</span>
+</div>
+
+<div class="info">
+<strong>Correctness Guarantee</strong>: <br>
+① <code>kv_indices</code> are prefill-side global logical page indices (slot = pos, DCP allocator size = $M \times N_{dcp}$)<br>
+② <code>mask = page_idx % N_dcp == d</code>: keep only pages belonging to the target decode rank<br>
+③ <code>// N_dcp</code>: compress global page slot to decode-side local physical page slot<br>
+④ RDMA write lands directly in decode's DCP sharded layout, <strong>no post-processing needed</strong>
+</div>
+
+<h3>6.3 Mooncake Transfer with DCP Reshard</h3>
+
+<p>In the mooncake connector's transfer worker loop, each <code style="font-family:'JetBrains Mono',monospace;font-size:0.85em;color:var(--cyan);">TransferInfo</code> carries the target decode rank's $N_{dcp}$ and $d$. The Prefill side applies DCP filtering to each layer's page indices before sending:</p>
+
+<div class="pseudo">
+<span class="cmt"># mooncake/conn.py — transfer worker loop (per layer, per TransferInfo)</span>
+N_dcp ← req.dcp_size        <span class="cmt"># from bootstrap metadata</span>
+d     ← req.dcp_rank        <span class="cmt"># = decode tp_rank % N_dcp</span>
+
+<span class="kw">if</span> N_dcp > 1:
+    <span class="cmt"># DCP reshard: filter by decode-side page VALUE parity</span>
+    mask ← dst_indices <span class="kw">mod</span> N_dcp = d
+    transfer_indices ← transfer_indices[mask]
+    dst_indices ← (dst_indices[mask] <span class="kw">div</span> N_dcp).astype(int32)
+    <span class="cmt"># Log: [DCP-XFER] pages: 256→64 (1/4 of full sequence)</span>
+
+<span class="cmt"># RDMA write: src=prefill_kv[owned_layer][transfer_indices]</span>
+<span class="cmt">#            dst=decode_kv[local_slot][dst_indices]</span>
+<span class="fn">send_kvcache</span>(session_id, transfer_blocks)
+</div>
+
+<h3>6.4 Transfer Page Size</h3>
+
+<p>Under DCP, PD transfer uses <strong>physical page_size (64)</strong>, not the allocator's virtual page_size ($64 \times N_{dcp} = 256$):</p>
+
+<div class="formula">
+<div class="label">Page Size Selection</div>
+$$P_{\text{transfer}} = \begin{cases} P_{\text{phys}} = 64 & \text{if DCP} \\ P_{\text{virt}} = 64 \times N_{dcp} & \text{otherwise} \end{cases}$$
+</div>
+
+<div class="pseudo">
+<span class="cmt"># decode.py — DCP transfer page size</span>
+<span class="kw">if</span> <span class="fn">dcp_enabled</span>():
+    <span class="cmt"># Use physical page_size (64) for PD transfer</span>
+    <span class="cmt"># PD transfer writes full 64-token pages in contiguous layout</span>
+    kv_transfer_page_size ← token_to_kv_pool.page_size   <span class="cmt"># 64</span>
+    <span class="cmt"># PD transfer with conn.py rank-filtering + //dcp mapping</span>
+    <span class="cmt"># writes KV directly to DCP page layout. No inplace_shard_dcp needed.</span>
+    decode_req.dcp_kv_shard_pages ← <span class="kw">None</span>   <span class="cmt"># skip post-transfer reshard</span>
+</div>
+
+<h3>6.5 2D Reshard Matrix</h3>
+
+<div class="anim-container">
+  <div class="anim-label">2D Reshard Matrix: $N_{cp}$ × $N_{dcp}$ = 32 transfer paths(highlighting current path)</div>
+  <div class="reshard-matrix" id="reshard-matrix">
+    <div class="matrix-h"></div>
+    <div class="matrix-h">DCP 0</div>
+    <div class="matrix-h">DCP 1</div>
+    <div class="matrix-h">DCP 2</div>
+    <div class="matrix-h">DCP 3</div>
+    <div class="matrix-l">CP 0<br>L0-9</div>
+    <div class="matrix-c" id="rm-0-0"></div><div class="matrix-c" id="rm-0-1"></div><div class="matrix-c" id="rm-0-2"></div><div class="matrix-c" id="rm-0-3"></div>
+    <div class="matrix-l">CP 1<br>L10-19</div>
+    <div class="matrix-c" id="rm-1-0"></div><div class="matrix-c" id="rm-1-1"></div><div class="matrix-c" id="rm-1-2"></div><div class="matrix-c" id="rm-1-3"></div>
+    <div class="matrix-l">CP 2<br>L20-29</div>
+    <div class="matrix-c" id="rm-2-0"></div><div class="matrix-c" id="rm-2-1"></div><div class="matrix-c" id="rm-2-2"></div><div class="matrix-c" id="rm-2-3"></div>
+    <div class="matrix-l">CP 3<br>L30-39</div>
+    <div class="matrix-c" id="rm-3-0"></div><div class="matrix-c" id="rm-3-1"></div><div class="matrix-c" id="rm-3-2"></div><div class="matrix-c" id="rm-3-3"></div>
+    <div class="matrix-l">CP 4<br>L40-49</div>
+    <div class="matrix-c" id="rm-4-0"></div><div class="matrix-c" id="rm-4-1"></div><div class="matrix-c" id="rm-4-2"></div><div class="matrix-c" id="rm-4-3"></div>
+    <div class="matrix-l">CP 5<br>L50-59</div>
+    <div class="matrix-c" id="rm-5-0"></div><div class="matrix-c" id="rm-5-1"></div><div class="matrix-c" id="rm-5-2"></div><div class="matrix-c" id="rm-5-3"></div>
+    <div class="matrix-l">CP 6<br>L60-68</div>
+    <div class="matrix-c" id="rm-6-0"></div><div class="matrix-c" id="rm-6-1"></div><div class="matrix-c" id="rm-6-2"></div><div class="matrix-c" id="rm-6-3"></div>
+    <div class="matrix-l">CP 7<br>L69-77</div>
+    <div class="matrix-c" id="rm-7-0"></div><div class="matrix-c" id="rm-7-1"></div><div class="matrix-c" id="rm-7-2"></div><div class="matrix-c" id="rm-7-3"></div>
+  </div>
+  <div style="font-size:0.8em;color:var(--text2);margin-top:12px;text-align:center;">
+    Each path transfers $\lceil 78/8 \rceil = 10$ layers per rank (first 6 ranks), $\lfloor 78/8 \rfloor = 9$ (last 2) × $1/N_{dcp}$ pages.$N_{cp}$ CP ranks cover all 78 layers, $N_{dcp}$ DCP ranks cover all pages.
+  </div>
+</div>
+
+<h3>6.6 CP Layer-Split and DCP Transfer Interaction</h3>
+
+<p>Under CP layer-split, each Prefill CP rank independently sends its owned layers' KV—no cross-CP-rank coordination needed for the layer dimension. CP index filtering is disabled in layer-split mode:</p>
+
+<div class="formula">
+<div class="label">CP Index Filtering Decision</div>
+$$F_{cp} = \begin{cases} \text{False} & \text{if layer-split or } N_{cp} > 1 \\ \text{True} & \text{if pure TP (} N_{cp} = 1\text{)} \end{cases}$$
+</div>
+
+<div class="pseudo">
+<span class="kw">function</span> <span class="fn">should_filter_cp_indices</span>():
+    <span class="cmt"># Under cp-layersplit: each CP rank owns distinct layers</span>
+    <span class="cmt"># and sends its own pages unfiltered → filtering N/A</span>
+    <span class="kw">if</span> is_cp_layersplit: <span class="kw">return</span> <span class="kw">False</span>
+    <span class="kw">if</span> attn_cp_size > 1: <span class="kw">return</span> <span class="kw">False</span>   <span class="cmt"># CP interleave already per-rank</span>
+    <span class="kw">return</span> enable_all_cp_ranks_for_transfer
+</div>
+
+<h3>6.7 Bootstrap: Decode → Prefill DCP Metadata</h3>
+
+<p>The Decode side passes its DCP configuration to Prefill via bootstrap:</p>
+
+<div class="formula">
+<div class="label">DCP Metadata via Bootstrap</div>
+$$d = r_{\text{tp}} \bmod N_{dcp} \quad \text{(decode side)}$$
+$$\text{DstKVInfo}: (N_{dcp},\; d) \xrightarrow{\text{bootstrap}} \text{Prefill} \quad \text{(per-request)}$$
+</div>
+
+<div class="pseudo">
+<span class="cmt"># Decode side: compute dcp_rank</span>
+dcp_rank ← attn_tp_rank <span class="kw">mod</span> dcp_size
+
+<span class="cmt"># Prefill side: learns decode's DCP config from bootstrap metadata</span>
+N_dcp ← info.dcp_size        <span class="cmt"># from DstKVInfo</span>
+d     ← info.dcp_rank       <span class="cmt"># target decode rank's DCP rank</span>
+<span class="cmt"># Each prefill rank sends 1/N_dcp page-shard to each decode DCP rank</span>
+</div>
+
+<h2>7. Correctness Guarantees</h2>
+
+<div class="card">
+<h3>2D Page-Level Reshard Correctness Guarantee</h3>
+<table>
+<tr><th>Dimension</th><th>Mechanism</th><th>Correctness Guarantee</th></tr>
+<tr><td><strong>Layer Dimension</strong></td><td>Each CP rank sends owned layers independently</td><td><code>should_filter_cp_indices</code> = False(no filter under layer-split)</td></tr>
+<tr><td><strong>Page Dimension</strong></td><td><code>filter_kv_indices_for_dcp_rank</code></td><td>$p \bmod N_{dcp} = d$ + $\lfloor p / N_{dcp} \rfloor$ compress</td></tr>
+<tr><td><strong>Transfer granularity</strong></td><td>physical page_size = 64</td><td>PD transfer writes full 64-token pages, not virtual page_size</td></tr>
+<tr><td><strong>Bootstrap metadata</strong></td><td><code>DstKVInfo.dcp_size/dcp_rank</code></td><td>Decode informs Prefill of its DCP config via bootstrap</td></tr>
+<tr><td><strong>Prefix Broadcast</strong></td><td>Size-broadcast protocol</td><td>All ranks participate in the same number of NCCL broadcasts (even if empty)</td></tr>
+<tr><td><strong>Gate rank-invariant</strong></td><td><code>seq_len</code> / <code>extend_num_tokens</code></td><td>CP gate uses pre-HiCache values, ensuring cross-rank consistency</td></tr>
+<tr><td><strong>Iteration barrier</strong></td><td>gloo all_reduce before <code>pop_bootstrapped</code></td><td>prevents cross-iteration collective deadlock</td></tr>
+<tr><td><strong>Consensus prefix</strong></td><td>cross-rank prefix length consensus</td><td>prevents input_ids length mismatch → page count mismatch</td></tr>
+<tr><td><strong>Padded all_reduce</strong></td><td><code>_padded_all_reduce_min</code></td><td>variable-length poller list all_reduce (padded to max_len)</td></tr>
+</table>
+</div>
+
+<div class="info">
+<strong>Core Design</strong>: 2D reshard = layer dimension (each CP rank sends its own layers) × page dimension (DCP filter). Each Prefill CP rank independently applies <code>filter_kv_indices_for_dcp_rank</code>, sending $1/N_{dcp}$ of pages to the target Decode DCP rank. Transfer is page-level (64 tokens), with RDMA write landing directly in decode's DCP sharded layout—<strong>no post-processing</strong> (<code>dcp_kv_shard_pages = None</code>).
+</div>
+
+<h2>8. EAGLE + DCP Adaptation</h2>
+
+<p>EAGLE speculative decoding introduces a draft model that runs in the same process as the target model. The target KV pool is DCP-sharded (each rank holds 1/N_dcp of pages), but the <strong>draft model needs the full sequence</strong> to generate draft tokens. This creates a fundamental tension:</p>
+
+<ul>
+<li><strong>Target model</strong>: runs under DCP, sees only 1/N_dcp of KV pages, uses all-gather + LSE merge for attention output.</li>
+<li><strong>Draft model</strong>: must see the full KV to predict next tokens. If it ran under DCP, the draft tokens would be inconsistent across DCP ranks (each rank only sees 1/4 of the context).</li>
+</ul>
+
+<p>Solution: the <code style="font-family:'JetBrains Mono',monospace;font-size:0.85em;color:var(--cyan);">@dcp_disabled()</code> context manager temporarily disables DCP for the draft model's forward pass. The draft model uses a separate, non-sharded KV pool with <code>draft_pool_token_multiplier = dcp_size</code> (4×) to allocate enough capacity for the full sequence. After draft generation, the target model verifies draft tokens under DCP mode—each DCP rank independently verifies its 1/N_dcp shard of the draft tokens, then all-gather merges the acceptance results.</p>
+
+<div class="pseudo">
+<span class="cmt"># eagle_worker_v2.py</span>
+<span class="kw">@dcp_disabled</span>()   <span class="cmt"># temporarily disable DCP for draft model</span>
+<span class="kw">function</span> <span class="fn">forward_draft</span>(...):
+    <span class="cmt"># draft model sees full sequence, not affected by DCP sharding</span>
+    <span class="cmt"># target model verifies draft tokens under DCP mode</span>
+    ...
+
+<span class="cmt"># draft pool token allocation accounts for DCP multiplier</span>
+draft_pool_token_multiplier ← server_args.dcp_size   <span class="cmt"># 4×</span>
+</div>
+
+<h2>Related Work</h2>
+
+<ul>
+<li><strong>DCP Roadmap</strong> (<a href="https://github.com/sgl-project/sglang/issues/29736">#29736</a>): Decode Context Parallelism base — round-robin KV sharding + LSE merge (<a href="https://github.com/sgl-project/sglang/pull/14194">#14194</a>), MHA/GQA DCP (<a href="https://github.com/sgl-project/sglang/pull/25090">#25090</a>), DCP helpers consolidation (<a href="https://github.com/sgl-project/sglang/pull/29365">#29365</a>).</li>
+<li><strong>Context Parallelism Roadmap</strong> (<a href="https://github.com/sgl-project/sglang/issues/21788">#21788</a>): CP layer-split by layer dimension (<a href="https://github.com/sgl-project/sglang/pull/29421">#29421</a>), CP refactor (<a href="https://github.com/sgl-project/sglang/issues/27252">#27252</a>), Prefill CP with split KV transfer (<a href="https://github.com/sgl-project/sglang/issues/22223">#22223</a>).</li>
+<li><strong>PD Disaggregation Roadmap</strong> (<a href="https://github.com/sgl-project/sglang/issues/4655">#4655</a>, <a href="https://github.com/sgl-project/sglang/issues/21703">#21703</a>): Mooncake/NIXL transfer backends, HiCache prefetching + PD incremental transfer (<a href="https://github.com/sgl-project/sglang/pull/26227">#26227</a>), layer-pipelined KV transfer (<a href="https://github.com/sgl-project/sglang/pull/23515">#23515</a>).</li>
+<li><strong>DSA Prefill CP</strong> (<a href="https://github.com/sgl-project/sglang/issues/31821">#31821</a>): DCP for DSA models (DeepSeek V3.2, GLM-5.x) — sparse-attention DCP with <code>slot % dcp_size</code> interleave, replicated indexer K cache.</li>
+</ul>
+
+<div class="footer">
+  <p>sglang b300-glm52 branch · 9 local commits · 5848 lines of custom code</p>
+  <p>GLM-5.2-FP8 · 256 MoE experts · 78 layers · CP=8 (layer-split) + DCP=4 + EAGLE 5 steps</p>
+  <p style="margin-top: 8px;">Macaron-V1-Venti · 748B params (744B base + 4×1B LoRA) · First model post-trained on GLM-5.2</p>
+</div>
+
+</div>
+
+<script>
+let animStep = 0;
+let isPlaying = true;
+const colors = ['#8ab4f8', '#81c995', '#c586f0', '#f9a825'];
+
+function buildLayerBar() {
+  const bar = document.getElementById('layer-bar');
+  if (!bar) return;
+  bar.innerHTML = '';
+  for (let i = 0; i < 78; i++) {
+    const owner = Math.floor(i / (78 / 8));  // CP=8
+    const cell = document.createElement('div');
+    cell.className = 'layer-cell';
+    cell.style.background = archColors8[owner % 8] + '30';
+    cell.style.color = archColors8[owner % 8];
+    cell.textContent = i;
+    cell.id = 'layer-' + i;
+    bar.appendChild(cell);
+  }
+}
+function updateLayerBar() {
+  const activeRank = animStep % 8;  // CP=8
+  for (let i = 0; i < 78; i++) {
+    const owner = Math.floor(i / (78 / 8));
+    const cell = document.getElementById('layer-' + i);
+    if (cell) {
+      if (owner === activeRank) {
+        cell.style.background = archColors8[owner % 8];
+        cell.style.color = '#fff';
+        cell.style.transform = 'scale(1.2)';
+        cell.style.zIndex = '10';
+      } else {
+        cell.style.background = archColors8[owner % 8] + '30';
+        cell.style.color = archColors8[owner % 8];
+        cell.style.transform = 'scale(1)';
+        cell.style.zIndex = '1';
+      }
+    }
+  }
+}
+
+function buildPageGrid() {
+  const grid = document.getElementById('page-grid');
+  if (!grid) return;
+  grid.innerHTML = '';
+  for (let i = 0; i < 16; i++) {
+    const cell = document.createElement('div');
+    cell.className = 'page-cell';
+    cell.style.background = archColors8[i % 4];
+    cell.style.opacity = '0.35';
+    cell.textContent = i;
+    cell.id = 'page-' + i;
+    grid.appendChild(cell);
+  }
+}
+function buildDcpRanks() {
+  const container = document.getElementById('dcp-ranks');
+  if (!container) return;
+  container.innerHTML = '';
+  for (let r = 0; r < 4; r++) {
+    const box = document.createElement('div');
+    box.style.background = 'var(--surface2)';
+    box.style.border = '1px solid ' + archColors8[r] + '40';
+    box.style.borderRadius = '10px';
+    box.style.padding = '10px';
+    box.id = 'dcp-box-' + r;
+    let html = '<div style="font-size:0.75em;font-weight:700;color:' + archColors8[r] + ';margin-bottom:6px;font-family:JetBrains Mono,monospace;">DCP Rank ' + r + '</div><div style="display:flex;gap:3px;flex-wrap:wrap;">';
+    for (let p = r; p < 16; p += 4) {
+      html += '<div class="page-cell" id="dcp-page-' + p + '" style="background:' + archColors8[r] + ';opacity:0.25;width:30px;height:24px;line-height:24px;">' + p + '</div>';
+    }
+    html += '</div>';
+    box.innerHTML = html;
+    container.appendChild(box);
+  }
+}
+function updatePages() {
+  const activeRank = animStep % 4;
+  for (let i = 0; i < 16; i++) {
+    const cell = document.getElementById('page-' + i);
+    if (cell) {
+      if (i % 4 === activeRank) { cell.style.opacity = '1'; cell.style.transform = 'scale(1.2)'; }
+      else { cell.style.opacity = '0.35'; cell.style.transform = 'scale(1)'; }
+    }
+  }
+  for (let r = 0; r < 4; r++) {
+    const box = document.getElementById('dcp-box-' + r);
+    if (box) {
+      box.style.opacity = r === activeRank ? '1' : '0.5';
+      box.style.transform = r === activeRank ? 'scale(1.03)' : 'scale(1)';
+    }
+    for (let p = r; p < 16; p += 4) {
+      const cell = document.getElementById('dcp-page-' + p);
+      if (cell) { cell.style.opacity = r === activeRank ? '1' : '0.25'; }
+    }
+  }
+}
+
+function buildReshardMatrix() {
+  const layerStarts = [0, 10, 20, 30, 40, 50, 60, 69];
+  for (let cp = 0; cp < 8; cp++) {
+    for (let dcp = 0; dcp < 4; dcp++) {
+      const cell = document.getElementById('rm-' + cp + '-' + dcp);
+      if (cell) {
+        cell.style.background = 'var(--surface2)';
+        cell.style.color = 'var(--dim)';
+        cell.textContent = 'L' + layerStarts[cp] + '+P' + dcp;
+      }
+    }
+  }
+}
+function updateReshardMatrix() {
+  const cp = Math.floor(animStep / 4) % 8;
+  const dcp = animStep % 4;
+  for (let i = 0; i < 8; i++) {
+    for (let j = 0; j < 4; j++) {
+      const cell = document.getElementById('rm-' + i + '-' + j);
+      if (cell) {
+        if (i === cp && j === dcp) {
+          cell.style.background = archColors8[j] + '30';
+          cell.style.color = '#fff';
+          cell.style.border = '1px solid ' + archColors8[j];
+          cell.style.transform = 'scale(1.05)';
+        } else if (i === cp || j === dcp) {
+          cell.style.background = archColors8[j] + '10';
+          cell.style.color = archColors8[j];
+          cell.style.border = '1px solid ' + archColors8[j] + '30';
+          cell.style.transform = 'scale(1)';
+        } else {
+          cell.style.background = 'var(--surface2)';
+          cell.style.color = 'var(--dim)';
+          cell.style.border = '1px solid transparent';
+          cell.style.transform = 'scale(1)';
+        }
+      }
+    }
+  }
+}
+
+// 2D Grid animation: 8 rows (layers) × 8 cols (pages)
+// CP=8: each row = 1 CP rank (8 rows = 8 CP ranks)
+// DCP=4: cols grouped by col%4 (8 cols, 2 per DCP rank)
+const archColors8 = ['#8ab4f8', '#81c995', '#c586f0', '#f9a825', '#f28b82', '#56c8d8', '#fdd663', '#e871c4'];
+const NROWS = 8, NCOLS = 8;
+
+function cpRankForRow(row) { return row; }  // CP=8: 1 row per CP rank
+function dcpRankForCol(col) { return col % 4; }  // DCP=4
+
+function buildArchAnim() {
+  const pfGrid = document.getElementById('pf-grid');
+  const dcGrid = document.getElementById('dc-grid');
+  const pfGpuGrid = document.getElementById('pf-gpu-grid');
+  const dcGpuGrid = document.getElementById('dc-gpu-grid');
+  if (!pfGrid || !dcGrid) return;
+
+  // Build GPU card layouts (8 GPUs per node, 2 rows × 4 cols)
+  // Prefill: CP=8, each GPU = 1 CP rank
+  if (pfGpuGrid) {
+    pfGpuGrid.innerHTML = '';
+    for (let g = 0; g < 8; g++) {
+      const cpRank = g;  // CP=8: 1 GPU per CP rank
+      const card = document.createElement('div');
+      card.className = 'gpu-card';
+      card.style.background = archColors8[cpRank % 8] + '15';
+      card.style.borderColor = archColors8[cpRank % 8] + '40';
+      card.id = 'pf-gpu-' + g;
+      card.innerHTML = '<div class="gpu-label" style="color:' + archColors8[cpRank % 8] + ';">GPU ' + g + '</div><div class="gpu-rank" style="color:' + archColors8[cpRank % 8] + '80;">CP' + cpRank + '</div>';
+      pfGpuGrid.appendChild(card);
+    }
+  }
+  // Decode: DCP=4, each 2 GPUs = 1 DCP rank
+  if (dcGpuGrid) {
+    dcGpuGrid.innerHTML = '';
+    for (let g = 0; g < 8; g++) {
+      const dcpRank = Math.floor(g / 2);  // DCP=4: 2 GPUs per DCP rank
+      const card = document.createElement('div');
+      card.className = 'gpu-card';
+      card.style.background = archColors8[dcpRank] + '15';
+      card.style.borderColor = archColors8[dcpRank] + '40';
+      card.id = 'dc-gpu-' + g;
+      card.innerHTML = '<div class="gpu-label" style="color:' + archColors8[dcpRank] + ';">GPU ' + g + '</div><div class="gpu-rank" style="color:' + archColors8[dcpRank] + '80;">DCP' + dcpRank + '</div>';
+      dcGpuGrid.appendChild(card);
+    }
+  }
+
+  // Prefill grid: rows colored by CP rank (horizontal bands)
+  pfGrid.innerHTML = '';
+  const hdr = document.createElement('div');
+  hdr.className = 'grid-label';
+  hdr.textContent = '';
+  pfGrid.appendChild(hdr);
+  for (let c = 0; c < NCOLS; c++) {
+    const h = document.createElement('div');
+    h.className = 'grid-label';
+    h.style.textAlign = 'center';
+    h.textContent = 'p' + c;
+    pfGrid.appendChild(h);
+  }
+  for (let r = 0; r < NROWS; r++) {
+    const lbl = document.createElement('div');
+    lbl.className = 'grid-label';
+    lbl.textContent = 'L' + (r * 10);
+    pfGrid.appendChild(lbl);
+    for (let c = 0; c < NCOLS; c++) {
+      const cell = document.createElement('div');
+      cell.className = 'grid-cell';
+      const cpRank = cpRankForRow(r);
+      cell.style.background = archColors8[cpRank] + '30';
+      cell.style.border = '1px solid ' + archColors8[cpRank] + '40';
+      cell.id = 'pf-cell-' + r + '-' + c;
+      pfGrid.appendChild(cell);
+    }
+  }
+
+  // Decode grid: cols colored by DCP rank (vertical bands)
+  dcGrid.innerHTML = '';
+  const dhdr = document.createElement('div');
+  dhdr.className = 'grid-label';
+  dhdr.textContent = '';
+  dcGrid.appendChild(dhdr);
+  for (let c = 0; c < NCOLS; c++) {
+    const h = document.createElement('div');
+    h.className = 'grid-label';
+    h.style.textAlign = 'center';
+    h.textContent = 'p' + c;
+    dcGrid.appendChild(h);
+  }
+  for (let r = 0; r < NROWS; r++) {
+    const lbl = document.createElement('div');
+    lbl.className = 'grid-label';
+    lbl.textContent = 'L' + (r * 10);
+    dcGrid.appendChild(lbl);
+    for (let c = 0; c < NCOLS; c++) {
+      const cell = document.createElement('div');
+      cell.className = 'grid-cell';
+      const dcpRank = dcpRankForCol(c);
+      cell.style.background = archColors8[dcpRank] + '30';
+      cell.style.border = '1px solid ' + archColors8[dcpRank] + '40';
+      cell.id = 'dc-cell-' + r + '-' + c;
+      dcGrid.appendChild(cell);
+    }
+  }
+}
+
+function updateArchFlow() {
+  // Cycle through 16 paths: (cp_rank, dcp_rank)
+  const pathIdx = animStep % 32;
+  const cpRank = Math.floor(pathIdx / 4);
+  const dcpRank = pathIdx % 4;
+
+  // Update prefill grid: highlight cells at (cpRank's rows × dcpRank's cols)
+  for (let r = 0; r < NROWS; r++) {
+    for (let c = 0; c < NCOLS; c++) {
+      const cell = document.getElementById('pf-cell-' + r + '-' + c);
+      if (!cell) continue;
+      const cellCpRank = cpRankForRow(r);
+      const cellDcpRank = dcpRankForCol(c);
+      if (cellCpRank === cpRank && cellDcpRank === dcpRank) {
+        // This is the block being transferred
+        cell.style.background = archColors8[cpRank];
+        cell.style.transform = 'scale(1.3)';
+        cell.style.boxShadow = '0 0 8px ' + archColors8[cpRank];
+        cell.style.zIndex = '10';
+      } else if (cellCpRank === cpRank) {
+        // Same CP rank, different DCP — dimmed but visible
+        cell.style.background = archColors8[cpRank] + '50';
+        cell.style.transform = 'scale(1)';
+        cell.style.boxShadow = 'none';
+        cell.style.zIndex = '1';
+      } else {
+        // Different CP rank — very dim
+        cell.style.background = archColors8[cellCpRank] + '15';
+        cell.style.transform = 'scale(1)';
+        cell.style.boxShadow = 'none';
+        cell.style.zIndex = '1';
+      }
+    }
+  }
+
+  // Update decode grid: highlight cells at (cpRank's rows × dcpRank's cols)
+  for (let r = 0; r < NROWS; r++) {
+    for (let c = 0; c < NCOLS; c++) {
+      const cell = document.getElementById('dc-cell-' + r + '-' + c);
+      if (!cell) continue;
+      const cellCpRank = cpRankForRow(r);
+      const cellDcpRank = dcpRankForCol(c);
+      if (cellCpRank === cpRank && cellDcpRank === dcpRank) {
+        // This block just received data
+        cell.style.background = archColors8[dcpRank];
+        cell.style.transform = 'scale(1.3)';
+        cell.style.boxShadow = '0 0 8px ' + archColors8[dcpRank];
+        cell.style.zIndex = '10';
+      } else if (cellDcpRank === dcpRank) {
+        // Same DCP rank, different CP — dimmed
+        cell.style.background = archColors8[dcpRank] + '50';
+        cell.style.transform = 'scale(1)';
+        cell.style.boxShadow = 'none';
+        cell.style.zIndex = '1';
+      } else {
+        cell.style.background = archColors8[cellDcpRank] + '15';
+        cell.style.transform = 'scale(1)';
+        cell.style.boxShadow = 'none';
+        cell.style.zIndex = '1';
+      }
+    }
+  }
+
+  // Update GPU card highlights
+  // Prefill: CP=8, each GPU = 1 CP rank (gpuCpRank = g)
+  // Decode: DCP=4, each 2 GPUs = 1 DCP rank (gpuDcpRank = floor(g/2))
+  for (let g = 0; g < 8; g++) {
+    const pfGpu = document.getElementById('pf-gpu-' + g);
+    const dcGpu = document.getElementById('dc-gpu-' + g);
+    const gpuCpRank = g;  // CP=8: 1 GPU per CP rank
+    const gpuDcpRank = Math.floor(g / 2);  // DCP=4: 2 GPUs per DCP rank
+    if (pfGpu) {
+      if (gpuCpRank === cpRank) {
+        pfGpu.style.background = archColors8[cpRank % 8] + '30';
+        pfGpu.style.borderColor = archColors8[cpRank % 8];
+        pfGpu.style.transform = 'scale(1.08)';
+        pfGpu.style.boxShadow = '0 0 12px ' + archColors8[cpRank % 8] + '40';
+      } else {
+        pfGpu.style.background = archColors8[gpuCpRank % 8] + '08';
+        pfGpu.style.borderColor = archColors8[gpuCpRank % 8] + '20';
+        pfGpu.style.transform = 'scale(1)';
+        pfGpu.style.boxShadow = 'none';
+      }
+    }
+    if (dcGpu) {
+      if (gpuDcpRank === dcpRank) {
+        dcGpu.style.background = archColors8[dcpRank] + '30';
+        dcGpu.style.borderColor = archColors8[dcpRank];
+        dcGpu.style.transform = 'scale(1.08)';
+        dcGpu.style.boxShadow = '0 0 12px ' + archColors8[dcpRank] + '40';
+      } else {
+        dcGpu.style.background = archColors8[gpuDcpRank] + '08';
+        dcGpu.style.borderColor = archColors8[gpuDcpRank] + '20';
+        dcGpu.style.transform = 'scale(1)';
+        dcGpu.style.boxShadow = 'none';
+      }
+    }
+  }
+
+  // Update transfer arrow + label
+  const arrow = document.getElementById('xfer-arrow');
+  if (arrow) {
+    arrow.style.color = archColors8[cpRank];
+    arrow.style.textShadow = '0 0 12px ' + archColors8[cpRank];
+    arrow.style.transform = 'scale(1.2)';
+  }
+  const label = document.getElementById('xfer-label');
+  if (label) {
+    label.style.color = archColors8[cpRank];
+    label.style.textShadow = '0 0 8px ' + archColors8[cpRank] + '40';
+  }
+
+  // Status text
+  const status = document.getElementById('arch-status');
+  if (status) {
+    const layerRanges = ['L0-9', 'L10-19', 'L20-29', 'L30-39', 'L40-49', 'L50-59', 'L60-68', 'L69-77'];
+    status.textContent = 'Path ' + (pathIdx + 1) + '/32: CP Rank ' + cpRank + ' (' + layerRanges[cpRank] + ') → DCP Rank ' + dcpRank + ' (p%4=' + dcpRank + ')';
+    status.style.color = archColors8[cpRank];
+  }
+}
+
+function tick() {
+  updateLayerBar();
+  updatePages();
+  updateReshardMatrix();
+  updateArchFlow();
+}
+
+function toggleAnim() {
+  isPlaying = !isPlaying;
+  const btn = document.getElementById('arch-btn');
+  btn.textContent = isPlaying ? '⏸ Pause' : '▶ Play';
+  btn.style.background = isPlaying ? 'var(--accent)' : 'var(--dim)';
+}
+
+buildLayerBar();
+buildPageGrid();
+buildDcpRanks();
+buildReshardMatrix();
+buildArchAnim();
+tick();
+const timer = setInterval(() => { if (isPlaying) { animStep++; tick(); } }, 1500);
+</script>
+</body>
+</html>
