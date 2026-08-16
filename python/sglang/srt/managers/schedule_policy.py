@@ -106,6 +106,14 @@ def match_prefix_for_req(
     # this request's SWA ring. No-op for other layouts.
     reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
     key_limit = max(0, len(token_ids) - reprefill_tail) if reprefill_tail else None
+    if reprefill_tail and getattr(match_prefix_for_req, "_cap_logged", 0) < 5:
+        match_prefix_for_req._cap_logged = (
+            getattr(match_prefix_for_req, "_cap_logged", 0) + 1
+        )
+        logger.info(
+            f"[SWA-CAP] reprefill_tail={reprefill_tail} key_len={len(token_ids)} "
+            f"key_limit={key_limit} tree={type(tree_cache).__name__}"
+        )
 
     match_result = tree_cache.match_prefix(
         MatchPrefixParams(

@@ -858,12 +858,13 @@ def alloc_verify_window(
         device=device,
     )
     verify_cache_loc_2d = verify_cache_loc.view(bs, verify_w)
-    import logging as _lg
-    _lg.getLogger(__name__).info(
-        f"[DSP-LOC] seq_lens={prefix_lens.tolist() if hasattr(prefix_lens, 'tolist') else prefix_lens}"
-        f" vloc[:6]={verify_cache_loc[:6].tolist() if hasattr(verify_cache_loc[:6], 'tolist') else verify_cache_loc}"
-        f" vloc_n={verify_cache_loc.numel()}"
-    )
+    if envs.SGLANG_DEBUG_DIAG.get():
+        import logging as _lg
+        _lg.getLogger(__name__).info(
+            f"[DSP-LOC] seq_lens={prefix_lens.tolist() if hasattr(prefix_lens, 'tolist') else prefix_lens}"
+            f" vloc[:6]={verify_cache_loc[:6].tolist() if hasattr(verify_cache_loc[:6], 'tolist') else verify_cache_loc}"
+            f" vloc_n={verify_cache_loc.numel()}"
+        )
     return VerifyWindow(
         positions_2d=positions_2d,
         verify_cache_loc=verify_cache_loc,

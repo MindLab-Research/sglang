@@ -3108,13 +3108,42 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     #  - swa_reprefill_tail_tokens() reports window+page so matches are
     #    capped and prefill recomputes the trailing window (fresh SWA).
     swa_served_from_tree: bool = True
+    # PD-disagg PREFILL mode (set by kv_cache_builder): prefill's radix/HiCache
+    # hit must NEVER extend into the trailing SWA window. The SWA slots of a
+    # tree node's region are tombstoned once the node ages past the window
+    # horizon (_evict_swa_only / insert-time SWA frees under churn), so a hit
+    # covering the trailing window would (a) serve prefill's own extend
+    # attention a dead SWA window (corrupting even the freshly computed FULL
+    # KV), and (b) make prefill's PD _swa_payload translate tombstoned slots,
+    # which translate_loc_from_full_to_swa clamps to the padding sink (slot 0)
+    # — shipping ZEROS as the "fresh" window SWA state to decode, which
+    # allocates real slots and trusts the transfer. Decode's SWA window is then
+    # destroyed -> hybrid attention collapses -> token loops. Capping the match
+    # forces prefill to recompute the trailing window (~window tokens) so the
+    # transferred window SWA is real. Without churn (serial rerun) nodes stay
+    # young and their window SWA is still live — which is why corruption only
+    # shows under sustained concurrent load that ages/evicts shared nodes
+    # between insert and hit.
+    swa_pd_prefill_reprefill_tail: bool = False
 
     def swa_reprefill_tail_tokens(self) -> int:
         swa = self.components.get(ComponentType.SWA)
-        if swa is not None and not self.swa_served_from_tree:
-            # Decode-disagg radix: leave a trailing window (+page margin so
-            # page floor still leaves >= window) for prefill to recompute,
-            # which re-transfers a fresh SWA window for this request.
+        if getattr(self, "_reprefill_logged", 0) < 5:
+            self._reprefill_logged = getattr(self, "_reprefill_logged", 0) + 1
+            logger.info(
+                f"[SWA-REPREFILL] swa_comp={'None' if swa is None else 'present'} "
+                f"swa_window={None if swa is None else swa.sliding_window_size} "
+                f"served_from_tree={self.swa_served_from_tree} "
+                f"pd_prefill_flag={getattr(self, 'swa_pd_prefill_reprefill_tail', 'N/A')} "
+                f"page_size={self.page_size} components={list(self.components.keys())}"
+            )
+        if swa is not None and (
+            not self.swa_served_from_tree
+            or self.swa_pd_prefill_reprefill_tail
+        ):
+            # Decode-disagg radix / PD-disagg prefill: leave a trailing window
+            # (+page margin so page floor still leaves >= window) for prefill
+            # to recompute, which re-transfers a fresh SWA window.
             return swa.sliding_window_size + self.page_size
         unified_compress_only_hicache = (
             self.cache_controller is not None

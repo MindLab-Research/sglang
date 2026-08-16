@@ -284,6 +284,23 @@ def build_kv_cache(
     ):
         tree_cache.swa_served_from_tree = False
 
+    # PD-disagg PREFILL side: the decode-side contract ("window SWA arrives
+    # fresh via PD transfer") requires PREFILL to recompute the trailing SWA
+    # window on every request. But swa_reprefill_tail_tokens() only capped the
+    # decode tree (swa_served_from_tree=False is decode-only), so prefill's own
+    # radix/HiCache hit could extend into the window region: tree-aged SWA
+    # slots are tombstoned, translate_loc_from_full_to_swa clamps them to the
+    # padding sink, and prefill ships ZEROS as the window SWA state — decode
+    # writes them into its freshly allocated (real) window slots and its SWA
+    # attention collapses (token loops under concurrent load that ages shared
+    # tree nodes between insert and hit). Enable the window cap on prefill too.
+    if (
+        server_args.disaggregation_mode == "prefill"
+        and is_hybrid_swa
+        and hasattr(tree_cache, "swa_served_from_tree")
+    ):
+        tree_cache.swa_pd_prefill_reprefill_tail = True
+
     embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
     init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
 
