@@ -1220,6 +1220,13 @@ class Req(ReqDllmMixin):
             if reprefill_tail:
                 capped = max(0, input_len - reprefill_tail)
                 key_limit = capped if key_limit is None else min(key_limit, capped)
+                # Unified-kv SWA snapshot protocol: floor the match limit to a
+                # snapshot boundary (chunk boundary) so the boundary-window
+                # restore is position-aligned with the node's insert-time
+                # snapshot. No-op when the tree has no snapshot boundary.
+                align_fn = getattr(tree_cache, "swa_reprefill_align_limit", None)
+                if align_fn is not None and key_limit is not None:
+                    key_limit = align_fn(input_len, key_limit)
 
         # Disable prefix caching when embed overrides are present: same token IDs
         # with different override vectors must not share cached KV values.
