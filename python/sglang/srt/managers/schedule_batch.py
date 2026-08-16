@@ -2450,16 +2450,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                             )
                     except Exception:
                         pass
-                # Bisector: zero trailing c128 compressed-KV rows at the hit
-                # boundary (last remaining history-dependent read set).
-                _c128win_fn = getattr(_kvcache, "clear_c128_kv_window_for_prefix", None)
-                if _c128win_fn is not None:
-                    try:
-                        _pfx = req.prefix_indices
-                        if _pfx is not None and len(_pfx) >= pre_len:
-                            _c128win_fn(int(pre_len), _pfx)
-                    except Exception:
-                        pass
                 if getattr(ScheduleBatch, "_state_clear_ran_left", 5) > 0:
                     ScheduleBatch._state_clear_ran_left = (
                         getattr(ScheduleBatch, "_state_clear_ran_left", 5) - 1
