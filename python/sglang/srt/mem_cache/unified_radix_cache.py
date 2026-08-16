@@ -611,36 +611,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return result
 
         key = params.key
-        # Tree-level SWA window guard (unified-kv snapshot protocol): the
-        # invariant "a match must never extend into the SWA reprefill window
-        # and must land on a snapshot boundary" is a property of THIS tree's
-        # data model (SWA rings are per-request scratch; only insert-time
-        # content snapshots at node boundaries are restorable), so it is
-        # enforced HERE — at the single funnel every match passes through —
-        # rather than at each caller. Callers may pass a tighter limit; the
-        # tree only ever tightens further (reprefill cap -> chunk-aligned).
-        _reprefill = self.swa_reprefill_tail_tokens()
-        if _reprefill:
-            _capped = max(0, len(key) - _reprefill)
-            _boundary = int(getattr(self, "swa_snapshot_boundary_tokens", 0) or 0)
-            if _boundary > 0:
-                _capped = max((_capped // _boundary) * _boundary, 0)
-            if key.limit is None or key.limit > _capped:
-                key = RadixKey(
-                    token_ids=key.token_ids,
-                    extra_key=key.extra_key,
-                    is_bigram=key.is_bigram,
-                    limit=_capped,
-                )
-                if getattr(type(self), "_entry_cap_logged", 0) < 5:
-                    type(self)._entry_cap_logged = (
-                        getattr(type(self), "_entry_cap_logged", 0) + 1
-                    )
-                    logger.info(
-                        f"[SWA-ENTRY-CAP] key_len={len(key.token_ids)} "
-                        f"reprefill={_reprefill} boundary={_boundary} "
-                        f"capped={_capped} caller_limit={params.key.limit}"
-                    )
         key, _ = key.maybe_to_bigram_view(self.is_eagle)
         if self.disable or len(key) == 0:
             return self._empty_match_result
