@@ -364,13 +364,42 @@ class SWAComponent(TreeComponent):
                     else None
                 )
                 if _snap128_fn is not None:
-                    _snap128 = _snap128_fn(int(params.req.req_pool_idx))
+                    _snap128 = _snap128_fn(int(_ins_req.req_pool_idx))
                     if _snap128:
                         node.component_data[
                             self.component_type
                         ].c128_state_snapshot = _snap128
-            except Exception:
-                pass
+                        if getattr(type(self), "_c128snap_log_left", 5) > 0:
+                            type(self)._c128snap_log_left = (
+                                getattr(type(self), "_c128snap_log_left", 5) - 1
+                            )
+                            import logging as _slg
+
+                            _slg.getLogger(__name__).info(
+                                f"[C128SNAP-OK] node_len={len(node.key)} "
+                                f"rpi={_ins_req.req_pool_idx} "
+                                f"fams={sorted(_snap128.keys())}"
+                            )
+                    elif getattr(type(self), "_c128snap_log_left", 5) > 0:
+                        type(self)._c128snap_log_left = (
+                            getattr(type(self), "_c128snap_log_left", 5) - 1
+                        )
+                        import logging as _slg
+
+                        _slg.getLogger(__name__).warning(
+                            f"[C128SNAP-EMPTY] node_len={len(node.key)} "
+                            f"rpi={_ins_req.req_pool_idx} — no c128 pool matched"
+                        )
+            except Exception as _e:
+                if getattr(type(self), "_c128snap_log_left", 5) > 0:
+                    type(self)._c128snap_log_left = (
+                        getattr(type(self), "_c128snap_log_left", 5) - 1
+                    )
+                    import logging as _slg
+
+                    _slg.getLogger(__name__).warning(
+                        f"[C128SNAP-ERR] {type(_e).__name__}: {_e}"
+                    )
         # Decode-disagg radix / unified-kv rings: keep the leaf a SWA tombstone
         # -- the request's SWA ring is per-request state, translating tree
         # FULL slots to SWA here would publish SWA values the tree does not
