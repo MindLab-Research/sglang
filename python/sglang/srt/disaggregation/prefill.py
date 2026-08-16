@@ -651,8 +651,10 @@ class PrefillBootstrapQueue:
             if getattr(self.scheduler.server_args, "attn_cp_size", 1) > 1:
                 poll_and_all_reduce_attn_cp_tp_group(
                     [],
-                    self.scheduler.attn_cp_cpu_group,
-                    self.scheduler.attn_tp_cpu_group,
+                    getattr(self.scheduler, "pf_poll_cp_gloo_group", None)
+                    or self.scheduler.attn_cp_cpu_group,
+                    getattr(self.scheduler, "pf_poll_tp_gloo_group", None)
+                    or self.scheduler.attn_tp_cpu_group,
                 )
             if return_failed_reqs is False:
                 return []
@@ -661,8 +663,10 @@ class PrefillBootstrapQueue:
 
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender for req in self.queue],
-            self.scheduler.attn_cp_cpu_group,
-            self.scheduler.attn_tp_cpu_group,
+            getattr(self.scheduler, "pf_poll_cp_gloo_group", None)
+            or self.scheduler.attn_cp_cpu_group,
+            getattr(self.scheduler, "pf_poll_tp_gloo_group", None)
+            or self.scheduler.attn_tp_cpu_group,
         )
 
         for i, (req, poll) in enumerate(zip(self.queue, polls)):
@@ -1055,7 +1059,7 @@ class SchedulerDisaggregationPrefillMixin:
             # that are blocked in NCCL) → 600s watchdog SIGABRT.
             _eb = torch.tensor(0, dtype=torch.int, device="cpu")
             torch.distributed.all_reduce(_eb, op=torch.distributed.ReduceOp.MIN,
-                                         group=self.tp_cpu_group)
+                                         group=getattr(self, "pf_barrier_gloo_group", None) or self.tp_cpu_group)
 
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
@@ -1101,7 +1105,7 @@ class SchedulerDisaggregationPrefillMixin:
             # See event_loop_normal_disagg_prefill for detailed comment.
             _eb = torch.tensor(0, dtype=torch.int, device="cpu")
             torch.distributed.all_reduce(_eb, op=torch.distributed.ReduceOp.MIN,
-                                         group=self.tp_cpu_group)
+                                         group=getattr(self, "pf_barrier_gloo_group", None) or self.tp_cpu_group)
 
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()

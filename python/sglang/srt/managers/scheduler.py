@@ -1188,6 +1188,40 @@ class Scheduler(
                 timeout=datetime.timedelta(seconds=300),
             )
 
+            # 2026-08-16 18:59 deadlock (prefill_v4.log.deadlock1904): the
+            # prefill event loop's barrier (event_loop L1057, tp_cpu_group),
+            # pop_bootstrapped's poll (attn_cp/attn_tp groups) still ran on
+            # their ORIGINAL groups — the dedicated-group fix (2dd9d2c168)
+            # only covered the decode queues and this queue's constructor
+            # argument, not the group params poll_and_all_reduce receives.
+            # zmq recv is per-rank async: one rank got a control message and
+            # entered its broadcast while the others flowed into the poll →
+            # gloo FIFO cross-matched the heterogeneous collectives ACROSS
+            # ITERATIONS (py-spy: 5 ranks in pop poll, 2 in next-iteration
+            # barrier, 1 in dp all_gather) → 7-minute silent stall at zero
+            # load, released only when the next request's zmq arrival woke
+            # the straggler. Fix: same-member-set dedicated gloo copies for
+            # every CPU collective in the prefill loop — an independent FIFO
+            # per group makes cross-collective matching structurally
+            # impossible. The timeout is only a loud-failure backstop.
+            if self.server_args.disaggregation_mode == "prefill":
+                _pf_timeout = datetime.timedelta(seconds=600)
+                self.pf_barrier_gloo_group = torch.distributed.new_group(
+                    ranks=self.tp_group.ranks,
+                    backend="gloo",
+                    timeout=_pf_timeout,
+                )
+                self.pf_poll_tp_gloo_group = torch.distributed.new_group(
+                    ranks=self.attn_tp_group.ranks,
+                    backend="gloo",
+                    timeout=_pf_timeout,
+                )
+                self.pf_poll_cp_gloo_group = torch.distributed.new_group(
+                    ranks=self.attn_cp_group.ranks,
+                    backend="gloo",
+                    timeout=_pf_timeout,
+                )
+
             # The decode requests polling kv cache
             self.disagg_decode_transfer_queue = DecodeTransferQueue(
                 gloo_group=self._disagg_poll_gloo_group,
