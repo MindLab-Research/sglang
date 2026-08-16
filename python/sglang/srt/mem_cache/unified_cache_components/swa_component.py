@@ -95,20 +95,26 @@ class SWAComponent(TreeComponent):
     def _snapshot_unified_swa(self, node: UnifiedTreeNode, swa_value: torch.Tensor) -> None:
         """Unified-kv: capture the ring-row CONTENT the node's swa_value points
         to, before the inserting request's slot is reused and the rows are
-        overwritten. Stored on the node's host_value; non-unified pools are a
-        no-op (slot IDs are content-stable there)."""
+        overwritten. Only the LAST ring-stride positions have position-valid
+        content (earlier rows were overwritten by same-mod later positions),
+        so the snapshot is capped to the trailing ring window. Stored on the
+        node's host_value; non-unified pools are a no-op."""
         try:
             get_kvcache = getattr(
                 self.cache.token_to_kv_pool_allocator, "get_kvcache", None
             )
-            snap_fn = (
-                getattr(get_kvcache(), "snapshot_swa_rows", None)
-                if get_kvcache is not None
+            kc = get_kvcache() if get_kvcache is not None else None
+            snap_fn = getattr(kc, "snapshot_swa_rows", None) if kc is not None else None
+            ring_fn = (
+                getattr(getattr(kc, "unified_kv_pool", None), "swa_ring_size", None)
+                if kc is not None
                 else None
             )
-            if snap_fn is None:
+            if snap_fn is None or ring_fn is None:
                 return
-            snap = snap_fn(swa_value)
+            ring = int(ring_fn)
+            rows = swa_value[-ring:] if swa_value.numel() > ring else swa_value
+            snap = snap_fn(rows)
             if snap is not None:
                 node.component_data[self.component_type].host_value = snap
         except Exception:

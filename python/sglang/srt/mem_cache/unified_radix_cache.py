@@ -3125,6 +3125,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     # shows under sustained concurrent load that ages/evicts shared nodes
     # between insert and hit.
     swa_pd_prefill_reprefill_tail: bool = False
+    # Unified-kv SWA snapshot protocol: tree nodes carry a CONTENT snapshot of
+    # the trailing ring-stride positions (captured at insert). Snapshots exist
+    # at node boundaries (every cache_unfinished chunk boundary + finish). For
+    # a restore to be position-aligned, the match limit must be floored to a
+    # snapshot boundary (the chunk size); swa_reprefill_align_limit does that.
+    swa_snapshot_boundary_tokens: int = 0
+
+    def swa_reprefill_align_limit(self, key_len: int, limit: int) -> int:
+        b = int(self.swa_snapshot_boundary_tokens)
+        if b <= 0 or limit <= 0:
+            return max(limit, 0)
+        return max((int(limit) // b) * b, 0)
 
     def swa_reprefill_tail_tokens(self) -> int:
         swa = self.components.get(ComponentType.SWA)

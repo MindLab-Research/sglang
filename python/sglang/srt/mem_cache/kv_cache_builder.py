@@ -300,6 +300,17 @@ def build_kv_cache(
         and hasattr(tree_cache, "swa_served_from_tree")
     ):
         tree_cache.swa_pd_prefill_reprefill_tail = True
+        # Unified-kv SWA snapshot protocol: node content snapshots are
+        # captured at insert boundaries (every cache_unfinished chunk + the
+        # finish leaf). Aligning match limits to the chunk size guarantees a
+        # position-aligned snapshot exists at the hit boundary.
+        _snap_boundary = (
+            effective_chunked_prefill_size
+            if effective_chunked_prefill_size
+            else 0
+        )
+        if hasattr(tree_cache, "swa_snapshot_boundary_tokens"):
+            tree_cache.swa_snapshot_boundary_tokens = int(_snap_boundary)
 
     embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
     init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)

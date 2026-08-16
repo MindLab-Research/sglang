@@ -2335,37 +2335,61 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                             else None
                         )
                         if _restore_fn is not None and req.prefix_indices is not None:
-                            _win = int(
-                                getattr(self, "sliding_window_size", None) or 128
-                            ) + 2 * 256
+                            # Restore window == ring stride: the snapshot's
+                            # per-row content is position-valid ONLY for the
+                            # trailing ring-stride positions, and any 133
+                            # consecutive positions cover each ring row once.
+                            # pre_len is chunk-aligned (match limit flooring),
+                            # so node snapshots are position-aligned restores.
+                            _kc_ring = getattr(
+                                getattr(_kc, "unified_kv_pool", None),
+                                "swa_ring_size",
+                                None,
+                            )
+                            _win = int(_kc_ring) if _kc_ring else 133
                             _lo = max(0, pre_len - _win)
                             _pfx = req.prefix_indices
                             if len(_pfx) >= pre_len:
                                 _locs = _pfx[_lo:pre_len]
                                 _poss = torch.arange(_lo, pre_len, dtype=torch.int64)
+                                # Collect the node chain covering [_lo, pre_len):
+                                # deepest node covers the TAIL of the window.
+                                _chain = []
                                 _node = getattr(req, "last_node", None)
-                                _remaining = pre_len - _lo
+                                _cov = 0
                                 while (
                                     _node is not None
                                     and getattr(_node, "parent", None) is not None
-                                    and _remaining > 0
+                                    and _cov < _win
                                 ):
-                                    _cd = _node.component_data.get(ComponentType.SWA)
+                                    _nlen = len(getattr(_node, "key", []) or [])
+                                    _chain.append((_node, _nlen))
+                                    _cov += _nlen
+                                    _node = getattr(_node, "parent", None)
+                                # Walk the chain tail-first: each node restores
+                                # its own [end-133, end) snapshot onto the
+                                # window segment ending at its boundary.
+                                _seg_end = pre_len
+                                for _nd, _nlen in _chain:
+                                    if _seg_end <= _lo:
+                                        break
+                                    _cd = _nd.component_data.get(ComponentType.SWA)
                                     _snap = (
                                         getattr(_cd, "host_value", None) if _cd else None
                                     )
-                                    if _snap is not None:
-                                        _nlen = len(getattr(_node, "key", []) or [])
-                                        _seg = min(_remaining, _nlen)
+                                    if _snap is not None and _nlen > 0:
+                                        _seg_start = max(_lo, _seg_end - _win)
+                                        _mask = (_poss >= _seg_start) & (
+                                            _poss < _seg_end
+                                        )
                                         _ok = _restore_fn(
                                             _snap,
-                                            _locs[:_seg],
-                                            _poss[:_seg],
+                                            _locs[_mask],
+                                            _poss[_mask],
                                             int(req.req_pool_idx),
                                         )
                                         restored = restored or bool(_ok)
-                                    _remaining -= len(getattr(_node, "key", []) or [])
-                                    _node = getattr(_node, "parent", None)
+                                    _seg_end -= _nlen
                     except Exception:
                         restored = False
                     if not restored:
