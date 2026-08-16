@@ -783,6 +783,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 prev_prefix_len=req.cache_protected_len,
                 priority=getattr(req, "priority", 0) or 0,
             )
+            # thread the inserting request for the c128-state snapshot
+            # (swa_component.commit_insert_component_data reads it)
+            insert_params.req = req
 
             # components prepare insert data + return effective cache_len
             effective_cache_len = len(token_ids)
@@ -867,6 +870,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             chunked=chunked,
             priority=getattr(req, "priority", 0) or 0,
         )
+        # thread the inserting request for the c128-state snapshot
+        # (swa_component.commit_insert_component_data reads it)
+        insert_params.req = req
         effective_cache_len = len(token_ids)
         for comp in self._components_tuple:
             cl = comp.prepare_for_caching_req(

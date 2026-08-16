@@ -349,7 +349,10 @@ class SWAComponent(TreeComponent):
         # the correct carry from empty. Capture the inserting run's ring at
         # this node boundary (chunk end) — match-side restore reproduces the
         # exact carry a full recompute would have had.
-        if params.req is not None:
+        # NOTE: InsertParams has no `req` field; cache_(un)finished_req
+        # attaches it dynamically before insert.
+        _ins_req = getattr(params, "req", None)
+        if _ins_req is not None:
             try:
                 _gk = getattr(
                     self.cache.token_to_kv_pool_allocator, "get_kvcache", None
