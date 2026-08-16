@@ -2332,11 +2332,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         # positions BEYOND the match — restoring one would
                         # be position-misaligned.
                         _node = getattr(req, "last_node", None)
-                        _cd128 = (
-                            _node.component_data.get(ComponentType.SWA)
-                            if _node is not None
-                            else None
-                        )
+                        _cd128 = None
+                        if _node is not None:
+                            try:
+                                _cd128 = _node.component_data[ComponentType.SWA]
+                            except Exception:
+                                _cd128 = None
                         _snap128 = (
                             getattr(_cd128, "c128_state_snapshot", None)
                             if _cd128 is not None
@@ -2346,8 +2347,33 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                             _c128_restored = bool(
                                 _restore_c128_fn(int(req.req_pool_idx), _snap128)
                             )
-                except Exception:
+                        if getattr(ScheduleBatch, "_c128res_log_left", 5) > 0:
+                            ScheduleBatch._c128res_log_left = (
+                                getattr(ScheduleBatch, "_c128res_log_left", 5) - 1
+                            )
+                            import logging as _rl
+
+                            _state = (
+                                "OK" if _c128_restored
+                                else ("MISS" if _snap128 is None else "FAIL")
+                            )
+                            _rl.getLogger(__name__).info(
+                                f"[C128RESTORE-{_state}] pre_len={pre_len}"
+                            )
+                            _res_logged = True
+                        del _res_logged
+                except Exception as _e:
                     _c128_restored = False
+                    if getattr(ScheduleBatch, "_c128res_log_left", 5) > 0:
+                        ScheduleBatch._c128res_log_left = (
+                            getattr(ScheduleBatch, "_c128res_log_left", 5) - 1
+                        )
+                        import logging as _rl
+
+                        _rl.getLogger(__name__).warning(
+                            f"[C128RESTORE-ERR] pre_len={pre_len} "
+                            f"{type(_e).__name__}: {_e}"
+                        )
                 if not _c128_restored:
                     _clear_state_fn(int(req.req_pool_idx))
                 if _clear_swa_ring_fn is not None:
@@ -2414,7 +2440,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                                 for _nd, _nlen in _chain:
                                     if _seg_end <= _lo:
                                         break
-                                    _cd = _nd.component_data.get(ComponentType.SWA)
+                                    _cd = None
+                                    try:
+                                        _cd = _nd.component_data[ComponentType.SWA]
+                                    except Exception:
+                                        _cd = None
                                     _snap = (
                                         getattr(_cd, "swa_content_snapshot", None)
                                         if _cd
