@@ -2382,7 +2382,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                                         break
                                     _cd = _nd.component_data.get(ComponentType.SWA)
                                     _snap = (
-                                        getattr(_cd, "host_value", None) if _cd else None
+                                        getattr(_cd, "swa_content_snapshot", None)
+                                        if _cd
+                                        else None
                                     )
                                     if _snap is not None and _nlen > 0:
                                         _seg_start = max(_lo, _seg_end - _win)

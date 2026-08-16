@@ -276,6 +276,26 @@ def build_kv_cache(
     # SWA. Every request's SWA window arrives fresh via the PD transfer, so
     # matching is FULL-only and the trailing window is recomputed by prefill
     # (see UnifiedRadixCache.swa_served_from_tree).
+    # Unified-kv ring mode: the SWA pool is a per-request scratch ring
+    # (rpi*ring + pos%ring). The tree can NEVER own SWA content in this mode —
+    # the revival branches (_restore_device_value_with_locked_full et al.) were
+    # written for the separate-pool layout and double-free / burn stale
+    # mappings under unified (empirically: full_num_used = -139520 crash once
+    # an insert actually walks into them). swa_served_from_tree=False disables
+    # the whole revival family; the tree still caches FULL, and radix-hit
+    # resumes are made deterministic by the snapshot-restore protocol
+    # (swa_component._snapshot_unified_swa + schedule_batch restore). Decode
+    # already runs this mode; now cover prefill too.
+    _unified_ring = False
+    try:
+        _kc_getter = getattr(tree_cache.token_to_kv_pool_allocator, "get_kvcache", None)
+        _kc = _kc_getter() if _kc_getter is not None else None
+        _unified_ring = getattr(_kc, "unified_kv_pool", None) is not None
+    except Exception:
+        _unified_ring = False
+    if _unified_ring and is_hybrid_swa and hasattr(tree_cache, "swa_served_from_tree"):
+        tree_cache.swa_served_from_tree = False
+
     if (
         server_args.disaggregation_decode_enable_radix_cache
         and server_args.disaggregation_mode == "decode"

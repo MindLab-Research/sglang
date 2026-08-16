@@ -98,7 +98,9 @@ class SWAComponent(TreeComponent):
         overwritten. Only the LAST ring-stride positions have position-valid
         content (earlier rows were overwritten by same-mod later positions),
         so the snapshot is capped to the trailing ring window. Stored on the
-        node's host_value; non-unified pools are a no-op."""
+        component data's dedicated ``swa_content_snapshot`` field (NOT
+        host_value — that belongs to the HiCache host-tier bookkeeping);
+        non-unified pools are a no-op."""
         try:
             get_kvcache = getattr(
                 self.cache.token_to_kv_pool_allocator, "get_kvcache", None
@@ -116,7 +118,7 @@ class SWAComponent(TreeComponent):
             rows = swa_value[-ring:] if swa_value.numel() > ring else swa_value
             snap = snap_fn(rows)
             if snap is not None:
-                node.component_data[self.component_type].host_value = snap
+                node.component_data[self.component_type].swa_content_snapshot = snap
         except Exception:
             pass
 
@@ -322,9 +324,23 @@ class SWAComponent(TreeComponent):
     ) -> None:
         if not is_new_leaf:
             return
-        # Decode-disagg radix: keep the leaf a SWA tombstone -- the request's
-        # SWA ring is per-request state, translating tree FULL slots to SWA
-        # here would publish SWA values the tree does not really own.
+        # Unified-kv snapshot protocol: capture the leaf's trailing ring-stride
+        # CONTENT now — the one moment the inserting request still owns the
+        # rows. This MUST run before the tombstone early-return below: in
+        # unified ring mode the tree never serves SWA (swa_served_from_tree=
+        # False on both PD sides), and the snapshot is exactly what makes a
+        # radix-hit resume deterministic (match-side restore reads it).
+        # No-op on non-unified pools (snapshot_swa_rows absent).
+        self._snapshot_unified_swa(
+            node,
+            self._translate_full_to_swa(
+                node.component_data[BASE_COMPONENT_TYPE].value
+            ),
+        )
+        # Decode-disagg radix / unified-kv rings: keep the leaf a SWA tombstone
+        # -- the request's SWA ring is per-request state, translating tree
+        # FULL slots to SWA here would publish SWA values the tree does not
+        # really own.
         if not getattr(self.cache, "swa_served_from_tree", True):
             return
 
