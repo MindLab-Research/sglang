@@ -1020,63 +1020,135 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 rows[:, :half].zero_()
                 rows[:, half:].fill_(float("-inf"))
 
-    def clear_swa_ring_for_req(self, req_pool_idx: int) -> None:
-        """Zero the per-request SWA ring rows of one req slot in the unified
-        KV buffers.
+    def snapshot_swa_rows(self, swa_rows: torch.Tensor) -> Optional[torch.Tensor]:
+        """Capture unified-kv SWA ring-row CONTENT for tree nodes (host copy).
 
-        The unified-kv SWA ring is addressed by (req_pool_idx, pos % ring).
-        A radix-hit request recomputes the trailing window; the FIRST
-        recomputed token's sliding-window attention reads ring rows at
-        positions [prefix-window, prefix) that this request never wrote —
-        they hold the PREVIOUS request that owned this req slot. Because
-        req_pool_idx differs across runs, the stale rows differ run-to-run:
-        identical greedy requests diverge (the radix-hit nondeterminism).
+        In unified-kv mode the SWA "value" the radix tree stores is a set of
+        ring-row IDs, which dangle once the inserting request's req slot is
+        reused (ring rows are per-request scratch). This helper captures the
+        actual per-layer content at insert time — the only moment the
+        inserting request still owns the rows — as a stable host tensor.
+        Returns None on non-unified pools (slot IDs are content-stable there).
+        """
+        pool = getattr(self, "unified_kv_pool", None)
+        if pool is None or swa_rows is None or swa_rows.numel() == 0:
+            return None
+        rows = swa_rows.to(torch.long)
+        chunks = [buf[rows].to("cpu", copy=True) for buf in pool.kv_buffer]
+        return torch.stack(chunks, dim=0) if chunks else None
 
-        Zeroing the ring makes the resumed window read an empty history —
-        the same semantics as starting a sequence at position 0 — and the
-        recomputed window (>ring) rewrites the ring before any later token
-        depends on it. Cheap: ring_size rows per SWA layer per hit request.
+    def restore_swa_rows_and_remap(
+        self,
+        snapshot: torch.Tensor,
+        full_locs: torch.Tensor,
+        positions: torch.Tensor,
+        req_pool_idx: int,
+    ) -> bool:
+        """Restore a snapshot into the CURRENT request's own ring rows and
+        redirect the burned full->swa mapping for those positions.
+
+        After this, window attention for positions in `positions` resolves
+        through full_to_swa to rows this request owns, holding the content
+        captured at insert time — exactly what a fresh full computation would
+        have produced for those positions. Deterministic AND bit-equivalent.
+        """
+        pool = getattr(self, "unified_kv_pool", None)
+        mapping = getattr(self, "full_to_swa_index_mapping", None)
+        if pool is None or mapping is None or snapshot is None:
+            return False
+        if snapshot.ndim != 3 or snapshot.shape[0] != len(pool.kv_buffer):
+            return False
+        stride = int(pool.swa_ring_size)
+        rpi = int(req_pool_idx)
+        if rpi * stride + stride > int(pool.swa_pages):
+            return False
+        pos = positions.to(torch.long)
+        rows = rpi * stride + (pos % stride)
+        dev = pool.kv_buffer[0].device
+        rows_dev = rows.to(dev)
+        for li, buf in enumerate(pool.kv_buffer):
+            buf[rows_dev] = snapshot[li].to(dev)
+        if mapping.dtype == torch.int32:
+            mapping[full_locs.to(dev).to(torch.long)] = rows_dev.to(torch.int32)
+        else:
+            mapping[full_locs.to(dev).to(torch.long)] = rows_dev
+        return True
+
+    def clear_swa_ring_for_req(
+        self,
+        req_pool_idx: int,
+        prefix_len: int = 0,
+        prefix_locs: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Zero the SWA rows a radix-hit request will actually READ.
+
+        In unified-kv mode, full_to_swa_index_mapping[full_loc] is burned in
+        at WRITE time — it points at the ORIGINAL writer's ring rows
+        (writer_rpi * ring + pos % ring), not the current request's. A hit
+        request's window attention for the first recomputed token reads
+        positions [prefix-window, prefix) via this mapping, i.e. the previous
+        writer's ring rows — zeroing the CURRENT request's ring (as an
+        earlier attempt did) clears rows that are never read.
+
+        Zeroing the mapped rows is globally deterministic: every future hit
+        on the same tree node reads the same zeroed window (empty-history
+        semantics, consistent with swa never being restored from the tree —
+        the decode side already runs swa_served_from_tree=False). The
+        recomputed window rewrites the current request's own rows.
+
+        Also zeroes the current request's own ring rows (cheap, covers the
+        fresh-allocation path).
         """
         pool = getattr(self, "unified_kv_pool", None)
         if pool is None:
             return
+        # 1) current request's own ring rows
         ring = int(pool.swa_ring_size)
         start = int(req_pool_idx) * ring
-        if start + ring > int(pool.swa_pages):
+        if 0 <= start and start + ring <= int(pool.swa_pages):
+            for buf in pool.kv_buffer:
+                buf[start : start + ring].zero_()
+        # 2) the rows the resume actually reads: mapped swa rows of the hit
+        #    window [prefix - window - margin, prefix)
+        if prefix_len <= 0 or prefix_locs is None or prefix_locs.numel() == 0:
+            return
+        window = int(self.sliding_window or 0) + 2 * int(self.page_size or 256)
+        lo = max(0, prefix_len - window)
+        raw = prefix_locs[lo:prefix_len].to(torch.long)
+        if raw.numel() == 0:
+            return
+        swa = self.translate_loc_from_full_to_swa(raw)
+        swa = swa[(swa >= 0) & (swa < int(pool.swa_pages))].to(torch.long)
+        if swa.numel() == 0:
             return
         for buf in pool.kv_buffer:
-            buf[start : start + ring].zero_()
+            buf[swa].zero_()
 
     def clear_c4_carry_for_prefix(
         self,
         req_pool_idx: int,
         prefix_len: int,
-        req_to_token_row: torch.Tensor,
+        prefix_locs: torch.Tensor,
     ) -> None:
         """Blank the c4 compress-state rows a radix-hit request will READ as
         pre-carry at its hit boundary.
 
+        ``prefix_locs`` must be the FULL-pool locs of the hit region
+        (req.prefix_indices[:prefix_len]) — NOT req_to_token rows, which are
+        not yet populated for the prefix at prepare_for_extend time on the
+        prefill side (reading them yields stale locs and clears wrong rows).
+
         The c4 compressor resumes at the hit boundary: it reads carry state
-        rows addressed by (swa page of the OLD prefix slots) via
+        rows addressed by (swa page of the prefix locs) via
         translate_from_swa_loc_to_state_loc. Those rows were last written by
-        whatever request previously owned those pages (the radix tree never
-        restores them; unified-kv hicache does not persist them), so they are
-        stale garbage that varies with slot history — the source of divergent
-        greedy reruns / token loops.
-
-        Blanking them to the sentinel (kv=0, score=-inf) makes the resumed
-        compression start from an empty carry. The reprefill window
-        (swa_reprefill_tail_tokens = window+page) already forces >=384 tokens
-        of recomputation, well beyond the c4 ring span, so the sliding-window
-        compress state rebuilds itself before any new output depends on it.
-
-        Only touches rows in the state pools addressed by the swa-loc mapping
-        (c4 + c4-indexer families). The rpi-ring families (c128) are already
-        cleared by clear_compress_req_state.
+        whatever request previously owned those pages, so they are stale
+        garbage that varies with slot history — the radix-hit nondeterminism.
+        Blanking to the sentinel (kv=0, score=-inf) gives an empty carry; the
+        reprefill window (window+page) forces enough recomputation that the
+        sliding compress state rebuilds before any new token depends on it.
         """
-        if prefix_len <= 0:
+        if prefix_len <= 0 or prefix_locs is None or prefix_locs.numel() == 0:
             return
-        device = req_to_token_row.device
         families = (
             getattr(self, "compress_state_pools", None),
             getattr(self, "indexer_compress_state_pools", None),
@@ -1089,14 +1161,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                     continue  # c128 uses rpi-ring addressing (already cleared)
                 # Cover the FULL ring lookback the paged planner may read
                 # (ring_size slots x ratio tokens), not just the trailing
-                # partial-block carry the HIP path uses — the CUDA C++
-                # planner walks the whole ring.
+                # partial-block carry the HIP path uses.
                 ring_tok = int(pool.ring_size) * int(pool.ratio)
                 lo = max(0, prefix_len - ring_tok)
-                positions = torch.arange(lo, prefix_len, device=device)
-                if positions.numel() == 0:
+                raw_loc = prefix_locs[lo:prefix_len].to(torch.long)
+                if raw_loc.numel() == 0:
                     continue
-                raw_loc = req_to_token_row[positions.to(torch.long)]
                 swa_loc = self.translate_loc_from_full_to_swa(raw_loc)
                 state_loc = pool.translate_from_swa_loc_to_state_loc(swa_loc)
                 state_loc = state_loc[state_loc >= 0]

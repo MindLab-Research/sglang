@@ -92,6 +92,28 @@ class SWAComponent(TreeComponent):
             case _:
                 raise ValueError(f"Unknown LRURefreshPhase: {phase}")
 
+    def _snapshot_unified_swa(self, node: UnifiedTreeNode, swa_value: torch.Tensor) -> None:
+        """Unified-kv: capture the ring-row CONTENT the node's swa_value points
+        to, before the inserting request's slot is reused and the rows are
+        overwritten. Stored on the node's host_value; non-unified pools are a
+        no-op (slot IDs are content-stable there)."""
+        try:
+            get_kvcache = getattr(
+                self.cache.token_to_kv_pool_allocator, "get_kvcache", None
+            )
+            snap_fn = (
+                getattr(get_kvcache(), "snapshot_swa_rows", None)
+                if get_kvcache is not None
+                else None
+            )
+            if snap_fn is None:
+                return
+            snap = snap_fn(swa_value)
+            if snap is not None:
+                node.component_data[self.component_type].host_value = snap
+        except Exception:
+            pass
+
     def _restore_device_value(self, node: UnifiedTreeNode, value: torch.Tensor) -> None:
         ct = self.component_type
         node.component_data[ct].value = value
@@ -308,6 +330,7 @@ class SWAComponent(TreeComponent):
                 node.component_data[BASE_COMPONENT_TYPE].value
             )
             node.component_data[self.component_type].value = swa_value
+            self._snapshot_unified_swa(node, swa_value)
             self.cache.lru_lists[self.component_type].insert_mru(node)
             self.cache.component_evictable_size_[self.component_type] += len(swa_value)
         elif split_pos < len(node.key):
@@ -319,6 +342,7 @@ class SWAComponent(TreeComponent):
                 node.component_data[BASE_COMPONENT_TYPE].value
             )
             node.component_data[self.component_type].value = swa_value
+            self._snapshot_unified_swa(node, swa_value)
             self.cache.lru_lists[self.component_type].insert_mru(node)
             self.cache.component_evictable_size_[self.component_type] += len(swa_value)
         else:

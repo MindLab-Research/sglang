@@ -2313,24 +2313,88 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ):
                 _clear_state_fn(int(req.req_pool_idx))
                 if _clear_swa_ring_fn is not None:
-                    # Zero the per-req SWA ring: the first recomputed token's
-                    # sliding-window attention would otherwise read the ring
-                    # rows the PREVIOUS owner of this req slot wrote.
+                    # Unified-kv SWA resume: first try to RESTORE the boundary
+                    # window from tree node content snapshots (insert-time
+                    # capture — bit-equivalent to a fresh computation), falling
+                    # back to zeroing the ring only when no snapshot exists.
+                    from sglang.srt.mem_cache.unified_cache_components import (
+                        ComponentType,
+                    )
+
+                    restored = False
                     try:
-                        _clear_swa_ring_fn(int(req.req_pool_idx))
+                        _get_kc = getattr(
+                            self.tree_cache.token_to_kv_pool_allocator,
+                            "get_kvcache",
+                            None,
+                        )
+                        _kc = _get_kc() if _get_kc is not None else None
+                        _restore_fn = (
+                            getattr(_kc, "restore_swa_rows_and_remap", None)
+                            if _kc is not None
+                            else None
+                        )
+                        if _restore_fn is not None and req.prefix_indices is not None:
+                            _win = int(
+                                getattr(self, "sliding_window_size", None) or 128
+                            ) + 2 * 256
+                            _lo = max(0, pre_len - _win)
+                            _pfx = req.prefix_indices
+                            if len(_pfx) >= pre_len:
+                                _locs = _pfx[_lo:pre_len]
+                                _poss = torch.arange(_lo, pre_len, dtype=torch.int64)
+                                _node = getattr(req, "last_node", None)
+                                _remaining = pre_len - _lo
+                                while (
+                                    _node is not None
+                                    and getattr(_node, "parent", None) is not None
+                                    and _remaining > 0
+                                ):
+                                    _cd = _node.component_data.get(ComponentType.SWA)
+                                    _snap = (
+                                        getattr(_cd, "host_value", None) if _cd else None
+                                    )
+                                    if _snap is not None:
+                                        _nlen = len(getattr(_node, "key", []) or [])
+                                        _seg = min(_remaining, _nlen)
+                                        _ok = _restore_fn(
+                                            _snap,
+                                            _locs[:_seg],
+                                            _poss[:_seg],
+                                            int(req.req_pool_idx),
+                                        )
+                                        restored = restored or bool(_ok)
+                                    _remaining -= len(getattr(_node, "key", []) or [])
+                                    _node = getattr(_node, "parent", None)
                     except Exception:
-                        pass
+                        restored = False
+                    if not restored:
+                        try:
+                            _clear_swa_ring_fn(
+                                int(req.req_pool_idx),
+                                int(pre_len),
+                                (
+                                    req.prefix_indices
+                                    if req.prefix_indices is not None
+                                    else None
+                                ),
+                            )
+                        except Exception:
+                            pass
                 if _clear_c4_carry_fn is not None:
                     # Blank the swa-loc-addressed c4 carry rows at the hit
-                    # boundary (the compressor reads the last <=7 slots' state
-                    # rows there; they hold the previous page owner's state).
+                    # boundary. Pass req.prefix_indices (the authoritative
+                    # hit-region locs, set at match time) — req_to_token
+                    # prefix rows are not yet written at this point on the
+                    # prefill side.
                     try:
-                        _r2t = self.req_to_token_pool.req_to_token
-                        _clear_c4_carry_fn(
-                            int(req.req_pool_idx),
-                            int(pre_len),
-                            _r2t[int(req.req_pool_idx)],
-                        )
+                        _pfx = req.prefix_indices
+                        if _pfx is not None and len(_pfx) >= pre_len:
+                            _clear_c4_carry_fn(
+                                int(req.req_pool_idx),
+                                int(pre_len),
+                                _pfx,
+                            )
                     except Exception:
                         pass
                 if getattr(ScheduleBatch, "_state_clear_ran_left", 5) > 0:
