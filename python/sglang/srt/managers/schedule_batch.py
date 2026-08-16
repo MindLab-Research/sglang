@@ -2237,6 +2237,26 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self
         )
 
+        import os as _os
+
+        if _os.environ.get("SGLANG_DEBUG_ALLOC", "0") == "1":
+            # Temporary allocation-fingerprint diagnostics for the radix-hit
+            # nondeterminism hunt (see AGENTS.md 2026-08-16 entry). Logs the
+            # per-request slot range so diverging serial runs can be compared.
+            import logging as _lg
+
+            _off = 0
+            for _i, _req in enumerate(reqs):
+                _E = int(extend_lens[_i])
+                _blk = out_cache_loc[_off : _off + _E]
+                _lg.getLogger(__name__).info(
+                    f"[ALLOC-DIAG] rid={_req.rid} rpi={_req.req_pool_idx} "
+                    f"prefix={int(prefix_lens[_i])} E={_E} "
+                    f"loc0={int(_blk[0]) if _E > 0 else -1} "
+                    f"locN={int(_blk[-1]) if _E > 0 else -1}"
+                )
+                _off += _E
+
         # Set fields
         input_embeds = []
         all_replace_embeds: List[torch.Tensor] = []
@@ -2250,8 +2270,68 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mamba_track_indices_cpu = []
         mamba_track_seqlens_cpu = []
 
+        # DSV4 compress-state hygiene: a FIRST extend (extend_batch_idx == 0)
+        # with a radix-tree prefix resumes the compressor mid-sequence; the
+        # request-scoped c4/c128 state ring rows at this req_pool_idx would
+        # otherwise hold the previous request's carry (cross-request
+        # contamination -> divergent greedy reruns / token loops). Later chunks
+        # (extend_batch_idx > 0) legitimately carry this request's own state
+        # in those rows and must NOT be cleared. Best-effort: no-op on
+        # non-DSV4 pools.
+        _clear_state_fn = None
+        _clear_c4_carry_fn = None
+        try:
+            _get_kvcache = getattr(
+                self.tree_cache.token_to_kv_pool_allocator, "get_kvcache", None
+            )
+            if _get_kvcache is not None:
+                _kvcache = _get_kvcache()
+                _clear_state_fn = getattr(_kvcache, "clear_compress_req_state", None)
+                _clear_c4_carry_fn = getattr(_kvcache, "clear_c4_carry_for_prefix", None)
+        except Exception:
+            _clear_state_fn = None
+        if getattr(ScheduleBatch, "_state_clear_diag_left", 5) > 0:
+            ScheduleBatch._state_clear_diag_left = (
+                getattr(ScheduleBatch, "_state_clear_diag_left", 5) - 1
+            )
+            import logging as _dlg
+
+            _dlg.getLogger(__name__).info(
+                f"[STATE-CLEAR-DIAG] alloc_type={type(self.tree_cache.token_to_kv_pool_allocator).__name__} "
+                f"get_kvcache={_get_kvcache is not None} clear_fn={_clear_state_fn is not None}"
+            )
+
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
             assert seq_len - pre_len == req.extend_range.length
+
+            if (
+                _clear_state_fn is not None
+                and req.extend_batch_idx == 0
+                and pre_len > 0
+            ):
+                _clear_state_fn(int(req.req_pool_idx))
+                if _clear_c4_carry_fn is not None:
+                    # Blank the swa-loc-addressed c4 carry rows at the hit
+                    # boundary (the compressor reads the last <=7 slots' state
+                    # rows there; they hold the previous page owner's state).
+                    try:
+                        _r2t = self.req_to_token_pool.req_to_token
+                        _clear_c4_carry_fn(
+                            int(req.req_pool_idx),
+                            int(pre_len),
+                            _r2t[int(req.req_pool_idx)],
+                        )
+                    except Exception:
+                        pass
+                if getattr(ScheduleBatch, "_state_clear_ran_left", 5) > 0:
+                    ScheduleBatch._state_clear_ran_left = (
+                        getattr(ScheduleBatch, "_state_clear_ran_left", 5) - 1
+                    )
+                    import logging as _rlg
+
+                    _rlg.getLogger(__name__).info(
+                        f"[STATE-CLEAR-RAN] rid={req.rid} rpi={req.req_pool_idx} pre_len={pre_len}"
+                    )
 
             req.extend_batch_idx += 1
 

@@ -1020,6 +1020,104 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 rows[:, :half].zero_()
                 rows[:, half:].fill_(float("-inf"))
 
+    def clear_c4_carry_for_prefix(
+        self,
+        req_pool_idx: int,
+        prefix_len: int,
+        req_to_token_row: torch.Tensor,
+    ) -> None:
+        """Blank the c4 compress-state rows a radix-hit request will READ as
+        pre-carry at its hit boundary.
+
+        The c4 compressor resumes at the hit boundary: it reads carry state
+        rows addressed by (swa page of the OLD prefix slots) via
+        translate_from_swa_loc_to_state_loc. Those rows were last written by
+        whatever request previously owned those pages (the radix tree never
+        restores them; unified-kv hicache does not persist them), so they are
+        stale garbage that varies with slot history — the source of divergent
+        greedy reruns / token loops.
+
+        Blanking them to the sentinel (kv=0, score=-inf) makes the resumed
+        compression start from an empty carry. The reprefill window
+        (swa_reprefill_tail_tokens = window+page) already forces >=384 tokens
+        of recomputation, well beyond the c4 ring span, so the sliding-window
+        compress state rebuilds itself before any new output depends on it.
+
+        Only touches rows in the state pools addressed by the swa-loc mapping
+        (c4 + c4-indexer families). The rpi-ring families (c128) are already
+        cleared by clear_compress_req_state.
+        """
+        if prefix_len <= 0:
+            return
+        device = req_to_token_row.device
+        try:
+            from sglang.srt.layers.attention.dsv4.compress_hip import (
+                CompressHIP,
+            )
+
+            positions = CompressHIP.compute_state_len_indices(
+                seq_len=prefix_len, ratio=4
+            ).to(device)
+        except Exception:
+            return
+        families = (
+            getattr(self, "compress_state_pools", None),
+            getattr(self, "indexer_compress_state_pools", None),
+        )
+        for pools in families:
+            if pools is None:
+                continue
+            for pool in pools:
+                if pool is None or pool.ratio != 4:
+                    continue  # c128 uses rpi-ring addressing (already cleared)
+                raw_loc = req_to_token_row[positions.to(torch.long)]
+                swa_loc = self.translate_loc_from_full_to_swa(raw_loc)
+                state_loc = pool.translate_from_swa_loc_to_state_loc(swa_loc)
+                state_loc = state_loc[state_loc >= 0]
+                if state_loc.numel() == 0:
+                    continue
+                rows = pool.kv_score_buffer.kv_score[state_loc.to(torch.long)]
+                half = rows.shape[-1] // 2
+                rows[..., :half].zero_()
+                rows[..., half:].fill_(float("-inf"))
+
+    def clear_compress_req_state(self, req_pool_idx: int) -> None:
+        """Reset ALL request-scoped compress-state ring rows for one req slot.
+
+        Covers every state family (compress + indexer) and every ratio (c4 AND
+        c128). A radix-hit extend resumes the compressor mid-sequence: the ring
+        rows addressed by (req_pool_idx, pos % ring_size) otherwise hold the
+        PREVIOUS request's carry on this slot, silently corrupting the
+        compressed KV written for the delta. Symptom: identical greedy reruns
+        diverge (incl. token-level loops) depending on slot history. The c128
+        half of this is what clear_c128_req_state has always done at decode
+        bootstrap; the c4 half had no clearing anywhere, and nothing cleared
+        on the prefill side at all.
+        """
+        req_pool_idx = int(req_pool_idx)
+        families = (
+            getattr(self, "compress_state_pools", None),
+            getattr(self, "indexer_compress_state_pools", None),
+        )
+        for pools in families:
+            if pools is None:
+                continue
+            for pool in pools:
+                if pool is None:
+                    continue
+                state = pool.kv_score_buffer.kv_score
+                if getattr(pool, "online", False) or pool.ring_size == 1:
+                    row = state[req_pool_idx]
+                    head_dim = row.shape[-1] // 3
+                    row[:head_dim].fill_(float("-inf"))
+                    row[head_dim:].zero_()
+                else:
+                    start = req_pool_idx * pool.ring_size
+                    rows = state[start : start + pool.ring_size]
+                    half = rows.shape[-1] // 2
+                    rows[..., :half].zero_()
+                    rows[..., half:].fill_(float("-inf"))
+
     def clear_unaccepted_c128_draft_states(
         self,
         req_pool_indices: torch.Tensor,
