@@ -295,18 +295,19 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     def init_cuda_graphs(self):
         capture_decode_cuda_graph = not self.server_args.disable_cuda_graph
-        # PD disaggregation: draft CUDA graph buffers are captured at fixed bs
-        # but concurrent requests produce variable batch sizes (bs=1 graph vs
-        # bs=3 batch → _foreach_copy_ shape mismatch crash). Disable draft CUDA
-        # graph in PD mode; the draft model is small so eager mode is cheap.
-        if getattr(self.server_args, 'disaggregation_mode', None) is not None:
-            pd_mode = str(self.server_args.disaggregation_mode)
-            if pd_mode in ('decode', 'prefill'):
-                capture_decode_cuda_graph = False
-                logger.info(
-                    "Disable DSpark draft CUDA graph in PD disaggregation mode "
-                    "(variable batch sizes require eager mode)."
-                )
+        # The draft forward goes through the generic DecodeCudaGraphRunner
+        # (TARGET_VERIFY capture mode, bucket-padded like EAGLE), so variable
+        # concurrent batch sizes are supported. The old PD-mode disable dodged a
+        # bs=1-graph vs bs=3-batch _foreach_copy_ shape-mismatch crash that is
+        # now fixed at the buffer-registry layer (_grouped_foreach_copy_ +
+        # [FILL-MISMATCH] diagnostics). Re-enable draft graph; keep an escape
+        # hatch in case a residual shape mismatch resurfaces.
+        if envs.SGLANG_DSPARK_PD_DISABLE_DRAFT_CUDA_GRAPH.get():
+            capture_decode_cuda_graph = False
+            logger.warning(
+                "Disable DSpark draft CUDA graph via "
+                "SGLANG_DSPARK_PD_DISABLE_DRAFT_CUDA_GRAPH=1."
+            )
         if is_cuda() and capture_decode_cuda_graph:
             available_mem = get_available_gpu_memory(self.device, self.gpu_id)
             if available_mem < 1.0:

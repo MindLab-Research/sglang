@@ -304,6 +304,10 @@ class Envs:
     SGLANG_DSPARK_OPT_MARKOV_W2_BF16 = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD = EnvBool(True)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
+    # Escape hatch: re-disable the DSpark draft CUDA graph if a residual
+    # shape-mismatch resurfaces after the _foreach_copy_ fix. Default off
+    # (= draft graph enabled, the intended state).
+    SGLANG_DSPARK_PD_DISABLE_DRAFT_CUDA_GRAPH = EnvBool(False)
     SGLANG_DEBUG_REVERT_PR = EnvInt(0)
     SGLANG_PHASE_CHECKER_DEBUG = EnvBool(False)
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
