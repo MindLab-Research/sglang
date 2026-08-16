@@ -290,7 +290,14 @@ def build_kv_cache(
     try:
         _kc_getter = getattr(tree_cache.token_to_kv_pool_allocator, "get_kvcache", None)
         _kc = _kc_getter() if _kc_getter is not None else None
-        _unified_ring = getattr(_kc, "unified_kv_pool", None) is not None
+        if _kc is not None:
+            # DSV4 unified-mode markers (deepseek_v4_memory_pool): in unified
+            # mode swa_kv_pool/c4_kv_pool are set to None and the unified
+            # accessor exists. In split mode swa_kv_pool is a real pool.
+            _unified_ring = (
+                getattr(_kc, "swa_kv_pool", None) is None
+                and getattr(_kc, "get_unified_kv", None) is not None
+            )
     except Exception:
         _unified_ring = False
     if _unified_ring and is_hybrid_swa and hasattr(tree_cache, "swa_served_from_tree"):
