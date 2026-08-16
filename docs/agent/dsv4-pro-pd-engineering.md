@@ -108,12 +108,29 @@ kwarg（签名不兼容会在 warmup 即 TypeError）。
 
 ### 3.1 为什么必须两端同开
 
-DSpark hidden 是 target 中间层激活：**不可缓存、不可从 KV 反推**。若只开 prefill
-radix：prefill 命中 139K 前缀 → 只传 delta 段 hidden → decode 侧
-`hidden_start != decode_prefix_len` → 覆盖缺口 → 500 / 流式 out-of-order → abort。
+DSpark hidden 是 target 中间层激活：**不可缓存、不可从 KV 反推，只能由本请求
+实际前向计算产生**。由此产生硬约束：hidden 传输必须精确覆盖
+`[decode_prefix_len, N)`。
 
-结论：**prefill 与 decode 的 radix 语义必须一致**——要么都命中到同一前缀长度，
-要么都不命中。decode 侧启用 `--disaggregation-decode-enable-radix-cache` +
+先分清两类状态的传输语义（传输区间都由 **decode 承诺** `decode_prefix_len` 决定）：
+
+| 状态 | 可缓存？ | 只开 prefill radix（decode 承诺=0） | 两端同开且命中一致 |
+|---|---|---|---|
+| KV（FULL/压缩/SWA） | ✅ 树槽持有 | **全量传**（从树槽读出即发） | 只传 delta |
+| DSpark hidden | ❌ 只能本请求前向产生 | 见下 | 只传 delta |
+
+危险场景是 **prefill 命中超过 decode 承诺且不加钳制**：prefill 命中 139K →
+只对 delta 段 `[139K, N)` 做前向 → hidden 只剩 delta 段 → decode 侧 draft 需要
+`[0, N)` 覆盖 → `hidden_start != decode_prefix_len` / 流式 out-of-order →
+500 / abort（基 1992 实爆即此）。
+
+**解协议**：`init_next_round_input` 将 prefill 的 radix 命中 **clamp 到 decode
+承诺**——prefill 实际计算起点恒等于 `decode_prefix_len`，hidden/KV 传输区间
+由此保持一致。两端同开的真正意义：只有 decode 侧树也命中同一前缀时，
+`decode_prefix_len` 才非零，prefill 才能真正只算 delta、双端只传 delta。
+只开 prefill 侧 = clamp 到 0 = 全量重算 + 全量传输，**正确但零缓存收益**。
+
+decode 侧启用参数：`--disaggregation-decode-enable-radix-cache` +
 `SGLANG_DECODE_RADIX_ALLOW_SWA=1`。
 
 ### 3.2 `swa_served_from_tree = False` 协议
