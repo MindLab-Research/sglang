@@ -308,4 +308,5 @@ rsync -avz --exclude='__pycache__' --exclude='*.pyc' "$SRC" root@<node>:"$DEST"
 | `docs/agent/dspark-pd-deadlocks.md` | DSPARK PD 五个死锁修复链（专用 gloo group / 异常安全 poll / prefill 空分支补偿 / spec_info DSPARK 分支 / hidden materialize），py-spy 死锁形态识别方法 |
 | `docs/agent/decode-radix-swa.md` | DSV4 PD 双端 radix 全链路：为何 DSpark 必须两端同开、`swa_served_from_tree=False` 设计（树不持有 SWA）、四层 bug 修复链（hidden clamp / len-1 match / SWA validator / SWA 池泄漏）、诊断 env 与验证数据 |
 | `docs/agent/dsv4-cp-dspark.md` | DSV4 prefill CP + DSpark PD hidden 共存：三层修复链（hook flag 顺序 / aux hidden all-gather 重组 / decode_engine_rank 对角配对防 8 倍重复发送）、flag 语义辨析（V4 用 interleave 非 GLM layersplit）、SGLANG_DEBUG_DIAG 日志 gate、3.5× 长上下文实测数据 |
+| `docs/agent/dsv4-pro-pd-engineering.md` | **V4 Pro PD 工程总纲报告**：DSPARK PD 分离支持（#31466 hidden 传输 + spec_info 分支 + merge_batch 守卫）、双端 radix（swa_served_from_tree 协议）、CP=8 共存（3.5×）、死锁三连、KV 广播正确性、乱码战争摘要、编译基础设施、性能汇总、残余项边界 |
 | `docs/agent/dsv4-radix-nondet-postmortem.md` | 乱码/循环战争完整 postmortem（2026-08-16，12h）：分层根因（dup 双 free -139520 逐位归因 / SPLIT 池状态污染三件套 / c128 边界字典快照-恢复 / 三个静默失败）/ FORCE_MISS 定音 kernel 级非确定 / 冷热三轮 0 短循环验证 / 可复用判据工具（nondet.py、longloop_scan、ALLOC-DIAG 插桩）/ 经验教训 |
