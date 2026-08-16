@@ -1331,7 +1331,12 @@ class CommonKVReceiver(BaseKVReceiver):
         self.kv_mgr = mgr
         self.conclude_state: Optional[KVPoll] = None
         self.require_staging: bool = False
-        self.init_time: Optional[float] = None
+        # Start the safety clock at construction so a receiver stuck in
+        # KVPoll.Bootstrapping (prefill_info never resolves, bootstrap never
+        # establishes) also times out. Previously only WaitingForInput had a
+        # timeout, so a Bootstrapping-stuck request hung forever with no
+        # client response. send_metadata() resets this when handshake starts.
+        self.init_time: Optional[float] = time.time()
         self.abort_notified: bool = False
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)

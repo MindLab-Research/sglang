@@ -372,6 +372,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # support aborting them we would need an additional fix in the
         # scheduler. In practice this shouldn't arise in the RL scenario.
         self.held_rebootstrap_reqs: List[Req] = []
+        # Safety net for requests staged in retracted_queue /
+        # held_rebootstrap_reqs: rid -> monotonic entry time. If a staged
+        # request cannot resume within SGLANG_DISAGGREGATION_RETRACT_TIMEOUT
+        # (e.g. a very long conversation that no longer fits the KV budget),
+        # it is aborted and streamed back so the client never hangs forever.
+        # This was the "request stuck with no response and zero logs" hole.
+        self.staged_req_deadlines: Dict[str, float] = {}
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         if self.enable_staging and self.is_mla_backend:
             raise RuntimeError(
@@ -543,6 +550,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if is_retracted:
             req.retraction_mb_id = None
             self.retracted_queue.append(req)
+            self.staged_req_deadlines[req.rid] = time.monotonic()
         else:
             decode_req = self._create_receiver_and_enqueue(
                 req, is_rebootstrap=is_rebootstrap
@@ -657,6 +665,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         is recomputed by the prefill worker under the updated weights.
         """
         self.held_rebootstrap_reqs.append(req)
+        self.staged_req_deadlines.setdefault(req.rid, time.monotonic())
 
     def enqueue_held_rebootstrap(self) -> None:
         """Enqueue all staged rebootstrap requests when generation resumes."""
@@ -731,6 +740,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def release_memory_occupation(self):
         self.queue.clear()
         self.retracted_queue.clear()
+        self.staged_req_deadlines.clear()
         if hasattr(self.kv_manager, "deregister_buffer_to_engine"):
             self.kv_manager.deregister_buffer_to_engine()
 
@@ -738,10 +748,65 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if hasattr(self.kv_manager, "register_buffer_to_engine"):
             self.kv_manager.register_buffer_to_engine()
 
+    def _fail_expired_staged_reqs(self) -> None:
+        """Abort retracted/held requests that failed to resume within the
+        retract timeout, streaming an error back to the client.
+
+        Without this, a retracted request whose token budget never fits again
+        (e.g. a ~550K-token multi-turn conversation after KV pressure) sits in
+        ``retracted_queue`` forever: no timeout, no abort, no client response,
+        and zero log lines — exactly the observed "request stuck forever".
+        """
+        timeout_s = envs.SGLANG_DISAGGREGATION_RETRACT_TIMEOUT.get()
+        if timeout_s <= 0 or not self.staged_req_deadlines:
+            return
+        now = time.monotonic()
+        expired_rids = {
+            rid
+            for rid, ts in self.staged_req_deadlines.items()
+            if now - ts >= timeout_s
+        }
+        if not expired_rids:
+            return
+        for attr in ("retracted_queue", "held_rebootstrap_reqs"):
+            lst = getattr(self, attr)
+            remaining = []
+            for req in lst:
+                if req.rid in expired_rids:
+                    self._abort_staged_req(req, timeout_s)
+                else:
+                    remaining.append(req)
+            setattr(self, attr, remaining)
+        for rid in expired_rids:
+            self.staged_req_deadlines.pop(rid, None)
+
+    def _abort_staged_req(self, req: Req, timeout_s: float) -> None:
+        total_tokens = len(req.origin_input_ids) + len(req.output_ids)
+        error_message = (
+            f"Decode request {req.rid} could not resume within "
+            f"{timeout_s:.0f}s after retraction (needs {total_tokens} tokens; "
+            f"KV budget too small or pool busy). Aborting to unblock the client."
+        )
+        logger.error("[RETRACT-TIMEOUT] " + error_message)
+        if getattr(req, "kv_cache_cpu", None) is not None:
+            try:
+                del req.kv_cache_cpu
+            except AttributeError:
+                pass
+        prepare_abort(
+            req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+        )
+        self.scheduler.output_streamer.stream_output([req], req.return_logprob)
+        if self.scheduler.metrics_reporter.enable_metrics:
+            self.scheduler.metrics_collector.increment_transfer_failed_reqs()
+
     def resume_retracted_reqs(
         self, rids_to_check: Optional[List[str]] = None
     ) -> List[Req]:
         # TODO refactor the scheduling part, reuse with the unified engine logic as much as possible
+
+        # Fail requests that have been staged too long (safety net).
+        self._fail_expired_staged_reqs()
 
         # allocate memory
         resumed_reqs = []
@@ -786,6 +851,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             resumed_reqs.append(req)
             indices_to_remove.add(i)
             req.is_retracted = False
+            self.staged_req_deadlines.pop(req.rid, None)
             self._pre_alloc(req)
             full_allocatable_tokens -= full_required
             if uses_swa_tail_prealloc:

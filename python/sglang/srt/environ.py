@@ -393,6 +393,11 @@ class Envs:
     # side's chunked_prefill_size so one prefill chunk always fits.
     SGLANG_PD_HIDDEN_STREAMING_CHUNK_ROWS = EnvInt(16384)
     SGLANG_PD_HIDDEN_STREAMING_DEPTH = EnvInt(2)
+    # Safety net for retracted/held requests on the decode side: if a request
+    # cannot resume within this many seconds after retraction, abort it and
+    # stream the error to the client instead of hanging forever (0 = disabled,
+    # strongly discouraged).
+    SGLANG_DISAGGREGATION_RETRACT_TIMEOUT = EnvInt(600)
 
     # Scheduler: others:
     # in seconds. Set if you observe high memory accumulation over a long serving period.

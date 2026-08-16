@@ -2935,6 +2935,13 @@ class MooncakeKVReceiver(CommonKVReceiver):
             timeout_result = self._check_waiting_timeout()
             if timeout_result is not None:
                 return timeout_result
+        elif status == KVPoll.Bootstrapping:
+            # Safety net: a receiver whose bootstrap never establishes (e.g.
+            # the router dispatched the request but prefill never received it)
+            # previously polled Bootstrapping forever with no timeout.
+            timeout_result = self._check_waiting_timeout()
+            if timeout_result is not None:
+                return timeout_result
 
         return status
 
