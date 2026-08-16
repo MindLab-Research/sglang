@@ -1105,6 +1105,35 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             mapping[full_locs.to(dev).to(torch.long)] = rows_dev
         return True
 
+    def _swa_flat_rows(self, swa_locs: torch.Tensor) -> Optional[torch.Tensor]:
+        """Byte-flat index helper for the SPLIT SWA pool.
+
+        kv_buffer[li] is a byte plane [num_pages, bytes_per_page_padded] of
+        uint8; token `loc` lives at page loc//page_size, byte offset
+        (loc%page_size)*bytes_per_token within that page's DATA region.
+        Returns per-token flattened byte indices (num_locs, bytes_per_token),
+        or None when the pool/layout is unavailable.
+        """
+        pool = getattr(self, "swa_kv_pool", None)
+        if pool is None:
+            return None
+        try:
+            page_size = int(pool.page_size)
+            bytes_per_page = int(pool.bytes_per_page_padded)
+            bytes_per_tok = int(pool.get_bytes_per_token())
+        except Exception:
+            return None
+        loc = swa_locs.to(torch.long)
+        n_pages = int(pool.kv_buffer[0].shape[0])
+        loc = loc[(loc >= 0) & (loc < n_pages * page_size)]
+        if loc.numel() == 0:
+            return None
+        page = torch.div(loc, page_size, rounding_mode="floor")
+        off = (loc % page_size) * bytes_per_tok
+        base = page * bytes_per_page + off
+        tok_range = torch.arange(bytes_per_tok, device=loc.device)
+        return base[:, None] + tok_range[None, :]
+
     def clear_swa_ring_for_req(
         self,
         req_pool_idx: int,
@@ -1126,9 +1155,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             getattr(type(self), "_swaclear_diag_left", 5) > 0
             and _os.environ.get("SGLANG_DEBUG_ALLOC", "0") == "1"
         )
-        # ---- Split layout: swa_kv_pool is a real paged pool ----
-        split_pool = getattr(self, "swa_kv_pool", None)
-        if split_pool is not None and getattr(self, "unified_kv_pool", None) is None:
+        # ---- Split layout: byte-plane pool, zero via flattened byte idx ----
+        if getattr(self, "swa_kv_pool", None) is not None and getattr(
+            self, "unified_kv_pool", None
+        ) is None:
             if prefix_len <= 0 or prefix_locs is None or prefix_locs.numel() == 0:
                 return
             window = int(self.sliding_window or 0) + 2 * int(
@@ -1152,7 +1182,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                         f"{type(_e).__name__}: {_e}"
                     )
                 return
-            swa = swa[(swa >= 0) & (swa < int(split_pool.size))].to(torch.long)
+            byte_idx = self._swa_flat_rows(swa)
             if _diag:
                 type(self)._swaclear_diag_left = (
                     getattr(type(self), "_swaclear_diag_left", 5) - 1
@@ -1161,14 +1191,14 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
                 _lg.getLogger(__name__).info(
                     f"[SWACLEAR-OK] rpi={req_pool_idx} prefix={prefix_len} "
-                    f"rows={int(swa.numel())} (split)"
+                    f"toks={int(swa.numel())} (split byte-plane)"
                 )
-            if swa.numel() == 0:
+            if byte_idx is None:
                 return
-            dev = split_pool.kv_buffer[0].device
-            swa_dev = swa.to(dev)
-            for buf in split_pool.kv_buffer:
-                buf[swa_dev].zero_()
+            dev = self.swa_kv_pool.kv_buffer[0].device
+            flat_idx = byte_idx.reshape(-1).to(dev)
+            for buf in self.swa_kv_pool.kv_buffer:
+                buf.view(-1)[flat_idx] = 0
             return
         # ---- Unified layout ----
         pool = getattr(self, "unified_kv_pool", None)
