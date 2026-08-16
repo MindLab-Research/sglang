@@ -912,6 +912,39 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         insert_params.value = values
         result = self.insert(insert_params)
 
+        # c128 boundary-snapshot store (bypasses tree node plumbing entirely:
+        # SWA horizon splits fragment nodes and last_node semantics vary, so
+        # snapshots are keyed by (boundary length, trailing-token hash)).
+        # The hit side (schedule_batch) recomputes the same key from the
+        # matched prefix and restores the exact carry.
+        try:
+            if not hasattr(self, "_c128_boundary_snaps"):
+                from collections import OrderedDict
+
+                self._c128_boundary_snaps = OrderedDict()
+            _gk = getattr(
+                self.token_to_kv_pool_allocator, "get_kvcache", None
+            )
+            _kc = _gk() if _gk is not None else None
+            _snap_fn = (
+                getattr(_kc, "snapshot_compress_state", None)
+                if _kc is not None
+                else None
+            )
+            if _snap_fn is not None:
+                _ids = list(token_ids[:page_aligned_len])
+                _key = (
+                    page_aligned_len,
+                    hash(tuple(_ids[-128:])),
+                )
+                _snap = _snap_fn(int(req.req_pool_idx))
+                if _snap:
+                    self._c128_boundary_snaps[_key] = _snap
+                    while len(self._c128_boundary_snaps) > 128:
+                        self._c128_boundary_snaps.popitem(last=False)
+        except Exception:
+            pass
+
         # Match prefix
         match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
         new_indices = match_result.device_indices

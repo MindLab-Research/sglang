@@ -2326,26 +2326,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     _restore_c128_fn = getattr(
                         _kvcache, "restore_compress_state", None
                     )
-                    if _restore_c128_fn is not None:
-                        # ONLY the deepest matched node: its boundary is
-                        # exactly pre_len. Ancestors' snapshots are for
-                        # positions BEYOND the match — restoring one would
-                        # be position-misaligned.
-                        _node = getattr(req, "last_node", None)
-                        _cd128 = None
-                        if _node is not None:
-                            try:
-                                _cd128 = _node.component_data[ComponentType.SWA]
-                            except Exception:
-                                _cd128 = None
-                        _snap128 = (
-                            getattr(_cd128, "c128_state_snapshot", None)
-                            if _cd128 is not None
-                            else None
+                    _snaps = getattr(self.tree_cache, "_c128_boundary_snaps", None)
+                    if _restore_c128_fn is not None and _snaps:
+                        # Boundary-dict lookup: key = (boundary len, hash of
+                        # trailing 128 tokens of the matched prefix). Stored at
+                        # chunk insert time by cache_unfinished_req — immune
+                        # to SWA-horizon node splits / last_node semantics.
+                        _ids = list(
+                            (req.origin_input_ids or [])[:pre_len]
                         )
+                        _key = (pre_len, hash(tuple(_ids[-128:])))
+                        _snap128 = _snaps.get(_key)
                         if _snap128 is not None:
                             _c128_restored = bool(
-                                _restore_c128_fn(int(req.req_pool_idx), _snap128)
+                                _restore_c128_fn(
+                                    int(req.req_pool_idx), _snap128
+                                )
                             )
                         if getattr(ScheduleBatch, "_c128res_log_left", 5) > 0:
                             ScheduleBatch._c128res_log_left = (
@@ -2357,11 +2353,32 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                                 "OK" if _c128_restored
                                 else ("MISS" if _snap128 is None else "FAIL")
                             )
+                            _dbg_n = getattr(req, "last_node", None)
+                            _dbg_p = getattr(_dbg_n, "parent", None)
+
+                            def _klen(x):
+                                try:
+                                    return len(getattr(x, "key", []) or [])
+                                except Exception:
+                                    return -1
+
+                            _dbg_cd_n = None
+                            _dbg_cd_p = None
+                            try:
+                                _dbg_cd_n = _dbg_n.component_data[ComponentType.SWA]
+                            except Exception:
+                                pass
+                            try:
+                                _dbg_cd_p = _dbg_p.component_data[ComponentType.SWA]
+                            except Exception:
+                                pass
                             _rl.getLogger(__name__).info(
-                                f"[C128RESTORE-{_state}] pre_len={pre_len}"
+                                f"[C128RESTORE-{_state}] pre_len={pre_len} "
+                                f"n_klen={_klen(_dbg_n)} "
+                                f"n_snap={getattr(_dbg_cd_n, 'c128_state_snapshot', None) is not None} "
+                                f"p_klen={_klen(_dbg_p)} "
+                                f"p_snap={getattr(_dbg_cd_p, 'c128_state_snapshot', None) is not None}"
                             )
-                            _res_logged = True
-                        del _res_logged
                 except Exception as _e:
                     _c128_restored = False
                     if getattr(ScheduleBatch, "_c128res_log_left", 5) > 0:
