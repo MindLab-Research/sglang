@@ -1306,7 +1306,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     failed_reqs.append(decode_req)
                     indices_to_remove.add(i)
                     continue
-                pd_hidden_window_rows = min(pd_hidden_len, dspark_pool.size)
+                pd_hidden_window_rows = self._adaptive_pd_hidden_window_rows(
+                    dspark_pool, pd_hidden_len
+                )
                 if pd_hidden_window_rows <= 0:
                     message = (
                         "PD decode hidden receive pool has no streaming rows: "
@@ -1702,6 +1704,43 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             + len(self.scheduler.waiting_queue)
             + extra_reserved_reqs
         )
+
+    def _adaptive_pd_hidden_window_rows(
+        self, dspark_pool, pd_hidden_len: int
+    ) -> int:
+        """Adaptive decode-side window for PD hidden streaming.
+
+        The decode hidden pool is a shared rolling window: a request only needs
+        to hold *in-flight* rows (sent by prefill, not yet acked), never the
+        whole hidden span. The old ``min(hidden_len, pool.size)`` made one long
+        request monopolize the entire pool — with concurrent requests holding
+        any rows, ``alloc(pool.size)`` fails forever and the long request
+        starves until every other request finishes (observed as a ~10-minute
+        TTFT stall).
+
+        Three bounds, take the min:
+          1. throughput saturation = chunk_rows * depth  (RDMA overlaps decode)
+          2. fair share            = pool.size / active   (no starvation)
+          3. request total         = pd_hidden_len
+        Lower bound = one chunk (prefill always writes whole chunks), so a
+        single long request can never monopolize the pool again.
+        """
+        chunk_rows = envs.SGLANG_PD_HIDDEN_STREAMING_CHUNK_ROWS.get()
+        if chunk_rows <= 0:
+            chunk_rows = 16384
+        depth = envs.SGLANG_PD_HIDDEN_STREAMING_DEPTH.get()
+        if depth <= 0:
+            depth = 2
+
+        active = max(1, self._active_req_count())
+        in_flight = chunk_rows * depth
+        fair_share = dspark_pool.size // active
+
+        window = min(pd_hidden_len, dspark_pool.size, in_flight, fair_share)
+        # One prefill chunk must always fit, otherwise prefill writes past the
+        # window end (row_end > len(dst_indices) raises in conn.py).
+        window = max(window, min(chunk_rows, pd_hidden_len, dspark_pool.size))
+        return int(window)
 
     def _active_reserved_tokens(
         self, n_active: Optional[int] = None, extra_reserved_reqs: int = 0

@@ -385,6 +385,14 @@ class Envs:
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
     SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS = EnvInt(0)
+    # PD hidden streaming window sizing (decode side). The decode hidden pool is
+    # a shared rolling window; each request only needs to hold *in-flight* rows
+    # (sent by prefill, not yet acked), never the whole hidden span. The window
+    # is min(chunk_rows * depth, pool.size / active_reqs) — throughput-saturated
+    # when idle, fair-share when contended. chunk_rows must match the prefill
+    # side's chunked_prefill_size so one prefill chunk always fits.
+    SGLANG_PD_HIDDEN_STREAMING_CHUNK_ROWS = EnvInt(16384)
+    SGLANG_PD_HIDDEN_STREAMING_DEPTH = EnvInt(2)
 
     # Scheduler: others:
     # in seconds. Set if you observe high memory accumulation over a long serving period.
