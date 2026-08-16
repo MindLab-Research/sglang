@@ -2280,6 +2280,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # non-DSV4 pools.
         _clear_state_fn = None
         _clear_c4_carry_fn = None
+        _clear_swa_ring_fn = None
         try:
             _get_kvcache = getattr(
                 self.tree_cache.token_to_kv_pool_allocator, "get_kvcache", None
@@ -2288,6 +2289,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 _kvcache = _get_kvcache()
                 _clear_state_fn = getattr(_kvcache, "clear_compress_req_state", None)
                 _clear_c4_carry_fn = getattr(_kvcache, "clear_c4_carry_for_prefix", None)
+                _clear_swa_ring_fn = getattr(_kvcache, "clear_swa_ring_for_req", None)
         except Exception:
             _clear_state_fn = None
         if getattr(ScheduleBatch, "_state_clear_diag_left", 5) > 0:
@@ -2310,6 +2312,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 and pre_len > 0
             ):
                 _clear_state_fn(int(req.req_pool_idx))
+                if _clear_swa_ring_fn is not None:
+                    # Zero the per-req SWA ring: the first recomputed token's
+                    # sliding-window attention would otherwise read the ring
+                    # rows the PREVIOUS owner of this req slot wrote.
+                    try:
+                        _clear_swa_ring_fn(int(req.req_pool_idx))
+                    except Exception:
+                        pass
                 if _clear_c4_carry_fn is not None:
                     # Blank the swa-loc-addressed c4 carry rows at the hit
                     # boundary (the compressor reads the last <=7 slots' state

@@ -1020,6 +1020,33 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 rows[:, :half].zero_()
                 rows[:, half:].fill_(float("-inf"))
 
+    def clear_swa_ring_for_req(self, req_pool_idx: int) -> None:
+        """Zero the per-request SWA ring rows of one req slot in the unified
+        KV buffers.
+
+        The unified-kv SWA ring is addressed by (req_pool_idx, pos % ring).
+        A radix-hit request recomputes the trailing window; the FIRST
+        recomputed token's sliding-window attention reads ring rows at
+        positions [prefix-window, prefix) that this request never wrote —
+        they hold the PREVIOUS request that owned this req slot. Because
+        req_pool_idx differs across runs, the stale rows differ run-to-run:
+        identical greedy requests diverge (the radix-hit nondeterminism).
+
+        Zeroing the ring makes the resumed window read an empty history —
+        the same semantics as starting a sequence at position 0 — and the
+        recomputed window (>ring) rewrites the ring before any later token
+        depends on it. Cheap: ring_size rows per SWA layer per hit request.
+        """
+        pool = getattr(self, "unified_kv_pool", None)
+        if pool is None:
+            return
+        ring = int(pool.swa_ring_size)
+        start = int(req_pool_idx) * ring
+        if start + ring > int(pool.swa_pages):
+            return
+        for buf in pool.kv_buffer:
+            buf[start : start + ring].zero_()
+
     def clear_c4_carry_for_prefix(
         self,
         req_pool_idx: int,
