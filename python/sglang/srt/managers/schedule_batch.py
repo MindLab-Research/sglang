@@ -2377,6 +2377,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                                 # its own [end-133, end) snapshot onto the
                                 # window segment ending at its boundary.
                                 _seg_end = pre_len
+                                _split_restore_fn = getattr(
+                                    _kc, "restore_swa_rows_content", None
+                                )
                                 for _nd, _nlen in _chain:
                                     if _seg_end <= _lo:
                                         break
@@ -2387,6 +2390,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                                         else None
                                     )
                                     if _snap is not None and _nlen > 0:
+                                        # Split layout first: write the content
+                                        # back into the node's OWN stable slots
+                                        # (no remap). Falls through to the
+                                        # unified ring remap when absent.
+                                        _slots = getattr(_cd, "value", None) if _cd else None
+                                        if (
+                                            _split_restore_fn is not None
+                                            and _slots is not None
+                                            and _slots.numel() == _snap.shape[1]
+                                        ):
+                                            try:
+                                                _ok = _split_restore_fn(_snap, _slots)
+                                                restored = restored or bool(_ok)
+                                                _seg_end -= _nlen
+                                                continue
+                                            except Exception:
+                                                pass
                                         _seg_start = max(_lo, _seg_end - _win)
                                         _mask = (_poss >= _seg_start) & (
                                             _poss < _seg_end

@@ -1021,21 +1021,52 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 rows[:, half:].fill_(float("-inf"))
 
     def snapshot_swa_rows(self, swa_rows: torch.Tensor) -> Optional[torch.Tensor]:
-        """Capture unified-kv SWA ring-row CONTENT for tree nodes (host copy).
+        """Capture SWA row CONTENT for tree nodes (host copy), both layouts.
 
-        In unified-kv mode the SWA "value" the radix tree stores is a set of
-        ring-row IDs, which dangle once the inserting request's req slot is
-        reused (ring rows are per-request scratch). This helper captures the
-        actual per-layer content at insert time — the only moment the
-        inserting request still owns the rows — as a stable host tensor.
-        Returns None on non-unified pools (slot IDs are content-stable there).
+        Unified-kv: the tree's SWA "value" is ring-row IDs that dangle once
+        the inserting request's req slot is reused. Split-kv: slot IDs are
+        stable, but a freed-and-reallocated slot's content gets overwritten
+        while a still-live tree node may reference it (window-boundary races
+        with free_swa/free_out_of_window). In BOTH layouts the insert moment
+        is the only time the content provably belongs to this node — capture
+        it then. Returns None when no SWA pool exists.
         """
-        pool = getattr(self, "unified_kv_pool", None)
+        pool = getattr(self, "unified_kv_pool", None) or getattr(
+            self, "swa_kv_pool", None
+        )
         if pool is None or swa_rows is None or swa_rows.numel() == 0:
             return None
         rows = swa_rows.to(torch.long)
+        rows = rows[(rows >= 0) & (rows < int(pool.size))]
+        if rows.numel() == 0:
+            return None
         chunks = [buf[rows].to("cpu", copy=True) for buf in pool.kv_buffer]
         return torch.stack(chunks, dim=0) if chunks else None
+
+    def restore_swa_rows_content(
+        self, snapshot: torch.Tensor, swa_rows: torch.Tensor
+    ) -> bool:
+        """Write a snapshot back into its ORIGINAL slots (split layout).
+
+        Split-kv slots are stable containers; restoring the insert-time
+        content makes every future reader of these tree-referenced slots see
+        exactly what a fresh computation would have produced. Deterministic
+        and bit-equivalent; no remapping needed (unlike the unified ring).
+        """
+        pool = getattr(self, "swa_kv_pool", None)
+        if pool is None or snapshot is None or swa_rows is None:
+            return False
+        if snapshot.ndim != 3 or snapshot.shape[0] != len(pool.kv_buffer):
+            return False
+        rows = swa_rows.to(torch.long)
+        rows = rows[(rows >= 0) & (rows < int(pool.size))]
+        if rows.numel() == 0 or rows.numel() != snapshot.shape[1]:
+            return False
+        dev = pool.kv_buffer[0].device
+        rows_dev = rows.to(dev)
+        for li, buf in enumerate(pool.kv_buffer):
+            buf[rows_dev] = snapshot[li].to(dev)
+        return True
 
     def restore_swa_rows_and_remap(
         self,
@@ -1082,34 +1113,72 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     ) -> None:
         """Zero the SWA rows a radix-hit request will actually READ.
 
-        In unified-kv mode, full_to_swa_index_mapping[full_loc] is burned in
-        at WRITE time — it points at the ORIGINAL writer's ring rows
-        (writer_rpi * ring + pos % ring), not the current request's. A hit
-        request's window attention for the first recomputed token reads
-        positions [prefix-window, prefix) via this mapping, i.e. the previous
-        writer's ring rows — zeroing the CURRENT request's ring (as an
-        earlier attempt did) clears rows that are never read.
-
-        Zeroing the mapped rows is globally deterministic: every future hit
-        on the same tree node reads the same zeroed window (empty-history
-        semantics, consistent with swa never being restored from the tree —
-        the decode side already runs swa_served_from_tree=False). The
-        recomputed window rewrites the current request's own rows.
-
-        Also zeroes the current request's own ring rows (cheap, covers the
-        fresh-allocation path).
+        Split layout: the resume's window attention reads SWA slots obtained
+        by translate(full locs of [prefix-window, prefix)); those slots were
+        last written by whatever request previously owned them — zeroing
+        gives the empty-history semantics (window rebuilds from the
+        recomputation). Unified layout: zero the current req slot's ring plus
+        the mapped rows (see history). Diagnostic log on first calls.
         """
+        import os as _os
+
+        _diag = (
+            getattr(type(self), "_swaclear_diag_left", 5) > 0
+            and _os.environ.get("SGLANG_DEBUG_ALLOC", "0") == "1"
+        )
+        # ---- Split layout: swa_kv_pool is a real paged pool ----
+        split_pool = getattr(self, "swa_kv_pool", None)
+        if split_pool is not None and getattr(self, "unified_kv_pool", None) is None:
+            if prefix_len <= 0 or prefix_locs is None or prefix_locs.numel() == 0:
+                return
+            window = int(self.sliding_window or 0) + 2 * int(
+                self.page_size or 256
+            )
+            lo = max(0, prefix_len - window)
+            raw = prefix_locs[lo:prefix_len].to(torch.long)
+            if raw.numel() == 0:
+                return
+            try:
+                swa = self.translate_loc_from_full_to_swa(raw)
+            except Exception as _e:
+                if _diag:
+                    type(self)._swaclear_diag_left = (
+                        getattr(type(self), "_swaclear_diag_left", 5) - 1
+                    )
+                    import logging as _lg
+
+                    _lg.getLogger(__name__).warning(
+                        f"[SWACLEAR-FAIL] rpi={req_pool_idx} prefix={prefix_len} "
+                        f"{type(_e).__name__}: {_e}"
+                    )
+                return
+            swa = swa[(swa >= 0) & (swa < int(split_pool.size))].to(torch.long)
+            if _diag:
+                type(self)._swaclear_diag_left = (
+                    getattr(type(self), "_swaclear_diag_left", 5) - 1
+                )
+                import logging as _lg
+
+                _lg.getLogger(__name__).info(
+                    f"[SWACLEAR-OK] rpi={req_pool_idx} prefix={prefix_len} "
+                    f"rows={int(swa.numel())} (split)"
+                )
+            if swa.numel() == 0:
+                return
+            dev = split_pool.kv_buffer[0].device
+            swa_dev = swa.to(dev)
+            for buf in split_pool.kv_buffer:
+                buf[swa_dev].zero_()
+            return
+        # ---- Unified layout ----
         pool = getattr(self, "unified_kv_pool", None)
         if pool is None:
             return
-        # 1) current request's own ring rows
         ring = int(pool.swa_ring_size)
         start = int(req_pool_idx) * ring
         if 0 <= start and start + ring <= int(pool.swa_pages):
             for buf in pool.kv_buffer:
                 buf[start : start + ring].zero_()
-        # 2) the rows the resume actually reads: mapped swa rows of the hit
-        #    window [prefix - window - margin, prefix)
         if prefix_len <= 0 or prefix_locs is None or prefix_locs.numel() == 0:
             return
         window = int(self.sliding_window or 0) + 2 * int(self.page_size or 256)
@@ -1149,6 +1218,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         """
         if prefix_len <= 0 or prefix_locs is None or prefix_locs.numel() == 0:
             return
+        _diag_left = getattr(type(self), "_c4clear_diag_left", 5)
         families = (
             getattr(self, "compress_state_pools", None),
             getattr(self, "indexer_compress_state_pools", None),
@@ -1163,13 +1233,46 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 # (ring_size slots x ratio tokens), not just the trailing
                 # partial-block carry the HIP path uses.
                 ring_tok = int(pool.ring_size) * int(pool.ratio)
+                # DIAG bisection (never enable in production): widen the clear
+                # to the ENTIRE hit prefix's state rows. If identical greedy
+                # reruns become deterministic under this env, the divergence
+                # source lives in the compress-state family and the normal
+                # window was too narrow; if they still diverge, the source is
+                # in the KV bodies (SWA window content / page-tail residue).
+                import os as _os
+
+                _all_mode = (
+                    _os.environ.get("SGLANG_DIAG_CLEAR_ALL_STATE", "0") == "1"
+                )
+                if _all_mode:
+                    ring_tok = int(prefix_len)
                 lo = max(0, prefix_len - ring_tok)
                 raw_loc = prefix_locs[lo:prefix_len].to(torch.long)
                 if raw_loc.numel() == 0:
                     continue
-                swa_loc = self.translate_loc_from_full_to_swa(raw_loc)
-                state_loc = pool.translate_from_swa_loc_to_state_loc(swa_loc)
+                try:
+                    swa_loc = self.translate_loc_from_full_to_swa(raw_loc)
+                    state_loc = pool.translate_from_swa_loc_to_state_loc(swa_loc)
+                except Exception as _e:
+                    if _diag_left > 0:
+                        type(self)._c4clear_diag_left = _diag_left - 1
+                        import logging as _lg
+
+                        _lg.getLogger(__name__).warning(
+                            f"[C4CLEAR-FAIL] rpi={req_pool_idx} prefix={prefix_len} "
+                            f"translate raised: {type(_e).__name__}: {_e}"
+                        )
+                    continue
                 state_loc = state_loc[state_loc >= 0]
+                if _diag_left > 0:
+                    type(self)._c4clear_diag_left = _diag_left - 1
+                    import logging as _lg
+
+                    _lg.getLogger(__name__).info(
+                        f"[C4CLEAR-OK] rpi={req_pool_idx} prefix={prefix_len} "
+                        f"all_mode={_all_mode} rows_cleared={int(state_loc.numel())} "
+                        f"pool={pool.ratio}"
+                    )
                 if state_loc.numel() == 0:
                     continue
                 rows = pool.kv_score_buffer.kv_score[state_loc.to(torch.long)]

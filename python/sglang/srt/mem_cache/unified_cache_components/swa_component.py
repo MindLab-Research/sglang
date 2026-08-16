@@ -93,29 +93,33 @@ class SWAComponent(TreeComponent):
                 raise ValueError(f"Unknown LRURefreshPhase: {phase}")
 
     def _snapshot_unified_swa(self, node: UnifiedTreeNode, swa_value: torch.Tensor) -> None:
-        """Unified-kv: capture the ring-row CONTENT the node's swa_value points
-        to, before the inserting request's slot is reused and the rows are
-        overwritten. Only the LAST ring-stride positions have position-valid
-        content (earlier rows were overwritten by same-mod later positions),
-        so the snapshot is capped to the trailing ring window. Stored on the
-        component data's dedicated ``swa_content_snapshot`` field (NOT
-        host_value — that belongs to the HiCache host-tier bookkeeping);
-        non-unified pools are a no-op."""
+        """Capture the SWA row CONTENT this node's swa_value points to, at the
+        insert moment (the only time the content provably belongs to this
+        node). Unified ring layout: only the trailing ring-stride rows are
+        position-valid (earlier rows were overwritten by same-mod positions),
+        so cap to the ring. Split layout: swa_value already holds exactly the
+        node's window slots — snapshot all of them. Stored on the component
+        data's dedicated ``swa_content_snapshot`` field (NOT host_value — that
+        belongs to the HiCache host-tier bookkeeping)."""
         try:
             get_kvcache = getattr(
                 self.cache.token_to_kv_pool_allocator, "get_kvcache", None
             )
             kc = get_kvcache() if get_kvcache is not None else None
             snap_fn = getattr(kc, "snapshot_swa_rows", None) if kc is not None else None
+            if snap_fn is None:
+                return
             ring_fn = (
                 getattr(getattr(kc, "unified_kv_pool", None), "swa_ring_size", None)
                 if kc is not None
                 else None
             )
-            if snap_fn is None or ring_fn is None:
-                return
-            ring = int(ring_fn)
-            rows = swa_value[-ring:] if swa_value.numel() > ring else swa_value
+            if ring_fn is not None:
+                ring = int(ring_fn)
+                rows = swa_value[-ring:] if swa_value.numel() > ring else swa_value
+            else:
+                # Split layout: swa_value IS the node's window slot list.
+                rows = swa_value
             snap = snap_fn(rows)
             if snap is not None:
                 node.component_data[self.component_type].swa_content_snapshot = snap
