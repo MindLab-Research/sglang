@@ -1105,6 +1105,50 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             mapping[full_locs.to(dev).to(torch.long)] = rows_dev
         return True
 
+    def clear_c128_kv_window_for_prefix(
+        self, prefix_len: int, prefix_locs: torch.Tensor
+    ) -> None:
+        """Zero the trailing c128 compressed-KV rows near a radix-hit boundary.
+
+        Bisector for the remaining nondeterminism: after the SWA window and
+        all compress-state rings are cleaned, the only state a resume still
+        reads that can vary with slot history is the compressed c128 KV rows
+        themselves (byte-plane pool, one row per 128 tokens). Zeroing the
+        trailing window gives every run an identical (empty) read set.
+        """
+        pool = getattr(self, "c128_kv_pool", None)
+        if pool is None or prefix_len <= 0 or prefix_locs is None:
+            return
+        try:
+            ratio = 128
+            page_size = int(pool.page_size)
+            bytes_per_page = int(pool.bytes_per_page_padded)
+            bytes_per_tok = int(pool.get_bytes_per_token())
+        except Exception:
+            return
+        # window: last `rows` c128 rows of the hit region
+        n_rows = min(int(prefix_len) // ratio, 128 + 4)
+        lo_tok = max(0, prefix_len - n_rows * ratio)
+        raw = prefix_locs[lo_tok:prefix_len].to(torch.long)
+        if raw.numel() == 0:
+            return
+        row_first = raw[0] // ratio
+        row_last = raw[-1] // ratio
+        rows = torch.arange(row_first, row_last + 1, device=raw.device)
+        n_pages = int(pool.kv_buffer[0].shape[0])
+        rows = rows[(rows >= 0) & (rows < n_pages * page_size)]
+        if rows.numel() == 0:
+            return
+        page = torch.div(rows, page_size, rounding_mode="floor")
+        off = (rows % page_size) * bytes_per_tok
+        base = page * bytes_per_page + off
+        tok_range = torch.arange(bytes_per_tok, device=rows.device)
+        byte_idx = (base[:, None] + tok_range[None, :]).reshape(-1)
+        dev = pool.kv_buffer[0].device
+        flat_idx = byte_idx.to(dev)
+        for buf in pool.kv_buffer:
+            buf.view(-1)[flat_idx] = 0
+
     def _swa_flat_rows(self, swa_locs: torch.Tensor) -> Optional[torch.Tensor]:
         """Byte-flat index helper for the SPLIT SWA pool.
 
