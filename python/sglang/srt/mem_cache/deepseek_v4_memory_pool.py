@@ -1077,16 +1077,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         if prefix_len <= 0:
             return
         device = req_to_token_row.device
-        try:
-            from sglang.srt.layers.attention.dsv4.compress_hip import (
-                CompressHIP,
-            )
-
-            positions = CompressHIP.compute_state_len_indices(
-                seq_len=prefix_len, ratio=4
-            ).to(device)
-        except Exception:
-            return
         families = (
             getattr(self, "compress_state_pools", None),
             getattr(self, "indexer_compress_state_pools", None),
@@ -1097,6 +1087,15 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             for pool in pools:
                 if pool is None or pool.ratio != 4:
                     continue  # c128 uses rpi-ring addressing (already cleared)
+                # Cover the FULL ring lookback the paged planner may read
+                # (ring_size slots x ratio tokens), not just the trailing
+                # partial-block carry the HIP path uses — the CUDA C++
+                # planner walks the whole ring.
+                ring_tok = int(pool.ring_size) * int(pool.ratio)
+                lo = max(0, prefix_len - ring_tok)
+                positions = torch.arange(lo, prefix_len, device=device)
+                if positions.numel() == 0:
+                    continue
                 raw_loc = req_to_token_row[positions.to(torch.long)]
                 swa_loc = self.translate_loc_from_full_to_swa(raw_loc)
                 state_loc = pool.translate_from_swa_loc_to_state_loc(swa_loc)
