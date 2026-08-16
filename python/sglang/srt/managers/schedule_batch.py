@@ -2318,7 +2318,38 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 and req.extend_batch_idx == 0
                 and pre_len > 0
             ):
-                _clear_state_fn(int(req.req_pool_idx))
+                # c128 chain (32K-token memory): a short recompute can't
+                # rebuild the carry — RESTORE the inserting run's snapshot
+                # from the boundary node first; clear only as fallback.
+                _c128_restored = False
+                try:
+                    _restore_c128_fn = getattr(
+                        _kvcache, "restore_compress_state", None
+                    )
+                    if _restore_c128_fn is not None:
+                        # ONLY the deepest matched node: its boundary is
+                        # exactly pre_len. Ancestors' snapshots are for
+                        # positions BEYOND the match — restoring one would
+                        # be position-misaligned.
+                        _node = getattr(req, "last_node", None)
+                        _cd128 = (
+                            _node.component_data.get(ComponentType.SWA)
+                            if _node is not None
+                            else None
+                        )
+                        _snap128 = (
+                            getattr(_cd128, "c128_state_snapshot", None)
+                            if _cd128 is not None
+                            else None
+                        )
+                        if _snap128 is not None:
+                            _c128_restored = bool(
+                                _restore_c128_fn(int(req.req_pool_idx), _snap128)
+                            )
+                except Exception:
+                    _c128_restored = False
+                if not _c128_restored:
+                    _clear_state_fn(int(req.req_pool_idx))
                 if _clear_swa_ring_fn is not None:
                     # Unified-kv SWA resume: first try to RESTORE the boundary
                     # window from tree node content snapshots (insert-time

@@ -117,12 +117,14 @@ class SWAComponent(TreeComponent):
             if ring_fn is not None:
                 ring = int(ring_fn)
                 rows = swa_value[-ring:] if swa_value.numel() > ring else swa_value
-            else:
-                # Split layout: swa_value IS the node's window slot list.
-                rows = swa_value
-            snap = snap_fn(rows)
-            if snap is not None:
-                node.component_data[self.component_type].swa_content_snapshot = snap
+                snap = snap_fn(rows)
+                if snap is not None:
+                    node.component_data[
+                        self.component_type
+                    ].swa_content_snapshot = snap
+            # SPLIT layout: DISABLED — naive slot gather went out of bounds
+            # (CUDA gather assert) at the first chunked insert; slot semantics
+            # of swa_kv_pool vs swa_value need verification first.
         except Exception:
             pass
 
@@ -341,6 +343,31 @@ class SWAComponent(TreeComponent):
                 node.component_data[BASE_COMPONENT_TYPE].value
             ),
         )
+        # c128 compress-state snapshot: the c128 carry chain holds up to
+        # ring(256) x ratio(128) = 32K tokens of memory, so a radix-hit
+        # resume that recomputes only a few hundred tokens can NEVER rebuild
+        # the correct carry from empty. Capture the inserting run's ring at
+        # this node boundary (chunk end) — match-side restore reproduces the
+        # exact carry a full recompute would have had.
+        if params.req is not None:
+            try:
+                _gk = getattr(
+                    self.cache.token_to_kv_pool_allocator, "get_kvcache", None
+                )
+                _kc = _gk() if _gk is not None else None
+                _snap128_fn = (
+                    getattr(_kc, "snapshot_compress_state", None)
+                    if _kc is not None
+                    else None
+                )
+                if _snap128_fn is not None:
+                    _snap128 = _snap128_fn(int(params.req.req_pool_idx))
+                    if _snap128:
+                        node.component_data[
+                            self.component_type
+                        ].c128_state_snapshot = _snap128
+            except Exception:
+                pass
         # Decode-disagg radix / unified-kv rings: keep the leaf a SWA tombstone
         # -- the request's SWA ring is per-request state, translating tree
         # FULL slots to SWA here would publish SWA values the tree does not

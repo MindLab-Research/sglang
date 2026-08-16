@@ -1105,6 +1105,69 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             mapping[full_locs.to(dev).to(torch.long)] = rows_dev
         return True
 
+    def snapshot_compress_state(self, req_pool_idx: int) -> Optional[dict]:
+        """Clone the request's c128-family compress-state ring rows.
+
+        The c128 carry chain has up to ring(256) x ratio(128) = 32K tokens of
+        memory: a radix-hit resume that recomputes only a few hundred tokens
+        can NEVER rebuild it from empty (it would take 32K tokens to
+        converge). The ONLY correct carry at the hit boundary is the one the
+        inserting run had — captured here, at the chunk-boundary insert
+        moment. Returns {family_key: rows} (CPU clones), or None.
+        """
+        req_pool_idx = int(req_pool_idx)
+        out = {}
+        for fam_attr in ("compress_state_pools", "indexer_compress_state_pools"):
+            pools = getattr(self, fam_attr, None)
+            if not pools:
+                continue
+            for pi, pool in enumerate(pools):
+                if pool is None or pool.ratio != 128:
+                    continue
+                state = pool.kv_score_buffer.kv_score
+                ring = int(pool.ring_size)
+                if getattr(pool, "online", False):
+                    row = state[req_pool_idx]
+                    out[f"{fam_attr}:{pi}"] = row.detach().to("cpu", copy=True)
+                else:
+                    start = req_pool_idx * ring
+                    if start + ring > int(state.shape[0]):
+                        continue
+                    rows = state[start : start + ring]
+                    out[f"{fam_attr}:{pi}"] = rows.detach().to("cpu", copy=True)
+        return out or None
+
+    def restore_compress_state(self, req_pool_idx: int, snap: dict) -> bool:
+        """Restore c128-family ring rows captured at insert time. Returns
+        True if at least one family was restored (gives the resumed
+        compression the exact carry of the inserting run)."""
+        req_pool_idx = int(req_pool_idx)
+        restored = False
+        for fam_attr in ("compress_state_pools", "indexer_compress_state_pools"):
+            pools = getattr(self, fam_attr, None)
+            if not pools:
+                continue
+            for pi, pool in enumerate(pools):
+                if pool is None or pool.ratio != 128:
+                    continue
+                t = snap.get(f"{fam_attr}:{pi}")
+                if t is None:
+                    continue
+                state = pool.kv_score_buffer.kv_score
+                ring = int(pool.ring_size)
+                dev = state.device
+                try:
+                    if getattr(pool, "online", False):
+                        state[req_pool_idx] = t.to(dev)
+                    else:
+                        start = req_pool_idx * ring
+                        if start + ring <= int(state.shape[0]) and t.shape[0] == ring:
+                            state[start : start + ring] = t.to(dev)
+                    restored = True
+                except Exception:
+                    continue
+        return restored
+
     def clear_c128_kv_window_for_prefix(
         self, prefix_len: int, prefix_locs: torch.Tensor
     ) -> None:
