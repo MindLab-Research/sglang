@@ -372,18 +372,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # support aborting them we would need an additional fix in the
         # scheduler. In practice this shouldn't arise in the RL scenario.
         self.held_rebootstrap_reqs: List[Req] = []
-        # Safety net for requests staged in retracted_queue /
-        # held_rebootstrap_reqs: rid -> monotonic entry time. If a staged
-        # request cannot resume within SGLANG_DISAGGREGATION_RETRACT_TIMEOUT
-        # (e.g. a very long conversation that no longer fits the KV budget),
-        # it is aborted and streamed back so the client never hangs forever.
-        # This was the "request stuck with no response and zero logs" hole.
-        self.staged_req_deadlines: Dict[str, float] = {}
-        # Prealloc-queue safety net: rid -> monotonic entry time. A request
-        # blocked in pop_preallocated (e.g. hidden row pool exhausted by a
-        # stuck upstream request) previously retried forever with no timeout —
-        # observed as a request stuck 5-6 hours with no client response.
-        self.prealloc_entry_time: Dict[str, float] = {}
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         if self.enable_staging and self.is_mla_backend:
             raise RuntimeError(
@@ -555,7 +543,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if is_retracted:
             req.retraction_mb_id = None
             self.retracted_queue.append(req)
-            self.staged_req_deadlines[req.rid] = time.monotonic()
         else:
             decode_req = self._create_receiver_and_enqueue(
                 req, is_rebootstrap=is_rebootstrap
@@ -655,7 +642,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             req=req, kv_receiver=kv_receiver, is_rebootstrap=is_rebootstrap
         )
         self.queue.append(decode_req)
-        self.prealloc_entry_time[req.rid] = time.monotonic()
         return decode_req
 
     def hold_rebootstrap(self, req: Req) -> None:
@@ -671,7 +657,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         is recomputed by the prefill worker under the updated weights.
         """
         self.held_rebootstrap_reqs.append(req)
-        self.staged_req_deadlines.setdefault(req.rid, time.monotonic())
 
     def enqueue_held_rebootstrap(self) -> None:
         """Enqueue all staged rebootstrap requests when generation resumes."""
@@ -746,8 +731,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def release_memory_occupation(self):
         self.queue.clear()
         self.retracted_queue.clear()
-        self.staged_req_deadlines.clear()
-        self.prealloc_entry_time.clear()
         if hasattr(self.kv_manager, "deregister_buffer_to_engine"):
             self.kv_manager.deregister_buffer_to_engine()
 
@@ -755,65 +738,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if hasattr(self.kv_manager, "register_buffer_to_engine"):
             self.kv_manager.register_buffer_to_engine()
 
-    def _fail_expired_staged_reqs(self) -> None:
-        """Abort retracted/held requests that failed to resume within the
-        retract timeout, streaming an error back to the client.
-
-        Without this, a retracted request whose token budget never fits again
-        (e.g. a ~550K-token multi-turn conversation after KV pressure) sits in
-        ``retracted_queue`` forever: no timeout, no abort, no client response,
-        and zero log lines — exactly the observed "request stuck forever".
-        """
-        timeout_s = envs.SGLANG_DISAGGREGATION_RETRACT_TIMEOUT.get()
-        if timeout_s <= 0 or not self.staged_req_deadlines:
-            return
-        now = time.monotonic()
-        expired_rids = {
-            rid
-            for rid, ts in self.staged_req_deadlines.items()
-            if now - ts >= timeout_s
-        }
-        if not expired_rids:
-            return
-        for attr in ("retracted_queue", "held_rebootstrap_reqs"):
-            lst = getattr(self, attr)
-            remaining = []
-            for req in lst:
-                if req.rid in expired_rids:
-                    self._abort_staged_req(req, timeout_s)
-                else:
-                    remaining.append(req)
-            setattr(self, attr, remaining)
-        for rid in expired_rids:
-            self.staged_req_deadlines.pop(rid, None)
-
-    def _abort_staged_req(self, req: Req, timeout_s: float) -> None:
-        total_tokens = len(req.origin_input_ids) + len(req.output_ids)
-        error_message = (
-            f"Decode request {req.rid} could not resume within "
-            f"{timeout_s:.0f}s after retraction (needs {total_tokens} tokens; "
-            f"KV budget too small or pool busy). Aborting to unblock the client."
-        )
-        logger.error("[RETRACT-TIMEOUT] " + error_message)
-        if getattr(req, "kv_cache_cpu", None) is not None:
-            try:
-                del req.kv_cache_cpu
-            except AttributeError:
-                pass
-        prepare_abort(
-            req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
-        )
-        self.scheduler.output_streamer.stream_output([req], req.return_logprob)
-        if self.scheduler.metrics_reporter.enable_metrics:
-            self.scheduler.metrics_collector.increment_transfer_failed_reqs()
-
     def resume_retracted_reqs(
         self, rids_to_check: Optional[List[str]] = None
     ) -> List[Req]:
         # TODO refactor the scheduling part, reuse with the unified engine logic as much as possible
-
-        # Fail requests that have been staged too long (safety net).
-        self._fail_expired_staged_reqs()
 
         # allocate memory
         resumed_reqs = []
@@ -858,7 +786,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             resumed_reqs.append(req)
             indices_to_remove.add(i)
             req.is_retracted = False
-            self.staged_req_deadlines.pop(req.rid, None)
             self._pre_alloc(req)
             full_allocatable_tokens -= full_required
             if uses_swa_tail_prealloc:
@@ -1379,9 +1306,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     failed_reqs.append(decode_req)
                     indices_to_remove.add(i)
                     continue
-                pd_hidden_window_rows = self._adaptive_pd_hidden_window_rows(
-                    dspark_pool, pd_hidden_len
-                )
+                pd_hidden_window_rows = min(pd_hidden_len, dspark_pool.size)
                 if pd_hidden_window_rows <= 0:
                     message = (
                         "PD decode hidden receive pool has no streaming rows: "
@@ -1425,34 +1350,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                             len(self.transfer_queue.queue),
                         )
                         self._last_pd_hidden_recv_credit_warning_time = now
-                    # Safety net: a request blocked here (hidden pool exhausted
-                    # by a stuck upstream request) previously retried forever
-                    # with no timeout and no client response — observed stuck
-                    # for 5-6 hours. Abort it once the prealloc timeout fires.
-                    entry = self.prealloc_entry_time.get(decode_req.req.rid)
-                    prealloc_timeout_s = getattr(
-                        self.kv_manager, "waiting_timeout", 600
-                    )
-                    if entry is not None and now - entry >= prealloc_timeout_s:
-                        message = (
-                            f"Decode request {decode_req.req.rid} blocked in "
-                            f"prealloc for {now - entry:.0f}s waiting for hidden "
-                            f"pool rows (needs {pd_hidden_window_rows}, free "
-                            f"{dspark_pool.available_size()}). Aborting to unblock "
-                            f"the client."
-                        )
-                        logger.error("[PREALLOC-TIMEOUT] " + message)
-                        prepare_abort(
-                            decode_req.req,
-                            message,
-                            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                        )
-                        self.scheduler.output_streamer.stream_output(
-                            [decode_req.req], decode_req.req.return_logprob
-                        )
-                        self.prealloc_entry_time.pop(decode_req.req.rid, None)
-                        failed_reqs.append(decode_req)
-                        indices_to_remove.add(i)
                     continue
 
                 pd_hidden_dst_indices_by_pp = {}
@@ -1772,14 +1669,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
 
-        # Drop prealloc entry timestamps for requests that have left the queue,
-        # so the dict cannot grow unboundedly across the process lifetime.
-        if self.prealloc_entry_time:
-            remaining_rids = {dr.req.rid for dr in self.queue}
-            for rid in list(self.prealloc_entry_time):
-                if rid not in remaining_rids:
-                    self.prealloc_entry_time.pop(rid, None)
-
         return preallocated_reqs, failed_reqs
 
     @property
@@ -1813,43 +1702,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             + len(self.scheduler.waiting_queue)
             + extra_reserved_reqs
         )
-
-    def _adaptive_pd_hidden_window_rows(
-        self, dspark_pool, pd_hidden_len: int
-    ) -> int:
-        """Adaptive decode-side window for PD hidden streaming.
-
-        The decode hidden pool is a shared rolling window: a request only needs
-        to hold *in-flight* rows (sent by prefill, not yet acked), never the
-        whole hidden span. The old ``min(hidden_len, pool.size)`` made one long
-        request monopolize the entire pool — with concurrent requests holding
-        any rows, ``alloc(pool.size)`` fails forever and the long request
-        starves until every other request finishes (observed as a ~10-minute
-        TTFT stall).
-
-        Three bounds, take the min:
-          1. throughput saturation = chunk_rows * depth  (RDMA overlaps decode)
-          2. fair share            = pool.size / active   (no starvation)
-          3. request total         = pd_hidden_len
-        Lower bound = one chunk (prefill always writes whole chunks), so a
-        single long request can never monopolize the pool again.
-        """
-        chunk_rows = envs.SGLANG_PD_HIDDEN_STREAMING_CHUNK_ROWS.get()
-        if chunk_rows <= 0:
-            chunk_rows = 16384
-        depth = envs.SGLANG_PD_HIDDEN_STREAMING_DEPTH.get()
-        if depth <= 0:
-            depth = 2
-
-        active = max(1, self._active_req_count())
-        in_flight = chunk_rows * depth
-        fair_share = dspark_pool.size // active
-
-        window = min(pd_hidden_len, dspark_pool.size, in_flight, fair_share)
-        # One prefill chunk must always fit, otherwise prefill writes past the
-        # window end (row_end > len(dst_indices) raises in conn.py).
-        window = max(window, min(chunk_rows, pd_hidden_len, dspark_pool.size))
-        return int(window)
 
     def _active_reserved_tokens(
         self, n_active: Optional[int] = None, extra_reserved_reqs: int = 0

@@ -1263,33 +1263,6 @@ class CommonKVSender(BaseKVSender):
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         return KVPoll.Failed
 
-    def _check_waiting_timeout(self) -> Optional[KVPoll]:
-        """Timeout the request if it is stuck waiting for the decode side to
-        confirm KV reception.
-
-        Mirrors CommonKVReceiver._check_waiting_timeout: without this the prefill
-        sender can hang forever in WaitingForInput/Transferring when the decode
-        side already aborted but the abort notification never took effect on this
-        rank. The stuck request then never leaves the prefill inflight queue and
-        its KV cache is never released (the "KV transfer stuck" symptom).
-        """
-        if self.init_time is None:
-            return None
-        elapsed = time.time() - self.init_time
-        if elapsed < self.kv_mgr.waiting_timeout:
-            return None
-        logger.warning_once(
-            "Some requests fail to complete KV transfer on the prefill side. "
-            "If a greater mean TTFT is acceptable, you can 'export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=600' (10 minutes) to relax the timeout condition. "
-        )
-        self.kv_mgr.record_failure(
-            self.bootstrap_room,
-            f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s "
-            f"in KVPoll.WaitingForInput/Transferring",
-        )
-        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
-        return KVPoll.Failed
-
     def poll(self) -> KVPoll:
         pass
 
@@ -1331,12 +1304,7 @@ class CommonKVReceiver(BaseKVReceiver):
         self.kv_mgr = mgr
         self.conclude_state: Optional[KVPoll] = None
         self.require_staging: bool = False
-        # Start the safety clock at construction so a receiver stuck in
-        # KVPoll.Bootstrapping (prefill_info never resolves, bootstrap never
-        # establishes) also times out. Previously only WaitingForInput had a
-        # timeout, so a Bootstrapping-stuck request hung forever with no
-        # client response. send_metadata() resets this when handshake starts.
-        self.init_time: Optional[float] = time.time()
+        self.init_time: Optional[float] = None
         self.abort_notified: bool = False
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)

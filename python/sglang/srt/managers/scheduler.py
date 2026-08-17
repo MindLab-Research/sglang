@@ -3831,7 +3831,6 @@ class Scheduler(
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
                 idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
-                idle &= len(self.disagg_decode_prealloc_queue.held_rebootstrap_reqs) == 0
                 idle &= len(self.disagg_decode_transfer_queue.queue) == 0
                 if self.decode_offload_manager is not None:
                     idle &= len(self.decode_offload_manager.ongoing_offload) == 0
@@ -4260,28 +4259,6 @@ class Scheduler(
                     else:
                         remaining_retracted.append(decode_req)
                 self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
-
-            # Abort requests held for rebootstrap (staged while generation is
-            # paused). Without this they are unreachable by /abort_request and
-            # a client cancel would never reach them.
-            if self.disagg_decode_prealloc_queue.held_rebootstrap_reqs:
-                remaining_held = []
-                for req in self.disagg_decode_prealloc_queue.held_rebootstrap_reqs:
-                    if recv_req.abort_all or req.rid.startswith(recv_req.rid):
-                        logger.debug(f"Abort held rebootstrap request. {req.rid=}")
-                        if getattr(req, "kv_cache_cpu", None) is not None:
-                            del req.kv_cache_cpu
-                        self.disagg_decode_prealloc_queue.staged_req_deadlines.pop(
-                            req.rid, None
-                        )
-                        self.ipc_channels.send_to_tokenizer.send_output(
-                            AbortReq(rid=req.rid), req
-                        )
-                    else:
-                        remaining_held.append(req)
-                self.disagg_decode_prealloc_queue.held_rebootstrap_reqs = (
-                    remaining_held
-                )
 
         # Delete requests in the running batch
         if self.ps.pp_size == 1:

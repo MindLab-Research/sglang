@@ -2711,14 +2711,6 @@ class MooncakeKVSender(CommonKVSender):
                 timeout_result = self._check_bootstrap_timeout()
                 if timeout_result is not None:
                     return timeout_result
-            elif status in (KVPoll.WaitingForInput, KVPoll.Transferring):
-                # Prefill side has no abort-notification fallback for a request
-                # whose decode side already aborted; without this timeout the
-                # sender hangs forever in WaitingForInput/Transferring and the
-                # request never leaves the prefill inflight queue (KV leak).
-                timeout_result = self._check_waiting_timeout()
-                if timeout_result is not None:
-                    return timeout_result
 
             return status
         else:
@@ -2932,13 +2924,6 @@ class MooncakeKVReceiver(CommonKVReceiver):
         if status in (KVPoll.Success, KVPoll.Failed):
             self.conclude_state = status
         elif status == KVPoll.WaitingForInput:
-            timeout_result = self._check_waiting_timeout()
-            if timeout_result is not None:
-                return timeout_result
-        elif status == KVPoll.Bootstrapping:
-            # Safety net: a receiver whose bootstrap never establishes (e.g.
-            # the router dispatched the request but prefill never received it)
-            # previously polled Bootstrapping forever with no timeout.
             timeout_result = self._check_waiting_timeout()
             if timeout_result is not None:
                 return timeout_result
