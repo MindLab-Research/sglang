@@ -640,22 +640,6 @@ class PrefillBootstrapQueue:
         rids_to_check_set = set(rids_to_check) if rids_to_check is not None else None
 
         if len(self.queue) == 0:
-            # Keep the CP collective sequence rank-invariant. Bootstrap queue
-            # population is per-rank (TCP reception timing diverges across
-            # attn-CP ranks), so an early return here would skip
-            # poll_and_all_reduce_attn_cp_tp_group on this rank only —
-            # permanently offsetting its per-group collective count and
-            # wedging every CP rank in the next all_reduce (health stays 200,
-            # zero crashes, requests time out). Participate with an empty
-            # poller list to hold the sequence alignment.
-            if getattr(self.scheduler.server_args, "attn_cp_size", 1) > 1:
-                poll_and_all_reduce_attn_cp_tp_group(
-                    [],
-                    getattr(self.scheduler, "pf_poll_cp_gloo_group", None)
-                    or self.scheduler.attn_cp_cpu_group,
-                    getattr(self.scheduler, "pf_poll_tp_gloo_group", None)
-                    or self.scheduler.attn_tp_cpu_group,
-                )
             if return_failed_reqs is False:
                 return []
             else:
@@ -1628,20 +1612,6 @@ class SchedulerDisaggregationPrefillMixin:
         rids_to_check: For PP, on rank > 0, check the rids from the previous rank has consensus with the current rank.
         """
         if len(self.disagg_prefill_inflight_queue) == 0:
-            # Keep the CP collective sequence rank-invariant (same rationale as
-            # pop_bootstrapped's empty-queue branch). Inflight queue population
-            # is per-rank; an early return here skips the collective on this
-            # rank only and permanently offsets its per-group count → every CP
-            # rank wedges in the next all_reduce (health 200, zero crashes,
-            # requests time out). Participate with an empty poller list.
-            if getattr(self.server_args, "attn_cp_size", 1) > 1:
-                poll_and_all_reduce_attn_cp_tp_group(
-                    [],
-                    getattr(self, "pf_poll_cp_gloo_group", None)
-                    or self.attn_cp_cpu_group,
-                    getattr(self, "pf_poll_tp_gloo_group", None)
-                    or self.attn_tp_cpu_group,
-                )
             return []
 
         done_reqs = []
