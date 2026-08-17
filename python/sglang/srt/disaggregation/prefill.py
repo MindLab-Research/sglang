@@ -734,8 +734,10 @@ class PrefillBootstrapQueue:
 
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender for req in self.queue],
-            self.scheduler.attn_cp_cpu_group,
-            self.scheduler.attn_tp_cpu_group,
+            getattr(self.scheduler, "pf_poll_cp_gloo_group", None)
+            or self.scheduler.attn_cp_cpu_group,
+            getattr(self.scheduler, "pf_poll_tp_gloo_group", None)
+            or self.scheduler.attn_tp_cpu_group,
         )
 
         metadata_credits = (
@@ -989,8 +991,10 @@ class SchedulerDisaggregationPrefillMixin:
             return
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender for req in candidates],
-            self.attn_cp_cpu_group,
-            self.attn_tp_cpu_group,
+            getattr(self, "pf_poll_cp_gloo_group", None)
+            or self.attn_cp_cpu_group,
+            getattr(self, "pf_poll_tp_gloo_group", None)
+            or self.attn_tp_cpu_group,
         )
         failed = set()
         for req, poll in zip(candidates, polls):
@@ -1482,8 +1486,10 @@ class SchedulerDisaggregationPrefillMixin:
         if optimistic_reqs:
             polls = poll_and_all_reduce_attn_cp_tp_group(
                 [req.disagg_kv_sender for _, req in optimistic_reqs],
-                self.attn_cp_cpu_group,
-                self.attn_tp_cpu_group,
+                getattr(self, "pf_poll_cp_gloo_group", None)
+                or self.attn_cp_cpu_group,
+                getattr(self, "pf_poll_tp_gloo_group", None)
+                or self.attn_tp_cpu_group,
             )
             optimistic_polls = {
                 idx: poll for (idx, _), poll in zip(optimistic_reqs, polls)
@@ -1622,14 +1628,30 @@ class SchedulerDisaggregationPrefillMixin:
         rids_to_check: For PP, on rank > 0, check the rids from the previous rank has consensus with the current rank.
         """
         if len(self.disagg_prefill_inflight_queue) == 0:
+            # Keep the CP collective sequence rank-invariant (same rationale as
+            # pop_bootstrapped's empty-queue branch). Inflight queue population
+            # is per-rank; an early return here skips the collective on this
+            # rank only and permanently offsets its per-group count → every CP
+            # rank wedges in the next all_reduce (health 200, zero crashes,
+            # requests time out). Participate with an empty poller list.
+            if getattr(self.server_args, "attn_cp_size", 1) > 1:
+                poll_and_all_reduce_attn_cp_tp_group(
+                    [],
+                    getattr(self, "pf_poll_cp_gloo_group", None)
+                    or self.attn_cp_cpu_group,
+                    getattr(self, "pf_poll_tp_gloo_group", None)
+                    or self.attn_tp_cpu_group,
+                )
             return []
 
         done_reqs = []
 
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
-            self.attn_cp_cpu_group,
-            self.attn_tp_cpu_group,
+            getattr(self, "pf_poll_cp_gloo_group", None)
+            or self.attn_cp_cpu_group,
+            getattr(self, "pf_poll_tp_gloo_group", None)
+            or self.attn_tp_cpu_group,
         )
 
         undone_reqs: List[Req] = []
@@ -1764,8 +1786,10 @@ class SchedulerDisaggregationPrefillMixin:
         """
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
-            self.attn_cp_cpu_group,
-            self.attn_tp_cpu_group,
+            getattr(self, "pf_poll_cp_gloo_group", None)
+            or self.attn_cp_cpu_group,
+            getattr(self, "pf_poll_tp_gloo_group", None)
+            or self.attn_tp_cpu_group,
         )
 
         transferred_rids: List[str] = []
@@ -1843,8 +1867,10 @@ class SchedulerDisaggregationPrefillMixin:
             return True
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender],
-            self.attn_cp_cpu_group,
-            self.attn_tp_cpu_group,
+            getattr(self, "pf_poll_cp_gloo_group", None)
+            or self.attn_cp_cpu_group,
+            getattr(self, "pf_poll_tp_gloo_group", None)
+            or self.attn_tp_cpu_group,
         )
         return self.handle_pending_bootstrap(req, polls[0])
 
