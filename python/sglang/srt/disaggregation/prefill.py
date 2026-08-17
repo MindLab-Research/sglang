@@ -640,6 +640,22 @@ class PrefillBootstrapQueue:
         rids_to_check_set = set(rids_to_check) if rids_to_check is not None else None
 
         if len(self.queue) == 0:
+            # Keep the CP collective sequence rank-invariant. Bootstrap queue
+            # population is per-rank (TCP reception timing diverges across
+            # attn-CP ranks), so an early return here would skip
+            # poll_and_all_reduce_attn_cp_tp_group on this rank only —
+            # permanently offsetting its per-group collective count and
+            # wedging every CP rank in the next all_reduce (health stays 200,
+            # zero crashes, requests time out). Participate with an empty
+            # poller list to hold the sequence alignment.
+            if getattr(self.scheduler.server_args, "attn_cp_size", 1) > 1:
+                poll_and_all_reduce_attn_cp_tp_group(
+                    [],
+                    getattr(self.scheduler, "pf_poll_cp_gloo_group", None)
+                    or self.scheduler.attn_cp_cpu_group,
+                    getattr(self.scheduler, "pf_poll_tp_gloo_group", None)
+                    or self.scheduler.attn_tp_cpu_group,
+                )
             if return_failed_reqs is False:
                 return []
             else:
@@ -718,10 +734,8 @@ class PrefillBootstrapQueue:
 
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender for req in self.queue],
-            getattr(self.scheduler, "pf_poll_cp_gloo_group", None)
-            or self.scheduler.attn_cp_cpu_group,
-            getattr(self.scheduler, "pf_poll_tp_gloo_group", None)
-            or self.scheduler.attn_tp_cpu_group,
+            self.scheduler.attn_cp_cpu_group,
+            self.scheduler.attn_tp_cpu_group,
         )
 
         metadata_credits = (
@@ -975,10 +989,8 @@ class SchedulerDisaggregationPrefillMixin:
             return
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender for req in candidates],
-            getattr(self, "pf_poll_cp_gloo_group", None)
-            or self.attn_cp_cpu_group,
-            getattr(self, "pf_poll_tp_gloo_group", None)
-            or self.attn_tp_cpu_group,
+            self.attn_cp_cpu_group,
+            self.attn_tp_cpu_group,
         )
         failed = set()
         for req, poll in zip(candidates, polls):
@@ -1470,10 +1482,8 @@ class SchedulerDisaggregationPrefillMixin:
         if optimistic_reqs:
             polls = poll_and_all_reduce_attn_cp_tp_group(
                 [req.disagg_kv_sender for _, req in optimistic_reqs],
-                getattr(self, "pf_poll_cp_gloo_group", None)
-                or self.attn_cp_cpu_group,
-                getattr(self, "pf_poll_tp_gloo_group", None)
-                or self.attn_tp_cpu_group,
+                self.attn_cp_cpu_group,
+                self.attn_tp_cpu_group,
             )
             optimistic_polls = {
                 idx: poll for (idx, _), poll in zip(optimistic_reqs, polls)
@@ -1618,10 +1628,8 @@ class SchedulerDisaggregationPrefillMixin:
 
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
-            getattr(self, "pf_poll_cp_gloo_group", None)
-            or self.attn_cp_cpu_group,
-            getattr(self, "pf_poll_tp_gloo_group", None)
-            or self.attn_tp_cpu_group,
+            self.attn_cp_cpu_group,
+            self.attn_tp_cpu_group,
         )
 
         undone_reqs: List[Req] = []
@@ -1756,10 +1764,8 @@ class SchedulerDisaggregationPrefillMixin:
         """
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
-            getattr(self, "pf_poll_cp_gloo_group", None)
-            or self.attn_cp_cpu_group,
-            getattr(self, "pf_poll_tp_gloo_group", None)
-            or self.attn_tp_cpu_group,
+            self.attn_cp_cpu_group,
+            self.attn_tp_cpu_group,
         )
 
         transferred_rids: List[str] = []
@@ -1837,10 +1843,8 @@ class SchedulerDisaggregationPrefillMixin:
             return True
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender],
-            getattr(self, "pf_poll_cp_gloo_group", None)
-            or self.attn_cp_cpu_group,
-            getattr(self, "pf_poll_tp_gloo_group", None)
-            or self.attn_tp_cpu_group,
+            self.attn_cp_cpu_group,
+            self.attn_tp_cpu_group,
         )
         return self.handle_pending_bootstrap(req, polls[0])
 

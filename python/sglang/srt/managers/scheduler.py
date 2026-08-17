@@ -1804,24 +1804,6 @@ class Scheduler(
             self.scripted_scheduler_hook = None
 
     def init_request_receiver(self) -> None:
-        # In PD prefill mode, recv_requests' broadcast must use the same
-        # dedicated gloo group as the iteration barrier (pf_barrier_gloo_group).
-        # Otherwise, when 1 rank receives a zmq control message and enters
-        # broadcast while 7 ranks have no message (empty broadcast), the 7
-        # fast ranks race ahead to get_next_disagg_prefill_batch_to_run's NCCL
-        # all_gather while the 1 slow rank is still in gloo broadcast —
-        # cross-backend deadlock (gloo broadcast waiting for ranks that are
-        # blocked in NCCL all_gather).
-        # Using the barrier group ensures the barrier at the top of the loop
-        # truly gates ALL ranks entering recv_requests together.
-        tp_cpu_group = self.tp_cpu_group
-        attn_tp_cpu_group = self.attn_tp_cpu_group
-        attn_cp_cpu_group = self.attn_cp_cpu_group
-        if self.server_args.disaggregation_mode == "prefill":
-            tp_cpu_group = getattr(self, "pf_barrier_gloo_group", None) or tp_cpu_group
-            attn_tp_cpu_group = getattr(self, "pf_barrier_gloo_group", None) or attn_tp_cpu_group
-            attn_cp_cpu_group = getattr(self, "pf_poll_cp_gloo_group", None) or attn_cp_cpu_group
-
         self.request_receiver = SchedulerRequestReceiver(
             recv_from_tokenizer=self.ipc_channels.recv_from_tokenizer,
             recv_from_rpc=self.ipc_channels.recv_from_rpc,
@@ -1830,11 +1812,11 @@ class Scheduler(
             mm_receiver=self.mm_receiver,
             ps=self.ps,
             tp_group=self.tp_group,
-            tp_cpu_group=tp_cpu_group,
+            tp_cpu_group=self.tp_cpu_group,
             attn_tp_group=self.attn_tp_group,
-            attn_tp_cpu_group=attn_tp_cpu_group,
+            attn_tp_cpu_group=self.attn_tp_cpu_group,
             attn_cp_group=self.attn_cp_group,
-            attn_cp_cpu_group=attn_cp_cpu_group,
+            attn_cp_cpu_group=self.attn_cp_cpu_group,
             world_group=self.world_group,
             server_args=self.server_args,
             model_config=self.model_config,
@@ -3849,7 +3831,6 @@ class Scheduler(
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
                 idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
-                idle &= len(self.disagg_decode_prealloc_queue.held_rebootstrap_reqs) == 0
                 idle &= len(self.disagg_decode_transfer_queue.queue) == 0
                 if self.decode_offload_manager is not None:
                     idle &= len(self.decode_offload_manager.ongoing_offload) == 0
@@ -4278,28 +4259,6 @@ class Scheduler(
                     else:
                         remaining_retracted.append(decode_req)
                 self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
-
-            # Abort requests held for rebootstrap (staged while generation is
-            # paused). Without this they are unreachable by /abort_request and
-            # a client cancel would never reach them.
-            if self.disagg_decode_prealloc_queue.held_rebootstrap_reqs:
-                remaining_held = []
-                for req in self.disagg_decode_prealloc_queue.held_rebootstrap_reqs:
-                    if recv_req.abort_all or req.rid.startswith(recv_req.rid):
-                        logger.debug(f"Abort held rebootstrap request. {req.rid=}")
-                        if getattr(req, "kv_cache_cpu", None) is not None:
-                            del req.kv_cache_cpu
-                        self.disagg_decode_prealloc_queue.staged_req_deadlines.pop(
-                            req.rid, None
-                        )
-                        self.ipc_channels.send_to_tokenizer.send_output(
-                            AbortReq(rid=req.rid), req
-                        )
-                    else:
-                        remaining_held.append(req)
-                self.disagg_decode_prealloc_queue.held_rebootstrap_reqs = (
-                    remaining_held
-                )
 
         # Delete requests in the running batch
         if self.ps.pp_size == 1:
