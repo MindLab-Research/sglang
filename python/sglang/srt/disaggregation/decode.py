@@ -379,6 +379,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # it is aborted and streamed back so the client never hangs forever.
         # This was the "request stuck with no response and zero logs" hole.
         self.staged_req_deadlines: Dict[str, float] = {}
+        # Prealloc-queue safety net: rid -> monotonic entry time. A request
+        # blocked in pop_preallocated (e.g. hidden row pool exhausted by a
+        # stuck upstream request) previously retried forever with no timeout —
+        # observed as a request stuck 5-6 hours with no client response.
+        self.prealloc_entry_time: Dict[str, float] = {}
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         if self.enable_staging and self.is_mla_backend:
             raise RuntimeError(
@@ -650,6 +655,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             req=req, kv_receiver=kv_receiver, is_rebootstrap=is_rebootstrap
         )
         self.queue.append(decode_req)
+        self.prealloc_entry_time[req.rid] = time.monotonic()
         return decode_req
 
     def hold_rebootstrap(self, req: Req) -> None:
@@ -741,6 +747,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.queue.clear()
         self.retracted_queue.clear()
         self.staged_req_deadlines.clear()
+        self.prealloc_entry_time.clear()
         if hasattr(self.kv_manager, "deregister_buffer_to_engine"):
             self.kv_manager.deregister_buffer_to_engine()
 
@@ -1418,6 +1425,34 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                             len(self.transfer_queue.queue),
                         )
                         self._last_pd_hidden_recv_credit_warning_time = now
+                    # Safety net: a request blocked here (hidden pool exhausted
+                    # by a stuck upstream request) previously retried forever
+                    # with no timeout and no client response — observed stuck
+                    # for 5-6 hours. Abort it once the prealloc timeout fires.
+                    entry = self.prealloc_entry_time.get(decode_req.req.rid)
+                    prealloc_timeout_s = getattr(
+                        self.kv_manager, "waiting_timeout", 600
+                    )
+                    if entry is not None and now - entry >= prealloc_timeout_s:
+                        message = (
+                            f"Decode request {decode_req.req.rid} blocked in "
+                            f"prealloc for {now - entry:.0f}s waiting for hidden "
+                            f"pool rows (needs {pd_hidden_window_rows}, free "
+                            f"{dspark_pool.available_size()}). Aborting to unblock "
+                            f"the client."
+                        )
+                        logger.error("[PREALLOC-TIMEOUT] " + message)
+                        prepare_abort(
+                            decode_req.req,
+                            message,
+                            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                        )
+                        self.scheduler.output_streamer.stream_output(
+                            [decode_req.req], decode_req.req.return_logprob
+                        )
+                        self.prealloc_entry_time.pop(decode_req.req.rid, None)
+                        failed_reqs.append(decode_req)
+                        indices_to_remove.add(i)
                     continue
 
                 pd_hidden_dst_indices_by_pp = {}
@@ -1736,6 +1771,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
+
+        # Drop prealloc entry timestamps for requests that have left the queue,
+        # so the dict cannot grow unboundedly across the process lifetime.
+        if self.prealloc_entry_time:
+            remaining_rids = {dr.req.rid for dr in self.queue}
+            for rid in list(self.prealloc_entry_time):
+                if rid not in remaining_rids:
+                    self.prealloc_entry_time.pop(rid, None)
 
         return preallocated_reqs, failed_reqs
 
