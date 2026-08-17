@@ -38,6 +38,7 @@ if TYPE_CHECKING:
 
 _ATTN_DP_RANK: Optional[int] = None
 _ATTN_DP_SIZE: Optional[int] = None
+_ATTN_TP_SIZE: Optional[int] = None
 
 
 def world_dp_gather_enabled() -> bool:
@@ -311,7 +312,7 @@ def initialize_dp_attention(
     server_args: ServerArgs,
     model_config: ModelConfig,
 ):
-    global _ATTN_DP_RANK, _ATTN_DP_SIZE
+    global _ATTN_DP_RANK, _ATTN_DP_SIZE, _ATTN_TP_SIZE
     dp = get_flags().dp
     dp.max_len_with_idle = (
         getattr(model_config.hf_config, "hybrid_override_pattern", None) is not None
@@ -325,10 +326,11 @@ def initialize_dp_attention(
     tp_rank = get_tensor_model_parallel_rank()
     tp_size = get_tensor_model_parallel_world_size()
 
-    _, _, _ATTN_DP_RANK, _ = compute_dp_attention_world_info(
+    _, attn_tp_size, _ATTN_DP_RANK, _ = compute_dp_attention_world_info(
         enable_dp_attention, tp_rank, tp_size, dp_size, attn_cp_size
     )
     _ATTN_DP_SIZE = dp_size if enable_dp_attention else 1
+    _ATTN_TP_SIZE = attn_tp_size
 
     if server_args.elastic_ep_backend is not None and server_args.max_ep_size:
         _ATTN_DP_RANK = tp_rank + server_args.ep_join_rank_offset
@@ -358,6 +360,19 @@ def get_attention_dp_rank() -> int:
 def get_attention_dp_size() -> int:
     assert _ATTN_DP_SIZE is not None, "dp attention not initialized!"
     return _ATTN_DP_SIZE
+
+
+def get_attention_tp_size() -> int:
+    """Return the attention TP size (tp_size // dp_size // cp_size).
+
+    This is the number of TP ranks within one attention group, i.e. the
+    partition factor for KV heads in the attention layer.
+    """
+    if _ATTN_TP_SIZE is not None:
+        return _ATTN_TP_SIZE
+    # Fallback: compute from server_args if not yet initialized
+    from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_world_size
+    return get_tensor_model_parallel_world_size()
 
 
 @contextmanager

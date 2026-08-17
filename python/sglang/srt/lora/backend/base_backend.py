@@ -40,7 +40,7 @@ def get_gathered_moe_num_tokens(forward_batch: ForwardBatch, num_tokens: int) ->
     from sglang.srt.layers.dp_attention import get_attention_tp_size
 
     # Local import: a module-level cp_utils import here is circular (see forward_batch_info).
-    from sglang.srt.layers.utils.cp_utils import get_cp_padding_align_size
+    from sglang.srt.layers.cp.padding import get_cp_padding_align_size
 
     attn_tp_size = get_attention_tp_size()
     cp_align_size = get_cp_padding_align_size()
