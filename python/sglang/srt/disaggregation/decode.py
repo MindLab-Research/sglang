@@ -301,6 +301,11 @@ class DecodeRequest:
     hicache_load_consumer_index: int = -1
     hicache_restore_status: HiCacheRestoreResult = HiCacheRestoreResult.PENDING
 
+    # Monotonic timestamp when this request entered the prealloc queue. Used to
+    # bound the DSpark hidden-pool alloc-retry loop so a leaked/exhausted pool
+    # aborts the request instead of stalling it forever.
+    enqueue_time: float = 0.0
+
     @property
     def seqlen(self) -> int:
         return self.req.seqlen
@@ -641,6 +646,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         decode_req = DecodeRequest(
             req=req, kv_receiver=kv_receiver, is_rebootstrap=is_rebootstrap
         )
+        decode_req.enqueue_time = time.monotonic()
         self.queue.append(decode_req)
         return decode_req
 
@@ -1350,6 +1356,43 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                             len(self.transfer_queue.queue),
                         )
                         self._last_pd_hidden_recv_credit_warning_time = now
+
+                    # Bound the alloc-retry loop: if the hidden pool stays
+                    # exhausted past the waiting timeout, abort this request
+                    # instead of spinning forever. This is the decode-side
+                    # counterpart to the prefill sender's WaitingForInput hang
+                    # (which has no timeout): aborting here sends an abort
+                    # notification to prefill, which releases the sender.
+                    # This runs in pop_preallocated (local-only poll, no
+                    # cross-rank all_reduce), so it cannot desync collectives.
+                    waiting_timeout = getattr(
+                        getattr(self, "kv_manager", None), "waiting_timeout", 600.0
+                    )
+                    if (
+                        decode_req.enqueue_time > 0
+                        and now - decode_req.enqueue_time > waiting_timeout
+                    ):
+                        message = (
+                            "PD decode hidden pool exhausted for over "
+                            f"{waiting_timeout:.0f}s; aborting request "
+                            f"(rid={decode_req.req.rid}, pool_rows={dspark_pool.size})"
+                        )
+                        logger.error(message)
+                        prepare_abort(
+                            decode_req.req,
+                            message,
+                            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                        )
+                        self.scheduler.output_streamer.stream_output(
+                            [decode_req.req], decode_req.req.return_logprob
+                        )
+                        if decode_req.kv_receiver is not None:
+                            # abort() (not clear()) sends the abort notification
+                            # to prefill so its sender is released too.
+                            decode_req.kv_receiver.abort()
+                        decode_req.kv_receiver = None
+                        failed_reqs.append(decode_req)
+                        indices_to_remove.add(i)
                     continue
 
                 pd_hidden_dst_indices_by_pp = {}
@@ -2145,13 +2188,22 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if wait_ack_completions is not None and not wait_ack_completions(
             decode_req.req.bootstrap_room
         ):
+            # Root-cause fix for "requests permanently stuck in prealloc":
+            # the prefill-side sender can hang in WaitingForInput (it has no
+            # timeout there), so hidden ACKs never complete. Previously we
+            # `return`ed here and leaked the rows, permanently starving the
+            # hidden pool so every later DSpark request spins forever in
+            # pop_preallocated's alloc-retry loop. The request is already
+            # finished/aborted at this point, so releasing the rows is safe —
+            # any in-flight prefill writes target a dead request and are
+            # discarded. Always release to keep the pool from leaking.
             logger.error(
-                "Timed out waiting for PD hidden ACK completion before "
-                "releasing receive rows: rid=%s room=%s",
+                "Timed out waiting for PD hidden ACK completion before releasing "
+                "receive rows; releasing anyway to avoid hidden-pool leak: "
+                "rid=%s room=%s",
                 decode_req.req.rid,
                 decode_req.req.bootstrap_room,
             )
-            return
         pop_acked_chunks = getattr(
             self.kv_manager, "pop_pd_hidden_acked_chunks", None
         )
