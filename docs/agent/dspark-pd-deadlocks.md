@@ -28,6 +28,9 @@
 
 ## 非 collective 型：hidden pool 耗尽 → 个别请求永久卡死（2026-08-18，commit `1c9e1c3275`）
 
+> 完整技术报告（协议时序/死锁解剖/修复设计/证明轮廓/残留边界/验证方案）见
+> `docs/agent/dspark-pd-stuck-req-postmortem.md`，本节为速查索引。
+
 与前五个 collective 死锁不同族：**单个请求永久卡死**，其余正常，health 200、0 crash。
 
 ### 死锁环（时序错位，非 collective）

@@ -308,6 +308,7 @@ rsync -avz --exclude='__pycache__' --exclude='*.pyc' "$SRC" root@<node>:"$DEST"
 | `docs/agent/v4-pro-deploy.md` | V4 Pro 0813 部署全流程：集群拓扑、重打包 checkpoint 识别（HTTP Range 验证法）、官方权重下载/验证/替换、DSpark/FP4 配置、容量与 bench 数据 |
 | `docs/agent/b300-compile-fixes.md` | 三个编译层修复：DeepGEMM sm_103a nvcc wrapper、tilelang flock 跨进程锁、tilelang CCCL include |
 | `docs/agent/dspark-pd-deadlocks.md` | DSPARK PD 五个死锁修复链（专用 gloo group / 异常安全 poll / prefill 空分支补偿 / spec_info DSPARK 分支 / hidden materialize），py-spy 死锁形态识别方法 |
+| `docs/agent/dspark-pd-stuck-req-postmortem.md` | **hidden pool 个别请求永久卡死完整技术报告**（2026-08-18，`1c9e1c3275`）：bootstrap 先于 hidden alloc 的时序倒置死锁环 / prefix-free 上界预留先于 bootstrap（背压替代死锁）/ park & drain 非阻塞释放（wait_ack 是 decode 本地 CUDA 事件等待）/ 不变量证明 / 残留边界与验证判据 |
 | `docs/agent/decode-radix-swa.md` | DSV4 PD 双端 radix 全链路：为何 DSpark 必须两端同开、`swa_served_from_tree=False` 设计（树不持有 SWA）、四层 bug 修复链（hidden clamp / len-1 match / SWA validator / SWA 池泄漏）、诊断 env 与验证数据 |
 | `docs/agent/dsv4-cp-dspark.md` | DSV4 prefill CP + DSpark PD hidden 共存：三层修复链（hook flag 顺序 / aux hidden all-gather 重组 / decode_engine_rank 对角配对防 8 倍重复发送）、flag 语义辨析（V4 用 interleave 非 GLM layersplit）、SGLANG_DEBUG_DIAG 日志 gate、3.5× 长上下文实测数据 |
 | `docs/agent/dsv4-pro-pd-engineering.md` | **V4 Pro PD 工程总纲报告**：DSPARK PD 分离支持（#31466 hidden 传输 + spec_info 分支 + merge_batch 守卫）、双端 radix（swa_served_from_tree 协议）、CP=8 共存（3.5×）、死锁三连、KV 广播正确性、乱码战争摘要、编译基础设施、性能汇总、残余项边界 |
