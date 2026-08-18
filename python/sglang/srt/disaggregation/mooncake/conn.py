@@ -1894,6 +1894,30 @@ class MooncakeKVManager(CommonKVManager):
                                         executor,
                                     )
                                 )
+                            except Exception as e:
+                                # An exception raised here used to kill the
+                                # transfer_worker thread silently (e.g.
+                                # "PD_HIDDEN state index length mismatch" when
+                                # the decode receive window is smaller than
+                                # one sender chunk): the thread dies, no ACK
+                                # is ever produced, the prefill-side source-row
+                                # pool drains (rows are released only on the
+                                # matching ACK), and both event loops freeze
+                                # in mismatched collectives — health 200,
+                                # zero crashes, requests stuck forever
+                                # (2026-08-18 16:13 freeze). Convert the
+                                # exception into the same session-failure
+                                # path as ret != 0 below so the request
+                                # aborts cleanly instead of wedging both
+                                # sides.
+                                logger.error(
+                                    "[PDH-SEND-FAIL] room=%s packet=%s "
+                                    "exc=%r",
+                                    kv_chunk.room,
+                                    kv_chunk.pd_hidden_packet_idx,
+                                    e,
+                                )
+                                ret, pd_hidden_done = -1, True
                             finally:
                                 self._end_pd_hidden_transfer(kv_chunk.room)
                             if ret != 0:

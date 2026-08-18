@@ -158,3 +158,24 @@ charge_set(rid, pd_hidden_window_rows)
   3. 8 rank `[PDH-ADMIT]` 序列同序（R1 实证）；
   4. `W=0` 重启行为与今晨完全一致（B1）。
 - 发布：默认 `W=0`（旧行为）；1104 先设 `W=8192` 观察高峰窗口再固化。
+
+---
+
+## 8. v1.1 补遗：2026-08-18 16:13 冻结事故与协议约束（重要）
+
+**事故**：W=8192 首个长请求（U=743401）触发双端事件循环冻结（health 200、零 crash、请求永久卡死）。py-spy：prefill 8 rank 卡在 `pop_bootstrapped → _padded_all_reduce_min`（7v1 行号错位）；decode 7 rank 卡 iteration barrier、TP1 卡 nvtx enter。
+
+**根因（日志实锤）**：
+```
+Exception in thread Thread-4 (transfer_worker):
+  conn.py:1890 → RuntimeError: PD_HIDDEN state index length mismatch:
+  prefill=16384, dst=8192
+```
+1. **协议约束（本设计 v1 遗漏）**：hidden streaming 的 sender 按 prefill chunk（chunked-prefill-size=16384 行）为单位发包，`_send_pd_hidden_packet` 要求 `len(src)==len(dst)`。**decode 窗口 W 必须 ≥ prefill 端 chunked-prefill-size**，否则 mismatch。
+2. **既有缺陷**：该 raise 发生在 transfer_worker 线程，异常裸杀线程（Python 默认 handler 打印后吞掉）——无失败同步、无 ACK。后果链：源行池（65536 行，行仅 ACK 后释放）被 4×16384 占满 → `source chunk allocation failed` 刷屏 → 双端集体状态级联冻结。
+
+**修复（v1.1）**：
+- `conn.py` transfer_worker：`_send_pd_hidden_packet` 异常捕获 → `ret=-1` → 复用既有 `ret != 0` 失败路径（`_mark_session_failed_and_sync` → decode abort → 源行释放）。任何未来窗口/协议不匹配 = 请求级 500 + `[PDH-SEND-FAIL]` 日志，**绝不冻结集群**。
+- 部署：**W 必须 ≥ prefill chunked-prefill-size（当前 16384）**。两端 env：`SGLANG_PD_HIDDEN_RECV_WINDOW=16384`。
+
+**v2 议题**：sender 按 decode 窗口自适应切 sub-chunk（解除 W ≥ chunk 约束，允许更小窗口提高并发）。
