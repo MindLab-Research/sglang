@@ -25,3 +25,51 @@
   - 部分 rank 在 `_padded_all_reduce_min` vs 部分在 broadcast → 同 group 异构互配
   - 全部 rank 在同一 gloo 点 → 该 group 内调用次数错位（某 rank 多/少调了一次）
 - 修复原则（AGENTS.md 已有）：**collective 必须 rank-invariant**——次数、时序对 receiver 异常和 per-rank 队列状态免疫
+
+## 非 collective 型：hidden pool 耗尽 → 个别请求永久卡死（2026-08-18，commit `1c9e1c3275`）
+
+与前五个 collective 死锁不同族：**单个请求永久卡死**，其余正常，health 200、0 crash。
+
+### 死锁环（时序错位，非 collective）
+
+```
+decode receiver.init()（bootstrap）先于 hidden rows 分配
+→ prefill sender 一进 WaitingForInput（无超时）就等 decode 发 KV indices
+→ pool 满时 pop_preallocated 的 alloc()==None 无限 continue（indices 永不发出）
+→ sender 永久卡死；且 _release_pd_hidden_rows 的 wait_ack 300s 阻塞跑在调度线程
+  → 整个 decode 冻结 300s；超时后 return 不释放 → rows 泄漏 → pool 永久满
+```
+
+**关键语义**（hidden_events.py）：`wait_ack_completions` 是 **decode 本地**等待
+（等自己的 chunk 注入 CUDA 事件 + drain 循环，正常 µs 级完成，ACK 由 decode 发给
+prefill）——不是等 prefill。所以非阻塞探测它完全安全。
+
+### 结构性修复（`1c9e1c3275`，替代 cd15c85d68 的超时兜底；用户红线：零超时依赖）
+
+1. **预留先于 bootstrap**（`_try_prealloc_pd_hidden_rows`，挂在 `add()` fast path
+   与 `_resolve_pending_reqs` 的 `init()` 之前）：prefix-free 上界
+   `min(_rebootstrap_prefill_len, pool.size)` 预留。pool 满 → 请求留在
+   `pending_reqs` 不 bootstrap → **sender 根本不存在，无卡可谈**（背压）。
+   pop 时按实际 window_rows 裁剪多余还回。不变量：
+   `window_rows = min(hidden_len, pool.size) ≤ min(upper, pool.size) = len(reserved)`
+   （hidden_len ≤ upper；radix match 少最后 1 token ⇒ total_prefix ≤ len-1）。
+2. **释放非阻塞化**：`wait_ack_completions(room, timeout_s=0.0)` 探测；未完成则
+   park 到 `_pending_pd_hidden_releases`，`pop_preallocated` 顶部每 tick drain
+   （事件循环常驻 + polling_interval 节奏 ⇒ 空闲也 drain）。永不放弃（不泄漏）、
+   永不阻塞调度线程。释放幂等（所有权字段置空），可被 FINISH_ABORT 扫描与
+   pop 尾部 failed_reqs 循环重复调用。
+3. **alloc-None → fail-fast abort(503) + `kv_receiver.abort()`**：预留机制下
+   已 bootstrap 必有 reserved rows，alloc 失败只能是不变量违规（确定性失败，
+   非 spin 非超时）。abort() 通知 prefill 释放 sender。
+4. **pop 尾部统一释放 failed_reqs 的 hidden rows**：6 个 config-abort 分支
+   （pool 布局/streaming/window 检查）在预留存在时 abort，不释放会泄漏。
+
+### 遗留约束
+
+- 预留上界会瞬时占满 pool（大请求 + 同 tick 并发）→ 同 tick 串行 prealloc，
+  每 tick 解锁一次（ convoy 有界，ms 级）。
+- rank 间 pool 状态可短暂分歧（park drain 时差 1 tick）→ bootstrap 时序分歧。
+  安全：prealloc 队列无 collective（local-only poll），旧代码本就有同类分歧
+  （且是永久性的），现在只剩 1 tick。
+- 判据 grep：`PD hidden ACK still pending at release; parking`（正常少见）、
+  `invariant violated`（不应出现，出现=有路径绕过了预alloc）。
