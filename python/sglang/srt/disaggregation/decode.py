@@ -114,6 +114,31 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# PD hidden receive-row accounting (see docs/agent/pd-hidden-window-design.md).
+#
+# Module-level so both DecodePreallocQueue and DecodeTransferQueue can maintain
+# it. Admission decisions read ONLY this accounting — never the local pool's
+# available_size(), because per-chunk row recycling happens at rank-local ACK
+# times and would let ranks diverge on the admit/park decision (partial
+# bootstrap => wedged prefill sender). charge(r) changes only on
+# rank-synchronized events: ADMIT (alloc), TRIM (pop), terminal cleanup.
+# ---------------------------------------------------------------------------
+_PD_HIDDEN_ROW_CHARGE: Dict[str, int] = {}
+
+
+def _pd_hidden_charge_set(rid: str, rows: int) -> None:
+    _PD_HIDDEN_ROW_CHARGE[rid] = int(rows)
+
+
+def _pd_hidden_charge_clear(rid: str) -> None:
+    _PD_HIDDEN_ROW_CHARGE.pop(rid, None)
+
+
+def _pd_hidden_charged_rows() -> int:
+    return sum(_PD_HIDDEN_ROW_CHARGE.values())
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
@@ -368,6 +393,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.queue: List[DecodeRequest] = []
         self.retracted_queue: List[Req] = []
         self.pending_reqs: List[DecodeRequest] = []
+        # PD hidden windowed admission state (design: docs/agent/
+        # pd-hidden-window-design.md). Window 0 => whole-pool demand (legacy).
+        self._pd_hidden_window = envs.SGLANG_PD_HIDDEN_RECV_WINDOW.get()
+        # rid -> (first_park_monotonic, last_log_monotonic)
+        self._pd_hidden_park_state: Dict[str, Tuple[float, float]] = {}
         self._ensure_retry_count: Dict[str, int] = {}
         self._max_ensure_retries: int = 15  # scheduling cycles
         self._ensure_last_attempt_time: Dict[str, float] = {}
@@ -635,31 +665,36 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         return None
 
+    def _pd_hidden_window_cap(self, pool) -> int:
+        """Effective admission window W (rows). 0/None => pool.size (legacy)."""
+        cap = pool.size
+        if self._pd_hidden_window and self._pd_hidden_window > 0:
+            cap = min(self._pd_hidden_window, cap)
+        return cap
+
     def _try_prealloc_pd_hidden_rows(self, decode_req: DecodeRequest) -> bool:
-        """Reserve PD hidden receive rows BEFORE the receiver bootstraps.
+        """Windowed admission for PD hidden receive rows, BEFORE bootstrap.
 
-        Structural fix for the "single request stuck forever" wedge: the
-        prefill sender enters WaitingForInput (which has no timeout) as soon
-        as the decode receiver bootstraps, and it only leaves that state when
-        decode sends its KV indices — which requires hidden rows to exist.
-        Bootstrapping without reserved rows therefore wedges the sender
-        whenever the hidden pool is exhausted (alloc()==None spins forever in
-        pop_preallocated and the metadata send never happens).
+        Structural fix for the "single request stuck forever" wedge (kept from
+        1c9e1c3275): the prefill sender enters WaitingForInput (no timeout) as
+        soon as the decode receiver bootstraps, and it only leaves when decode
+        sends its KV indices — which requires hidden rows. Reserving first
+        inverts the dependency: on exhaustion the request stays pending
+        (no sender exists to wedge) = plain backpressure.
 
-        Reserving first inverts the dependency: on pool exhaustion the request
-        simply stays in the pending queue — it has NOT bootstrapped, so no
-        prefill sender exists to wedge. That is plain backpressure, resolved
-        automatically once running requests return their rows. No timeout is
-        involved anywhere.
+        Windowing (docs/agent/pd-hidden-window-design.md) fixes the legacy
+        demand = min(U, pool.size): for long requests (U >= P) that demand is
+        the WHOLE pool, so any concurrent holder starved them forever (606s
+        incident). Demand is now w = min(U, W) with W from
+        SGLANG_PD_HIDDEN_RECV_WINDOW (0 => W = P, byte-for-byte legacy).
 
-        The reservation uses the prefix-free upper bound
-        min(_rebootstrap_prefill_len, pool.size); pop_preallocated trims the
-        excess right after the radix match (its pd_hidden_window_rows is never
-        larger than this bound), so the radix lock lifecycle is untouched.
+        The decision reads deterministic accounting (P - Σ charge), never the
+        local pool availability (per-chunk recycling is rank-local and would
+        desync the admit/park decision => partial bootstrap wedge). Local
+        available >= accounting free always, so pool.alloc(w) cannot fail
+        once the gate passes (K1).
 
-        Returns True when the request may bootstrap (rows reserved, or no
-        hidden transfer needed), False when the pool is exhausted and the
-        request must stay pending.
+        Watermark φ = W with FIFO head exemption gives bounded wait (L3).
         """
         if decode_req.pd_hidden_reserved_indices is not None:
             return True
@@ -677,13 +712,72 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if pool is None or pool.size <= 0:
             # Config error; pop_preallocated raises the explicit abort for it.
             return True
-        reserved = pool.alloc(min(upper_bound, pool.size))
-        if reserved is None:
-            # Pool exhausted: do NOT bootstrap (no wedged sender). Retry next
-            # tick; reserved rows return as requests finish/abort.
-            return False
-        decode_req.pd_hidden_reserved_indices = reserved
-        return True
+
+        rid = decode_req.req.rid
+        W = self._pd_hidden_window_cap(pool)
+        w = min(upper_bound, W)
+        free = pool.size - _pd_hidden_charged_rows()  # deterministic (R1)
+        is_head = (not self.pending_reqs) or (
+            decode_req is self.pending_reqs[0]
+        )
+        ok = free >= w and (is_head or free - w >= W)  # watermark φ = W
+        if ok:
+            reserved = pool.alloc(w)
+            # K1: local available >= accounting free >= w, so this cannot be
+            # None here. Guard anyway — never bootstrap on a partial reserve.
+            if reserved is None:  # pragma: no cover - accounting drift only
+                logger.error(
+                    "[PDH-ALLOC-FAIL] rid=%s w=%d free=%d pool=%d "
+                    "(accounting drift; parking)",
+                    rid, w, free, pool.size,
+                )
+                self._note_pd_hidden_park(rid)
+                return False
+            decode_req.pd_hidden_reserved_indices = reserved
+            _pd_hidden_charge_set(rid, w)
+            self._pd_hidden_park_state.pop(rid, None)
+            if self._pd_hidden_window and self._pd_hidden_window > 0:
+                logger.info(
+                    "[PDH-ADMIT] rid=%s U=%d w=%d free=%d/%d W=%d",
+                    rid, upper_bound, w, free, pool.size, W,
+                )
+            return True
+
+        # Park: structural backpressure, retried every tick. Visible via the
+        # throttled log below; no timeout by design (the pre-1c9e1c3275
+        # timeout was lossy stopgap, and any abort here would bootstrap-then-
+        #-abort, wedging the sender for a window).
+        self._note_pd_hidden_park(rid)
+        self._log_pd_hidden_park_throttled(
+            rid, upper_bound, w, free, pool.size
+        )
+        return False
+
+    def _note_pd_hidden_park(self, rid: str) -> Tuple[float, float]:
+        """Record/refresh park state; returns (first_park, last_log)."""
+        now = time.monotonic()
+        entry = self._pd_hidden_park_state.get(rid)
+        if entry is None:
+            entry = (now, 0.0)
+            self._pd_hidden_park_state[rid] = entry
+        return entry
+
+    def _log_pd_hidden_park_throttled(
+        self, rid: str, upper_bound: int, w: int, free: int, pool_size: int
+    ) -> None:
+        entry = self._pd_hidden_park_state.get(rid)
+        if entry is None:
+            return
+        first_park, last_log = entry
+        now = time.monotonic()
+        if now - last_log < 5.0:
+            return
+        self._pd_hidden_park_state[rid] = (first_park, now)
+        logger.info(
+            "[PDH-PARK] rid=%s U=%d w=%d free=%d/%d waited=%.0fs%s",
+            rid, upper_bound, w, free, pool_size, now - first_park,
+            " (head)" if (self.pending_reqs and self.pending_reqs[0].req.rid == rid) else "",
+        )
 
     def _create_receiver_and_enqueue(
         self, req: Req, is_rebootstrap: bool = False
@@ -789,6 +883,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         ``kv_manager``); the prealloc queue delegates so the pop_preallocated
         cleanup path can release rows symmetrically.
         """
+        # Terminal event (rank-synchronized): drop park bookkeeping here and
+        # the row charge inside the shared implementation.
+        self._pd_hidden_park_state.pop(decode_req.req.rid, None)
         self.transfer_queue._release_pd_hidden_rows(decode_req)
 
     def release_memory_occupation(self):
@@ -1378,7 +1475,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     failed_reqs.append(decode_req)
                     indices_to_remove.add(i)
                     continue
-                pd_hidden_window_rows = min(pd_hidden_len, dspark_pool.size)
+                pd_hidden_window_rows = min(
+                    pd_hidden_len, self._pd_hidden_window_cap(dspark_pool)
+                )
                 if pd_hidden_window_rows <= 0:
                     message = (
                         "PD decode hidden receive pool has no streaming rows: "
@@ -1404,11 +1503,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     # Rows were reserved before bootstrap (see
                     # _try_prealloc_pd_hidden_rows). pd_hidden_window_rows is
                     # guaranteed <= len(reserved) because the reservation used
-                    # the prefix-free upper bound
-                    # min(_rebootstrap_prefill_len, pool.size) >=
-                    # min(pd_hidden_len, pool.size). Trim the excess back to
-                    # the pool right away so other pending requests can
-                    # reserve them.
+                    # the windowed prefix-free upper bound
+                    # min(_rebootstrap_prefill_len, W) >= min(pd_hidden_len, W)
+                    # (H <= U by A5). Trim the excess back to the pool right
+                    # away so other pending requests can reserve them.
                     allocated_hidden_indices = decode_req.pd_hidden_reserved_indices[
                         :pd_hidden_window_rows
                     ]
@@ -1418,6 +1516,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     if excess:
                         dspark_pool.free(excess)
                     decode_req.pd_hidden_reserved_indices = None
+                    # Accounting: charge settles at the trimmed window for the
+                    # rest of the request's life (rows physically recycle via
+                    # chunk ACKs, which are rank-local — hence accounting, not
+                    # the local pool, drives admission; see design doc R1/K1).
+                    _pd_hidden_charge_set(
+                        decode_req.req.rid, pd_hidden_window_rows
+                    )
                 else:
                     allocated_hidden_indices = dspark_pool.alloc(
                         pd_hidden_window_rows
@@ -2302,6 +2407,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         only outlive the request while its own injection events are still in
         flight, so no timeout is needed to make progress.
         """
+        # Terminal event (rank-synchronized call site): clear the admission
+        # charge now, even though the physical row free may be parked for a
+        # local ACK drain. Clearing early only makes accounting more
+        # conservative (more parking, never divergence across ranks).
+        _pd_hidden_charge_clear(decode_req.req.rid)
         wait_ack_completions = getattr(
             self.kv_manager, "wait_pd_hidden_ack_completions", None
         )

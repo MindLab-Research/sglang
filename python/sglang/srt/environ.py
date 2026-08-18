@@ -375,6 +375,10 @@ class Envs:
     # computed dynamically at runtime based on cpu_count; see disaggregation backends.
     SGLANG_DISAGGREGATION_THREAD_POOL_SIZE = EnvInt(None)
     SGLANG_DISAGGREGATION_QUEUE_SIZE = EnvInt(4)
+    # PD hidden receive-row admission window (rows). 0 disables windowing and
+    # reproduces the legacy whole-pool demand (kill-switch). See
+    # docs/agent/pd-hidden-window-design.md.
+    SGLANG_PD_HIDDEN_RECV_WINDOW = EnvInt(0)
     SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT = EnvInt(300)
     SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL = EnvFloat(5.0)
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
