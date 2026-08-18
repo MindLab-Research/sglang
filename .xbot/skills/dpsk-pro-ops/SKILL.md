@@ -59,18 +59,25 @@ bash /root/start_pd.sh router --prefill 10.0.0.75:30100 --decode 10.0.0.67:30200
 
 **处理**：不要改 prefill collective 代码。如果死锁，重启 prefill。
 
-### 2. 请求随机永久卡死（未修复）
+### 2. 请求随机永久卡死（已修复 cd15c85d68）
 
 **症状**：低负载下偶尔一个请求永久不返回，health 200、零崩溃、日志无错误。
 
-**根因**（已定位但修复被回退）：
-- retracted_queue 里的请求预算不够时无限重试无超时
-- prealloc 队列 hidden pool alloc 失败无限 continue 无超时
-- sender WaitingForInput 无超时（receiver 有）
+**根因链**（三个环节）：
+1. prefill 端 sender 卡 `WaitingForInput` 无超时（receiver 有）→ 不发 hidden ACK
+2. decode 端 `_release_pd_hidden_rows` 等 ACK 超时(300s)后 `return` → hidden rows 泄漏 → hidden pool 永久满
+3. 新请求 `dspark_pool.alloc()` 返回 `None` → `pop_preallocated` 里无限 `continue` → 永久卡死
 
-**为什么没修**：所有修复都改了 collective 行为或 conn.py 的 poll 逻辑，间接导致 prefill 死锁。修复需要在不修改 collective/poll 行为的前提下进行（如 router 层超时、客户端层超时）。
+**为什么之前的修复被回退**：都改了 collective 行为或 conn.py 的 poll 逻辑，间接导致 prefill 死锁。
 
-**临时缓解**：router 的 `--request-timeout-secs 3600`（1 小时）会最终超时返回 503。
+**本次修复（cd15c85d68，全在 decode 端纯本地逻辑，不触碰 collective/poll）**：
+- `_release_pd_hidden_rows`：ACK 超时后仍释放 rows（不再 `return`），避免 pool 泄漏
+- `DecodeRequest` 加 `enqueue_time` 字段，入队时打 `time.monotonic()` 时间戳
+- `pop_preallocated` 的 alloc 失败分支：超过 `waiting_timeout`(600s) 则 `prepare_abort` + `kv_receiver.abort()`（abort 通知 prefill 释放 sender，间接解除环节 1）
+
+**安全性**：`pop_preallocated` 内 poll 是 local-only（注释明确 "no cross-rank all_reduce"），abort 不改变 collective 调用次数，不会 rank 间错位。
+
+**临时缓解（仍有效）**：router 的 `--request-timeout-secs 3600`（1 小时）会最终超时返回 503。
 
 ### 3. DSpark draft CUDA graph（d013ed4541，已开启）
 

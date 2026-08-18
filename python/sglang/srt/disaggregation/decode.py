@@ -301,10 +301,13 @@ class DecodeRequest:
     hicache_load_consumer_index: int = -1
     hicache_restore_status: HiCacheRestoreResult = HiCacheRestoreResult.PENDING
 
-    # Monotonic timestamp when this request entered the prealloc queue. Used to
-    # bound the DSpark hidden-pool alloc-retry loop so a leaked/exhausted pool
-    # aborts the request instead of stalling it forever.
-    enqueue_time: float = 0.0
+    # PD hidden receive rows reserved BEFORE the receiver bootstraps (see
+    # DecodePreallocQueue._try_prealloc_pd_hidden_rows). Reserved rows
+    # guarantee that a bootstrapped request can always complete its hidden
+    # allocation, so the prefill sender never wedges in WaitingForInput when
+    # the hidden pool is exhausted (exhaustion keeps requests in the pending
+    # queue instead — backpressure, not a deadlock).
+    pd_hidden_reserved_indices: Optional[List[int]] = None
 
     @property
     def seqlen(self) -> int:
@@ -369,7 +372,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self._max_ensure_retries: int = 15  # scheduling cycles
         self._ensure_last_attempt_time: Dict[str, float] = {}
         self._ensure_retry_interval: float = 1.0  # seconds
-        self._last_pd_hidden_recv_credit_warning_time: float = 0.0
         # Retracted requests staged for rebootstrap while generation is paused.
         # Enqueued into ``self.queue`` only on ``continue_generation`` so the
         # prefix KV is recomputed under the post-retract (updated) weights.
@@ -562,7 +564,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             prefill_dp_rank = self._resolve_prefill_dp_rank(req)
             logger.debug(f"prefill_dp_rank: {prefill_dp_rank}")
             if prefill_dp_rank is not None:
-                decode_req.kv_receiver.init(prefill_dp_rank)
+                # Reserve hidden rows BEFORE bootstrap; on pool exhaustion keep
+                # the request pending instead of bootstrapping into a wedged
+                # sender (see _try_prealloc_pd_hidden_rows).
+                if self._try_prealloc_pd_hidden_rows(decode_req):
+                    decode_req.kv_receiver.init(prefill_dp_rank)
+                else:
+                    self.pending_reqs.append(decode_req)
                 return
 
             self.pending_reqs.append(decode_req)
@@ -627,6 +635,56 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         return None
 
+    def _try_prealloc_pd_hidden_rows(self, decode_req: DecodeRequest) -> bool:
+        """Reserve PD hidden receive rows BEFORE the receiver bootstraps.
+
+        Structural fix for the "single request stuck forever" wedge: the
+        prefill sender enters WaitingForInput (which has no timeout) as soon
+        as the decode receiver bootstraps, and it only leaves that state when
+        decode sends its KV indices — which requires hidden rows to exist.
+        Bootstrapping without reserved rows therefore wedges the sender
+        whenever the hidden pool is exhausted (alloc()==None spins forever in
+        pop_preallocated and the metadata send never happens).
+
+        Reserving first inverts the dependency: on pool exhaustion the request
+        simply stays in the pending queue — it has NOT bootstrapped, so no
+        prefill sender exists to wedge. That is plain backpressure, resolved
+        automatically once running requests return their rows. No timeout is
+        involved anywhere.
+
+        The reservation uses the prefix-free upper bound
+        min(_rebootstrap_prefill_len, pool.size); pop_preallocated trims the
+        excess right after the radix match (its pd_hidden_window_rows is never
+        larger than this bound), so the radix lock lifecycle is untouched.
+
+        Returns True when the request may bootstrap (rows reserved, or no
+        hidden transfer needed), False when the pool is exhausted and the
+        request must stay pending.
+        """
+        if decode_req.pd_hidden_reserved_indices is not None:
+            return True
+        if not (
+            self.scheduler.spec_algorithm.is_dspark()
+            and StateType.PD_HIDDEN in self.kv_manager.kv_args.state_types
+            and not _is_fake_transfer(decode_req.req, self.scheduler.server_args)
+        ):
+            # No PD hidden transfer involved; nothing to reserve.
+            return True
+        upper_bound = self._rebootstrap_prefill_len(decode_req.req)
+        if upper_bound <= 0:
+            return True
+        pool = getattr(self.metadata_buffers, "pd_hidden_pool", None)
+        if pool is None or pool.size <= 0:
+            # Config error; pop_preallocated raises the explicit abort for it.
+            return True
+        reserved = pool.alloc(min(upper_bound, pool.size))
+        if reserved is None:
+            # Pool exhausted: do NOT bootstrap (no wedged sender). Retry next
+            # tick; reserved rows return as requests finish/abort.
+            return False
+        decode_req.pd_hidden_reserved_indices = reserved
+        return True
+
     def _create_receiver_and_enqueue(
         self, req: Req, is_rebootstrap: bool = False
     ) -> DecodeRequest:
@@ -646,7 +704,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         decode_req = DecodeRequest(
             req=req, kv_receiver=kv_receiver, is_rebootstrap=is_rebootstrap
         )
-        decode_req.enqueue_time = time.monotonic()
         self.queue.append(decode_req)
         return decode_req
 
@@ -949,12 +1006,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.pending_reqs = remaining
 
         for decode_req, prefill_dp_rank in resolved:
+            # Reserve hidden rows BEFORE bootstrap; on pool exhaustion keep the
+            # request pending (never bootstrapped -> no wedged prefill sender).
+            if not self._try_prealloc_pd_hidden_rows(decode_req):
+                self.pending_reqs.append(decode_req)
+                continue
             decode_req.kv_receiver.init(prefill_dp_rank)
 
     def pop_preallocated(
         self, rids_to_check: Optional[List[str]] = None
     ) -> Tuple[List[DecodeRequest], List[DecodeRequest]]:
         """Pop the preallocated requests from the pending queue (FIFO)."""
+        # First, retry PD hidden row releases that were parked because their
+        # chunk-injection ACKs were still pending (non-blocking pattern — see
+        # DecodeTransferQueue._release_pd_hidden_rows).
+        self.transfer_queue.drain_pending_pd_hidden_releases()
         self._resolve_pending_reqs()
         self._update_handshake_waiters(rids_to_check)
 
@@ -1334,65 +1400,63 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     failed_reqs.append(decode_req)
                     indices_to_remove.add(i)
                     continue
-                allocated_hidden_indices = dspark_pool.alloc(pd_hidden_window_rows)
+                if decode_req.pd_hidden_reserved_indices is not None:
+                    # Rows were reserved before bootstrap (see
+                    # _try_prealloc_pd_hidden_rows). pd_hidden_window_rows is
+                    # guaranteed <= len(reserved) because the reservation used
+                    # the prefix-free upper bound
+                    # min(_rebootstrap_prefill_len, pool.size) >=
+                    # min(pd_hidden_len, pool.size). Trim the excess back to
+                    # the pool right away so other pending requests can
+                    # reserve them.
+                    allocated_hidden_indices = decode_req.pd_hidden_reserved_indices[
+                        :pd_hidden_window_rows
+                    ]
+                    excess = decode_req.pd_hidden_reserved_indices[
+                        pd_hidden_window_rows:
+                    ]
+                    if excess:
+                        dspark_pool.free(excess)
+                    decode_req.pd_hidden_reserved_indices = None
+                else:
+                    allocated_hidden_indices = dspark_pool.alloc(
+                        pd_hidden_window_rows
+                    )
                 if allocated_hidden_indices is None:
+                    # Unreachable when the pre-bootstrap reservation ran: a
+                    # bootstrapped request always carries reserved rows. Only
+                    # a path that bypasses the reservation could land here, so
+                    # treat it as an invariant violation and fail fast — never
+                    # spin (spinning wedges the already-bootstrapped prefill
+                    # sender in WaitingForInput forever).
+                    message = (
+                        "PD decode hidden pool invariant violated: request "
+                        "bootstrapped without pre-reserved hidden rows and "
+                        "the pool has no free rows "
+                        f"(rid={decode_req.req.rid}, "
+                        f"free_rows={dspark_pool.available_size()}, "
+                        f"pool_rows={dspark_pool.size})."
+                    )
+                    logger.error(message)
                     if prefix_len > 0:
                         self.tree_cache.dec_lock_ref(decode_req.req.last_node)
-                    now = time.monotonic()
-                    if (
-                        now - self._last_pd_hidden_recv_credit_warning_time
-                        > 30
-                    ):
-                        logger.warning(
-                            "PD decode hidden pool blocked prealloc: "
-                            "rid=%s window_rows=%d hidden_len=%d free_rows=%d pool_rows=%d "
-                            "prealloc_queue=%d transfer_queue=%d",
-                            decode_req.req.rid,
-                            pd_hidden_window_rows,
-                            pd_hidden_len,
-                            dspark_pool.available_size(),
-                            dspark_pool.size,
-                            len(self.queue),
-                            len(self.transfer_queue.queue),
-                        )
-                        self._last_pd_hidden_recv_credit_warning_time = now
-
-                    # Bound the alloc-retry loop: if the hidden pool stays
-                    # exhausted past the waiting timeout, abort this request
-                    # instead of spinning forever. This is the decode-side
-                    # counterpart to the prefill sender's WaitingForInput hang
-                    # (which has no timeout): aborting here sends an abort
-                    # notification to prefill, which releases the sender.
-                    # This runs in pop_preallocated (local-only poll, no
-                    # cross-rank all_reduce), so it cannot desync collectives.
-                    waiting_timeout = getattr(
-                        getattr(self, "kv_manager", None), "waiting_timeout", 600.0
+                    prepare_abort(
+                        decode_req.req,
+                        message,
+                        status_code=HTTPStatus.SERVICE_UNAVAILABLE,
                     )
-                    if (
-                        decode_req.enqueue_time > 0
-                        and now - decode_req.enqueue_time > waiting_timeout
-                    ):
-                        message = (
-                            "PD decode hidden pool exhausted for over "
-                            f"{waiting_timeout:.0f}s; aborting request "
-                            f"(rid={decode_req.req.rid}, pool_rows={dspark_pool.size})"
-                        )
-                        logger.error(message)
-                        prepare_abort(
-                            decode_req.req,
-                            message,
-                            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
-                        )
-                        self.scheduler.output_streamer.stream_output(
-                            [decode_req.req], decode_req.req.return_logprob
-                        )
-                        if decode_req.kv_receiver is not None:
-                            # abort() (not clear()) sends the abort notification
-                            # to prefill so its sender is released too.
-                            decode_req.kv_receiver.abort()
-                        decode_req.kv_receiver = None
-                        failed_reqs.append(decode_req)
-                        indices_to_remove.add(i)
+                    self.scheduler.output_streamer.stream_output(
+                        [decode_req.req], decode_req.req.return_logprob
+                    )
+                    if decode_req.kv_receiver is not None:
+                        # abort() (not clear()) notifies prefill so its sender
+                        # leaves WaitingForInput instead of hanging forever.
+                        decode_req.kv_receiver.abort()
+                    decode_req.kv_receiver = None
+                    # Release any rows this request still owns (none expected).
+                    self._release_pd_hidden_rows(decode_req)
+                    failed_reqs.append(decode_req)
+                    indices_to_remove.add(i)
                     continue
 
                 pd_hidden_dst_indices_by_pp = {}
@@ -1711,6 +1775,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
+
+        # Config-error aborts inside the loop (pool layout / streaming /
+        # window checks) can fire while pre-bootstrap reserved hidden rows are
+        # still held. Release uniformly here; _release_pd_hidden_rows is
+        # idempotent (ownership fields are nulled), so requests already
+        # released by the FINISH_ABORT scan above are no-ops.
+        for failed_req in failed_reqs:
+            self._release_pd_hidden_rows(failed_req)
 
         return preallocated_reqs, failed_reqs
 
@@ -2167,6 +2239,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.staging_handler = None
         self.kv_manager = None
+        # PD hidden row releases whose chunk-injection ACKs were still pending
+        # at release time. Released on a later scheduler tick by
+        # drain_pending_pd_hidden_releases (non-blocking pattern; never gives
+        # up, so rows can never leak and the scheduler thread never blocks).
+        self._pending_pd_hidden_releases: List[dict] = []
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
@@ -2181,36 +2258,19 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 ):
                     self.staging_handler.register_decode_req(dr.req.bootstrap_room, dr)
 
-    def _release_pd_hidden_rows(self, decode_req: DecodeRequest) -> None:
-        wait_ack_completions = getattr(
-            self.kv_manager, "wait_pd_hidden_ack_completions", None
-        )
-        if wait_ack_completions is not None and not wait_ack_completions(
-            decode_req.req.bootstrap_room
-        ):
-            # Root-cause fix for "requests permanently stuck in prealloc":
-            # the prefill-side sender can hang in WaitingForInput (it has no
-            # timeout there), so hidden ACKs never complete. Previously we
-            # `return`ed here and leaked the rows, permanently starving the
-            # hidden pool so every later DSpark request spins forever in
-            # pop_preallocated's alloc-retry loop. The request is already
-            # finished/aborted at this point, so releasing the rows is safe —
-            # any in-flight prefill writes target a dead request and are
-            # discarded. Always release to keep the pool from leaking.
-            logger.error(
-                "Timed out waiting for PD hidden ACK completion before releasing "
-                "receive rows; releasing anyway to avoid hidden-pool leak: "
-                "rid=%s room=%s",
-                decode_req.req.rid,
-                decode_req.req.bootstrap_room,
-            )
+    def _do_release_pd_hidden_rows(
+        self,
+        room: int,
+        indices_by_pp: Optional[Dict[int, List[int]]],
+        indices: Optional[List[int]],
+        reserved_indices: Optional[List[int]],
+    ) -> None:
+        """Actually return PD hidden rows to the pool (idempotent by caller)."""
         pop_acked_chunks = getattr(
             self.kv_manager, "pop_pd_hidden_acked_chunks", None
         )
         if pop_acked_chunks is not None:
-            pop_acked_chunks(decode_req.req.bootstrap_room)
-        indices_by_pp = decode_req.pd_hidden_dst_indices_by_pp
-        indices = decode_req.pd_hidden_dst_indices
+            pop_acked_chunks(room)
         pool = getattr(self.metadata_buffers, "pd_hidden_pool", None)
         if pool is not None:
             if indices_by_pp is not None:
@@ -2223,10 +2283,99 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     pool.free(pp_indices)
             elif indices is not None:
                 pool.free(indices)
+            elif reserved_indices is not None:
+                # Rows reserved before bootstrap; the request aborted before
+                # pop_preallocated converted them into dst indices. Prefill was
+                # never told about them, so freeing needs no ACK at all.
+                pool.free(reserved_indices)
+
+    def _release_pd_hidden_rows(self, decode_req: DecodeRequest) -> None:
+        """Release PD hidden receive rows without ever blocking the caller.
+
+        The ACK wait is decode-local (it drains our own chunk-injection CUDA
+        completions), so in the normal case it is already complete and this
+        returns immediately. If completions are still pending we must NOT
+        block the scheduler thread for the old 300s deadline, and we must NOT
+        give up either (giving up leaked the rows and starved the pool — the
+        original wedge). Instead we park the release and retry it on a later
+        scheduler tick via drain_pending_pd_hidden_releases. Parked releases
+        only outlive the request while its own injection events are still in
+        flight, so no timeout is needed to make progress.
+        """
+        wait_ack_completions = getattr(
+            self.kv_manager, "wait_pd_hidden_ack_completions", None
+        )
+        room = decode_req.req.bootstrap_room
+        indices_by_pp = decode_req.pd_hidden_dst_indices_by_pp
+        indices = decode_req.pd_hidden_dst_indices
+        reserved_indices = decode_req.pd_hidden_reserved_indices
+        if (
+            wait_ack_completions is not None
+            and indices_by_pp is not None
+            and not wait_ack_completions(room, timeout_s=0.0)
+        ):
+            # ACKs still pending: park and retry later (non-blocking).
+            logger.info(
+                "PD hidden ACK still pending at release; parking release for "
+                "next tick: rid=%s room=%s",
+                decode_req.req.rid,
+                room,
+            )
+            self._pending_pd_hidden_releases.append(
+                {
+                    "room": int(room),
+                    "rid": decode_req.req.rid,
+                    "indices_by_pp": indices_by_pp,
+                    "indices": indices,
+                    "reserved_indices": reserved_indices,
+                }
+            )
+        else:
+            # Either fully acked, no announced rows (reserved-only abort —
+            # prefill never knew these rows), or a backend without ACK
+            # tracking: release synchronously.
+            self._do_release_pd_hidden_rows(
+                int(room), indices_by_pp, indices, reserved_indices
+            )
+        # Ownership has been transferred (freed or parked); null the fields so
+        # repeated calls for the same request are no-ops.
         decode_req.pd_hidden_dst_indices = None
         decode_req.pd_hidden_dst_indices_by_pp = None
+        decode_req.pd_hidden_reserved_indices = None
         decode_req.pd_hidden_pp_slices = None
         decode_req.pd_hidden_state.reset()
+
+    def drain_pending_pd_hidden_releases(self) -> None:
+        """Retry parked PD hidden row releases (called every scheduler tick)."""
+        if not self._pending_pd_hidden_releases:
+            return
+        wait_ack_completions = getattr(
+            self.kv_manager, "wait_pd_hidden_ack_completions", None
+        )
+        if wait_ack_completions is None:
+            # No ACK tracking: release everything parked immediately.
+            pending = self._pending_pd_hidden_releases
+            self._pending_pd_hidden_releases = []
+            for rec in pending:
+                self._do_release_pd_hidden_rows(
+                    rec["room"],
+                    rec["indices_by_pp"],
+                    rec["indices"],
+                    rec["reserved_indices"],
+                )
+            return
+        still_pending = []
+        for rec in self._pending_pd_hidden_releases:
+            if wait_ack_completions(rec["room"], timeout_s=0.0):
+                self._do_release_pd_hidden_rows(
+                    rec["room"],
+                    rec["indices_by_pp"],
+                    rec["indices"],
+                    rec["reserved_indices"],
+                )
+            else:
+                still_pending.append(rec)
+        self._pending_pd_hidden_releases = still_pending
 
     def _consume_pd_hidden_acked_chunks(self, decode_req: DecodeRequest) -> None:
         pop_acked_chunks = getattr(
