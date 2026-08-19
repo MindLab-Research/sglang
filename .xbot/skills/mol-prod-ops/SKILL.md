@@ -121,6 +121,17 @@ and [fault-triage.md](references/fault-triage.md) (search `2P3D`).
 - **⛔ rsync 后必须删除 L20D triton config**（TPOT 23ms→80ms 杀手）：
   `rm -f <venv>/lib/python3.12/site-packages/sglang/srt/layers/moe/moe_runner/triton_utils/configs/triton_3_6_0/*L20D*.json`
 - 代码版本 = 本地 git HEAD（skill 不再记录易过期 hash；关键修复 commit 见上节）
+### 1P2D decode 崩溃链（2026-08-19 全部结案）
+
+1. **flashinfer-cubin 不匹配**（v15_patched 专属）：`system_packages.pth` 暴露系统
+   `flashinfer_cubin 0.6.12` 给 venv `flashinfer 0.6.14` → trtllm kernel IMA。
+   修复 = 删系统 cubin 目录+dist-info、从 1102 完整同步 flashinfer（含 88M
+   `data/` 内嵌 cubin）。判据：`import flashinfer` 报 cubin version mismatch。
+2. **transfer 风暴 IMA**（commit `8bfe264118`）：`transform_index_page_table_decode_fast`
+   只 mask `topk<0` 缺上界 → 40+ 并发 KV 传输下 indexer 竞态越界 → OOB。
+   判据：并发 burst 崩一个 decode，栈在 `_forward_trtllm → transform_index`；
+   复现脚本 `/root/bench_case50/repro_storm.py`（40×11K 并发）。
+
 - 已知故障模式：router/proxy 进程活着但转发卡死（重启即恢复）、1101 Gloo TCP
   断连崩溃（22.0.68.78，根因待查）——详见 fault-triage.md
 
