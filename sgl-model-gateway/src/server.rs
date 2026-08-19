@@ -1175,6 +1175,36 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     )
     .await;
 
+    // Register the launched PD cluster as a control-plane child. Without this,
+    // GET /v1/control/models returns an empty view (no units to aggregate) and
+    // POST /v1/control/models has no deploy target. The child's decode engine
+    // /v1/models lists every LoRA that is actually loaded AND registered on
+    // the engines (sglang `lora_registry.get_all_adapters()`), which is the
+    // source of truth for dynamic LoRA switching.
+    if let RoutingMode::PrefillDecode {
+        prefill_urls,
+        decode_urls,
+        ..
+    } = &config.router_config.mode
+    {
+        if let Some(decode_url) = decode_urls.first() {
+            let unit = control_plane::ChildUnit {
+                id: "launch-pd".to_string(),
+                url: decode_url.clone(),
+                kind: "pd_cluster".to_string(),
+                prefill_url: prefill_urls.first().map(|(u, _)| u.clone()),
+                decode_url: Some(decode_url.clone()),
+                api_key: config.router_config.api_key.clone(),
+                models: Vec::new(),
+                // Matches --max-loaded-loras 2 on the BF16 GLM-5.2 cluster.
+                capacity: 2,
+                ssh_hosts: Vec::new(),
+            };
+            control_plane.register_child(unit);
+            info!("Registered launched PD cluster as control-plane child (decode={decode_url})");
+        }
+    }
+
     let app_state = Arc::new(AppState {
         router,
         context: app_context.clone(),

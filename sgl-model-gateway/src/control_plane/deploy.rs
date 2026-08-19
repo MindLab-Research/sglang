@@ -248,8 +248,16 @@ fn select_target_engine(state: &ControlPlaneState, req: &DeployRequest) -> Optio
         .filter(|u| u.kind == "pd_cluster" || u.kind == "engine")
         .filter(|u| u.decode_url.is_some() || u.prefill_url.is_some())
         .filter(|u| u.models.iter().all(|m| m.name != req.name))
-        // free slot OR at least one model that can be swapped out
-        .filter(|u| u.models.len() < u.capacity.max(1) || !u.models.is_empty())
+        // Free slot OR at least one model that can be swapped out. Capacity
+        // slots are LoRA-only (base model never counts toward capacity).
+        .filter(|u| {
+            let lora_count = u
+                .models
+                .iter()
+                .filter(|m| m.model_type != "base")
+                .count();
+            lora_count < u.capacity.max(1) || !u.models.is_empty()
+        })
         .collect();
 
     if candidates.is_empty() {
@@ -467,7 +475,16 @@ async fn execute_deploy(
 
     // 2. Free a slot if the unit is full (swap-slot semantics: the least-busy
     //    loaded model is drained, then unloaded before the new one loads).
-    let has_free_slot = target.models.len() < target.capacity.max(1);
+    // NOTE: only LoRAs consume capacity slots — the base model lives in the
+    //    same engine but is never a swap candidate, so it must not count
+    //    toward `capacity` (else a 2-slot engine with 1 LoRA + base would
+    //    appear full and swap on every deploy).
+    let lora_count = target
+        .models
+        .iter()
+        .filter(|m| m.model_type != "base")
+        .count();
+    let has_free_slot = lora_count < target.capacity.max(1);
     let replaced = if has_free_slot {
         None
     } else {

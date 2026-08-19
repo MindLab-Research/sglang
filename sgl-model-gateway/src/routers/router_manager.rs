@@ -437,7 +437,22 @@ impl RouterTrait for RouterManager {
             .into_response()
     }
 
-    async fn get_models(&self, _req: Request<Body>) -> Response {
+    async fn get_models(&self, req: Request<Body>) -> Response {
+        // Forward to the default/single router when one is registered: its
+        // get_models proxies the engine's /v1/models, which (PD mode) lists
+        // the base model plus every currently-loaded LoRA adapter — not just
+        // the static base model name known to the worker registry. Fall back
+        // to the worker registry only when no router exists (early boot).
+        let default_id = self
+            .default_router
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(default_id) = default_id {
+            if let Some(router) = self.routers.get(&default_id) {
+                return router.get_models(req).await;
+            }
+        }
         let model_names = self.worker_registry.get_models();
 
         if model_names.is_empty() {
