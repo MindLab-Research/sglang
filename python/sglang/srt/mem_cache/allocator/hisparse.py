@@ -231,9 +231,21 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,  # last_loc for full layers
     ):
-        return self.logical_attn_allocator.alloc_decode(
+        logical_indices = self.logical_attn_allocator.alloc_decode(
             seq_lens, seq_lens_cpu, last_loc
         )
+        if logical_indices is not None:
+            # Allocate matching hisparse device indices and update mapping
+            hisparse_indices = self.hisparse_attn_allocator.alloc(
+                len(logical_indices)
+            )
+            assert hisparse_indices is not None, (
+                "HiSparse device allocation failed in alloc_decode"
+            )
+            self.full_to_hisparse_device_index_mapping[logical_indices] = (
+                hisparse_indices
+            )
+        return logical_indices
 
     def free_hisparse(self, free_indices: torch.Tensor):
         hisparse_indices = self._kvcache._translate_loc_to_hisparse_device(free_indices)

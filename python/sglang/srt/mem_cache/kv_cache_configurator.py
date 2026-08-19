@@ -1101,7 +1101,7 @@ class KVCacheConfigurator:
             dsa_cp_layer_shard_size,
         ) = get_glm_dsa_cp_layer_shard_info(self)
         pool_kwargs = {}
-        if self.server_args.enable_hisparse:
+        if self.server_args.enable_hisparse and not self.is_draft_worker:
             PoolCls = HiSparseDSATokenToKVPool
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
@@ -1522,6 +1522,10 @@ class KVCacheConfigurator:
                     token_to_kv_pool.register_mapping(
                         swa_allocator.full_to_swa_index_mapping
                     )
+            elif self.server_args.enable_hisparse:
+                # Draft worker with HiSparse: the draft pool is DSATokenToKVPool
+                # (not HiSparseDSATokenToKVPool), so no register_mapping needed.
+                pass
         return token_to_kv_pool_allocator
 
     def _profile_available_bytes(self, pre_model_load_memory: int) -> int:

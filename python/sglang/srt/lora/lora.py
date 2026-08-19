@@ -145,6 +145,16 @@ class LoRAAdapter(nn.Module):
         loader = DefaultModelLoader(self.load_config)
         revision = getattr(self.config.hf_config, "revision", None)
 
+        # Get normalized target modules once (not per-weight) to avoid O(n^2)
+        # when adapters use fully-expanded PEFT target_modules (e.g. 58k paths
+        # for a 78-layer x 256-expert MoE), where the old per-weight call made
+        # load_lora_adapter take ~19 minutes.
+        from sglang.srt.lora.utils import get_normalized_target_modules
+
+        self._normalized_target_modules = get_normalized_target_modules(
+            self.config.target_modules
+        )
+
         # Get normalized target modules for filtering
         for name, loaded_weight in loader._get_weights_iterator(
             DefaultModelLoader.Source(
@@ -156,17 +166,27 @@ class LoRAAdapter(nn.Module):
         self._normalize_weights()
 
     def initialize_weights_from_tensors(self, tensors: Dict[str, torch.Tensor]):
+        from sglang.srt.lora.utils import get_normalized_target_modules
+
+        self._normalized_target_modules = get_normalized_target_modules(
+            self.config.target_modules
+        )
         for name, tensor in tensors.items():
             self._process_weight(name, tensor)
 
         self._normalize_weights()
 
     def _process_weight(self, name: str, loaded_weight: torch.Tensor):
-        from sglang.srt.lora.utils import get_normalized_target_modules
-
-        normalized_target_modules = get_normalized_target_modules(
-            self.config.target_modules
+        normalized_target_modules = getattr(
+            self, "_normalized_target_modules", None
         )
+        if normalized_target_modules is None:
+            from sglang.srt.lora.utils import get_normalized_target_modules
+
+            normalized_target_modules = get_normalized_target_modules(
+                self.config.target_modules
+            )
+            self._normalized_target_modules = normalized_target_modules
 
         # Remap PEFT "unembed_tokens" key to "lm_head" so the weight is
         # recognized and loaded into the correct buffer.

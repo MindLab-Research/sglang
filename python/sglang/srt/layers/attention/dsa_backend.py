@@ -2200,7 +2200,9 @@ class DeepseekSparseAttnBackend(
                 )
 
         # todo hisparse: to cover more backends
-        if self.hisparse_coordinator is not None:
+        if self.hisparse_coordinator is not None and hasattr(
+            self.token_to_kv_pool, "translate_loc_to_hisparse_device"
+        ):
             # flash_mla_sparse_fwd / tilelang require int32 page indices.
             page_table_1 = self.token_to_kv_pool.translate_loc_to_hisparse_device(
                 page_table_1
@@ -2300,6 +2302,11 @@ class DeepseekSparseAttnBackend(
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
+                return_lse=dcp_enabled()
+                and (
+                    forward_batch.forward_mode.is_decode()
+                    or forward_batch.forward_mode.is_target_verify()
+                ),
             )
         elif dsa_impl == "flashmla_kv":
             if q_rope is not None:
@@ -2313,6 +2320,11 @@ class DeepseekSparseAttnBackend(
                 layer=layer,
                 metadata=metadata,
                 page_table_1=page_table_1,
+                return_lse=dcp_enabled()
+                and (
+                    forward_batch.forward_mode.is_decode()
+                    or forward_batch.forward_mode.is_target_verify()
+                ),
             )
         elif dsa_impl == "fa3":
             return self._forward_fa3(
@@ -2446,6 +2458,11 @@ class DeepseekSparseAttnBackend(
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
+                return_lse=dcp_enabled()
+                and (
+                    forward_batch.forward_mode.is_decode()
+                    or forward_batch.forward_mode.is_target_verify()
+                ),
             )
         elif self.dsa_decode_impl == "flashmla_kv":
             if q_rope is not None:
@@ -2459,6 +2476,11 @@ class DeepseekSparseAttnBackend(
                 layer=layer,
                 metadata=metadata,
                 page_table_1=page_table_1,
+                return_lse=dcp_enabled()
+                and (
+                    forward_batch.forward_mode.is_decode()
+                    or forward_batch.forward_mode.is_target_verify()
+                ),
             )
         elif self.dsa_decode_impl == "tilelang":
             # Cat-skip (HIP-only): when caller passes q_rope=None on HIP, q_all

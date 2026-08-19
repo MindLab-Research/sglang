@@ -788,6 +788,12 @@ class ModelRunner:
     def maybe_init_hisparse_coordinator(self):
         if not self.enable_hisparse:
             return
+        # Draft worker does not use HiSparse host offload; its pool is
+        # DSATokenToKVPool (not HiSparseDSATokenToKVPool). Creating a
+        # coordinator here would make dsa_backend's swap_in_selected_pages
+        # run on a non-HiSparse pool, corrupting KV indices.
+        if self.is_draft_worker:
+            return
         from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
         from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
