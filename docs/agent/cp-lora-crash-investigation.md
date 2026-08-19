@@ -80,18 +80,18 @@ LoRA 请求路径的某处（prepare_lora_batch / hook 构建）在 CP gather �
 2. **CP gathered 尺寸**（`base_backend.get_gathered_moe_num_tokens` v2）：CP 下 MoE 跑 gathered token 集（=Σ各 rank），但 `global_num_tokens_cpu` 只存本 rank 值 → mapping 分配 8、kernel 索引 48 → OOB。实测 DIAG：nt=6 moe_nt=8（错）→ 修复后 64 ✓
 3. **mapping/seg/lora_id 消毒**（`_compute_moe_lora_info_kernel` + SANITIZE-MAP）：SEG-CLAMP 钳 seg 到 [0, mapping_len]，lora_id 上界，host 端 masked_fill_
 
-### 服务器级残余（CP×VE 路径，另案未解，已出圈）
+### 服务器级残余（CP×LoRA，2026-08-19 深夜已在 1102 结案，见文末）
 
-> ⚠️ 定性修正（2026-08-19 下午）：本节残余是**单机 CP×VE 路径**的问题，与 PD 集群崩溃（已解，见下节）**不是同一根因**。用户决策 BF16 不开 CP，本残余出圈挂起。
+> ✅ 本节残余已定性并修复：真凶是 **csgmv dense/attn 层的 batch_info 与 CP shard 行数错配**（非 VE kernel、非 gate GEMM、非 CP attention 交互）。layer-0 gate GEMM / DSA topk 只是 sticky IMA 的随机浮出点。完整链条见文末「1102 结案」节。
 
-全部消毒生效后（eager、干净 M=6、尺寸正确、权重 checksum 不变），仍崩：**layer-0 gate GEMM 报 `cudaErrorIllegalAddress`（CP0 rank、VE impl 之前、Xid 先于 Python 异常 16s）**。已排除：graph 池垃圾（全部钳制）、尺寸、加载污染（canary+probe 24 次干净）、`.cu` align kernel（独立测干净+naive 绕过仍崩）、torch 分配器冲突（LoRA 池=torch.zeros）、cublas workspace。**指向 CP attention 路径与 LoRA 权重加载的更深层交互**（CP0 是 layersplit broadcast owner）。
+原记录（保留供考古）：全部消毒生效后（eager、干净 M=6、尺寸正确、权重 checksum 不变），仍崩：**layer-0 gate GEMM 报 `cudaErrorIllegalAddress`（CP0 rank、VE impl 之前、Xid 先于 Python 异常 16s）**。已排除：graph 池垃圾（全部钳制）、尺寸、加载污染（canary+probe 24 次干净）、`.cu` align kernel（独立测干净+naive 绕过仍崩）、torch 分配器冲突（LoRA 池=torch.zeros）、cublas workspace。
 
 ### 铁的对照事实
 
-- **无 CP + LoRA（VE 路径）：全链正常**（单机 + PD 集群双验证）——可服务 LoRA 的形态
+- **无 CP + LoRA（VE 路径）：全链正常**（单机 + PD 集群双验证）
 - CP + base：正常（生产一直跑）
-- CP + LoRA（单机 VE 路径）：崩（上述残余，另案）
-- PD prefill（无 VE flag，classic 路径）：崩——**即上一晚所有 PD 崩溃的真因，见下节**
+- CP + LoRA（单机）：崩——**1102 定性：csgmv shard 错配（已修）**，见文末
+- PD prefill（无 VE flag，classic 路径）：崩——flag 缺失，见下节
 
 ---
 
@@ -127,3 +127,39 @@ LoRA 请求路径的某处（prepare_lora_batch / hook 构建）在 CP gather �
 - lora_overlap_loader：SYNC-LOAD 修复 + CANARY 探针（远端版）；**干净版已 commit 本地**
 - lora_moe_runners `a2e2aa01`：ALIGN-NATIVE-NAIVE（.cu align 绕过，env `SGLANG_LORA_ALIGN_CUDA=1` 可回开）——未 commit（未证明必要）
 - mem_pool/lora_manager：残留 PHASE-LOG 打印（无害，一次性）
+
+---
+
+## 2026-08-19 深夜结案：单机 CP×LoRA 崩溃 = csgmv batch_info 与 CP shard 行数错配（1102 复现+修复，commit `c1946917cb`）
+
+### 复现环境（1102，2P3D prefill 节点）
+
+- 8×L20D(B300)，GLM-5.2 **FP8**（`/root/glm52_local/base`），tp8 + `--enable-prefill-cp --cp-strategy interleave`
+- LoRA L0-L3 **全量版**（含 attn q_a/q_b/kv_a/kv_b/o_proj + MoE，走 csgmv backend `Using csgmv as backend of LoRA kernels`）
+- venv=`/root/sglang_venv`（已与本地 b300-glm52 完全同步；**旧 0.5.15.post1 `/opt/sglang-venv` 是 1101 在跑的另一套，勿混淆**）
+- 复现脚本 `/root/start_cp_mol_test.sh`（无 layersplit、`--disable-cuda-graph --disable-overlap-schedule`）
+
+### 根因链（三层证据闭环）
+
+1. **第一故障点钉死**（CUDA_LAUNCH_BLOCKING=1）：`deepseek_v2.py:345 dense MLP → apply_lora → run_gate_up_lora → chunked_sgmv_lora_expand_forward` IMA。后续轮次浮出点漂移到 DSA indexer topk / MoE gate GEMM——全是 **sticky IMA 随机浮出**，真凶都是同一个。
+2. **插桩铁证**（CSGMV-DIAG）：`M=3 base_M=3 nseg=2 seg_last=18 perm_len=18 perm_max=17`——dense 层 x 只有 **3 行**（CP 切分后本 rank shard），batch_info 的 permutation 覆盖 **18**（切分前全量）→ kernel 按 perm 索引 `x[17]` → OOB。另见 `perm_max=1043512920`（perm 未初始化段垃圾）。
+3. **机制**：`prepare_lora_batch` 在模型 forward **之前**构建 segments/permutation（全量 token），而 CP 在 forward 内部把 batch 切成 per-rank shard；csgmv kernel 用 permutation 索引 x → 行数错配即 OOB。无 CP / DCP 不崩因为两者行数天然相等；MoE 不崩因为走 gathered（已有 CP-fix v2）。
+
+**关键陷阱：round-robin 模式的 `attn_cp_metadata` 是空对象**（`ContextParallelMetadata()`，split_list=None）——第一版修复 keying on metadata 静默失效（0 warning 但照崩）。`dsa_prefill_cp_mode` 默认就是 `round-robin-split`（`p % cp_size == cp_rank` 升序取行）。
+
+### 修复（`chunked_backend.py`，commit `c1946917cb`）
+
+- `prepare_lora_batch` stash `(forward_batch, req adapter ids, chunk_size, full_covered)`
+- `_cp_shard_row_request_ids`：从 **parallel runtime + CPU seq_lens** 直算本 rank 行序（round-robin 与 zigzag 两布局都支持），不依赖 metadata
+- `_resolve_batch_info`：按 `x.shape[0]` 精确匹配 shard/full 视图（embedding/lm-head 保持自身视图）；残余 mismatch 时 clamp + 响亮日志（永不 OOB）
+- 同 commit 修 `base_backend.py`：`_compute_moe_lora_info_kernel` 调用点缺 hardened 两参数（mapping_len/num_lora_slots）→ 新部署 graph capture 即 TypeError
+
+### 验收（1102）
+
+10/10 混合（base/L0/L1/L2 轮换）+ 长文本 L3 全过；**0 Scheduler hits、0 shape-mismatch warning**（shard 重建精确匹配）；LoRA 生效（temp=0 输出 ≠ base）。修复前首个 LoRA 请求必崩。
+
+### 遗留
+
+- 1102 测试实例（:30444）保留供回归；远端 `chunked_backend.py.bak.diag` 是插桩版备份
+- 1021/1022 生产 BF16 集群目前**无 CP**（用户决策），此修复为 CP 开启铺路；同步代码后建议跑一轮 CP 开启验证
+- `--enable-dsa-cache-layer-split`（真 LayerSplit）仅 PD prefill 可用（validation 强制）；单机误用 `--enable-dsa-prefill-cp-layersplit`（不同 flag！）在单机会全量 pool → OOM，勿混淆两者
