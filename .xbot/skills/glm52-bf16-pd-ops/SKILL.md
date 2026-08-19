@@ -23,13 +23,13 @@ description: "GLM-5.2 BF16 + 4 LoRA 1P1D PD 集群运维 runbook（B300 8.213.21
 | 项 | prefill | decode |
 |---|---|---|
 | TP | 8 | 8 |
-| CP/DCP | CP=8（`--enable-prefill-cp --cp-strategy interleave --enable-dsa-prefill-cp-layersplit`） | DCP=8（`--dcp-size 8`） |
+| CP/DCP | 无 CP（2026-08-19 起；CP×LoRA 修复 `c1946917cb` 已进主线，恢复 CP 前必须部署该修复） | DCP=4（`--dcp-size 4`） |
 | 投机解码 | 无 | EAGLE（`--speculative-algorithm EAGLE --speculative-draft-model-path /root/glm52_local/bf16 --speculative-num-steps 5 --speculative-eagle-topk 1`） |
 | KV dtype | FP8 E4M3（默认，scaling=1.0） | 同 |
-| mem-fraction | 0.93 | 0.90 |
+| mem-fraction | 0.85 | 0.90 |
 | page size | 64 | 128 |
-| HiCache | ✅ file backend（/root/hicache） | ❌ |
-| LoRA | 4（L0-L3） | 4（L0-L3） |
+| HiCache | ❌（2026-08-19 移除，排查时排除，未恢复） | ❌ |
+| LoRA | 4（L0-L3）+ **VE flag 必须** | 4（L0-L3）+ VE |
 
 **必须两端同时启动**（decode 会 reconnect prefill 的 8998 bootstrap，先后启动会刷 reconnect）。
 
@@ -66,7 +66,7 @@ curl -s -X POST http://127.0.0.1:31000/v1/chat/completions \
   -d '{"model":"glm52-bf16-pd","messages":[{"role":"user","content":"1+1等于几？只回答数字"}],"max_tokens":64,"temperature":0}'
 ```
 
-## KV cache 容量（实测）
+## KV cache 容量（实测，CP=8+layersplit 旧形态；当前无 CP 形态数值更大，待重测）
 
 | | prefill | decode |
 |---|---|---|
@@ -79,15 +79,33 @@ decode KV 是 prefill 的 1.6 倍，因为 prefill 权重 + CP layer-split 开�
 
 ## 已知问题与陷阱
 
-1. **BF16 权重 199GB**：prefill `mem-fraction-static` 必须 ≥0.93，0.85 会 OOM 崩溃
-2. **启动缺函数/import 错误**（已修，commit `c561d36e45`）：
-   - `dp_attention.py` 需有 `get_attention_tp_size()`（model_runner_kv_cache_mixin / base_backend import）
-   - `base_backend.py` 的 `get_cp_padding_align_size` 从 `sglang.srt.layers.cp.padding` import（不是 `cp_utils`）
-3. **prefill collective 死锁**（V4 Pro 遗留）：`538ee9d0d1` 基线，不要改 prefill collective 代码
-4. **router 转发卡死**：health 200 但请求 503/超时 → kill + 重启 router
-5. **EAGLE draft graph**：冷启动捕获 ~9 分钟（热缓存 ~18s），draft model = BF16 自带 MTP
-6. **decode reconnect**：prefill 重启后 decode 必须一起重启
-7. **不用 scp**、**rsync 逐条**、**清 __pycache__**、**py-spy 并发抓**（同 V4 Pro）
+1. **⛔ VE flag 缺失 = 首个 LoRA 请求必崩（2026-08-19 结案）**：prefill 块曾丢
+   `--lora-use-virtual-experts` → 走无加固 classic `fused_moe_lora` kernel →
+   CUDA IMA。已修复（脚本双块补回，备份 `.bak.nove_*`）。**对照实验前先逐条
+   diff 两边启动 flags**；空续行 `\` 是 flag 被删的物证。
+2. **BF16 权重 199GB**：CP=8+layersplit 形态需 mem-fraction ≥0.93；当前无 CP
+   形态 0.85 正常（AGENTS §5.1.1 规范值）
+3. **CP×LoRA 崩溃已根修**（commit `c1946917cb`，2026-08-19）：csgmv batch_info
+   与 CP shard 行数错配 → OOB。恢复 CP 部署前确认双端代码 ≥ 该 commit
+4. **LoRA 触发语义**：只认请求体 `lora_path` 字段（按 adapter 名匹配）；
+   `model:xxx:L0` colon 语法不生效；`model` 字段引擎不校验
+5. **LoRA 懒加载**：`--lora-paths` 只注册，首个请求才加载。判断真用了 LoRA：
+   `grep -E "Start load Lora|loaded weights" /root/{prefill,decode}.log`；
+   `curl :30200/metrics | grep lora_pool_slots_used`（decode 常驻 ≥1）
+6. **LoRA 缓存隔离**：radix cache 的 extra_key 拼 lora_id，跨 adapter/base 不
+   命中（正确性要求）；同 prompt 多 adapter 各存独立 KV，显存按份数涨
+7. **PD 重启成套**：只重启 prefill → decode mooncake 会话过期
+   （`KVTransferError: Aborted by AbortReq`）；router 熔断器记死旧 prefill →
+   503。顺序：杀干净 → prefill+decode 同时 → router
+8. **router/smg control plane**（commit `c1663ec790`）：`GET
+   /v1/control/models`（key `sk-control-pd-2026`）返回引擎已注册 LoRA（动态切
+   lora 数据源）；POST 传 URL/路径部署（swap 槽位只数 lora 不算 base）；
+   `v1/completions` 端点在 smg PD 模式卡死（既有 bug，用 chat/completions）
+9. **启动缺函数/import 错误**（已修，commit `c561d36e45`，历史保留）
+10. **prefill collective 死锁**（V4 Pro 遗留）：`538ee9d0d1` 基线，不要改 prefill collective 代码
+11. **router 转发卡死**：health 200 但请求 503/超时 → kill + 重启 router
+12. **EAGLE draft graph**：冷启动捕获 ~9 分钟（热缓存 ~18s），draft model = BF16 自带 MTP
+13. **不用 scp**、**rsync 逐条**、**清 __pycache__**、**py-spy 并发抓**（同 V4 Pro）
 
 ## 关键代码位置
 
@@ -96,11 +114,14 @@ decode KV 是 prefill 的 1.6 倍，因为 prefill 权重 + CP layer-split 开�
 | 部署脚本 | `/root/start_glm52_bf16_pd.sh` |
 | EAGLE draft graph | `speculative/eagle_worker_v2.py` |
 | prefill CP layer-split | `mem_cache/cp_layersplit_pool.py`、`layers/utils/cp_utils.py` |
-| DCP | `disaggregation/decode.py`（`--dcp-size 8`） |
+| DCP | `disaggregation/decode.py`（`--dcp-size 4`） |
 | LoRA 虚拟专家 | `lora/backend/base_backend.py`、`lora/lora_manager.py` |
+| LoRA csgmv CP shard 修复 | `lora/backend/chunked_backend.py`（`_cp_shard_batch_info_or_none`） |
+| smg control plane | `sgl-model-gateway/src/control_plane/{deploy.rs,mod.rs}` |
 
 ## 当前部署版本
 
-- HEAD：`c561d36e45`（GLM-5.2 BF16 + LoRA 启动修复）
+- 代码 = 本地 git HEAD（2026-08-19 起）：含 `c1946917cb`（CP×LoRA 根修）、
+  `0eccdf831c`（LoRA sync-load）、`c1663ec790`（smg control plane）
 - prefill.py：`538ee9d0d1` 基线（不要动 collective）
-- 部署脚本 `start_glm52_bf16_pd.sh` 已同步两端（md5 一致）
+- 部署脚本 `start_glm52_bf16_pd.sh` 已同步两端（md5 一致），双块均带 VE flag

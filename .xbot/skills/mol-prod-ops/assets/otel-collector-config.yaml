@@ -1,0 +1,117 @@
+receivers:
+  # ============================================================
+  # Prometheus receiver: scrape sglang PD metrics endpoints
+  # ============================================================
+  prometheus:
+    config:
+      scrape_configs:
+        # Prefill node (B300-1)
+        - job_name: sglang-prefill
+          scrape_interval: 15s
+          scrape_timeout: 10s
+          metrics_path: /metrics
+          static_configs:
+            - targets:
+                - 10.0.0.66:30100
+              labels:
+                service: sglang
+                role: prefill
+                node: b300-1
+                model: glm52-fp8-official
+
+        # Decode node (B300-2)
+        - job_name: sglang-decode
+          scrape_interval: 15s
+          scrape_timeout: 10s
+          metrics_path: /metrics
+          static_configs:
+            - targets:
+                - 10.0.0.67:30200
+              labels:
+                service: sglang
+                role: decode
+                node: b300-2
+                model: glm52-fp8-official
+
+        # PD Router (B300-1)
+        - job_name: sglang-router
+          scrape_interval: 15s
+          scrape_timeout: 10s
+          metrics_path: /metrics
+          static_configs:
+            - targets:
+                - 10.0.0.66:29001
+              labels:
+                service: sglang-router
+                role: router
+                node: b300-1
+                model: glm52-fp8-official
+
+processors:
+  # Add resource attributes for Grafana filtering
+  resource:
+    attributes:
+      - key: deployment.environment
+        value: production
+        action: upsert
+      - key: service.namespace
+        value: b300-pd
+        action: upsert
+      - key: cluster
+        value: b300-pd-cluster
+        action: upsert
+
+  # Drop noisy/help metrics to reduce volume
+  filter:
+    metrics:
+      exclude:
+        match_type: regexp
+        metric_names:
+          - sglang:.*_bucket.*
+          - go_.*
+          - process_.*
+
+  # Batch for efficient export
+  batch:
+    send_batch_size: 1000
+    send_batch_max_size: 2000
+    timeout: 10s
+
+  # Memory limiter to prevent OOM
+  memory_limiter:
+    check_interval: 5s
+    limit_mib: 512
+    spike_limit_mib: 128
+
+exporters:
+  # OTLP gRPC to Macaron OTel gateway (overseas)
+  otlp/macaron:
+    endpoint: otel-i18n.macaron.xin:4317
+    tls:
+      insecure: false
+    headers:
+      x-api-key: d2983f7b1e10f43183e929064f02d2c09c71191e8a2478fe01e628e1487d5b8d
+
+  # Local debug (optional, remove in production)
+  debug:
+    verbosity: basic
+    sampling_initial: 1
+    sampling_thereafter: 100
+
+service:
+  pipelines:
+    metrics:
+      receivers:
+        - prometheus
+      processors:
+        - memory_limiter
+        - resource
+        - filter
+        - batch
+      exporters:
+        - otlp/macaron
+        # - debug  # uncomment for debugging
+
+  telemetry:
+    logs:
+      level: info
