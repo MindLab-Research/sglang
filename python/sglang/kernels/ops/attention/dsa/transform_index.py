@@ -49,6 +49,7 @@ def transform_index_page_table_decode_kernel(
     result_ptr: torch.Tensor,
     page_size: tl.constexpr,
     page_table_row_stride: tl.constexpr,
+    PAGE_TABLE_LEN: tl.constexpr,
 ):
     TOPK: tl.constexpr = 2048
     req_id = tl.program_id(0)
@@ -58,7 +59,12 @@ def transform_index_page_table_decode_kernel(
 
     offset = tl.arange(0, TOPK)  # topk should be 2048
     loaded_topk_indices = tl.load(topk_indices_ptr + offset)
-    mask = loaded_topk_indices >= 0
+    # Upper bound is required: under transfer storms the indexer output can
+    # race ahead of this kernel and contain values >= page_table row width —
+    # the prefill twin kernel masks both ends, the decode one only masked <0,
+    # letting a stale/garbage topk read past the row (CUDA IMA, sticky NCCL
+    # faults). Masked lanes degrade to "no KV selected" (-1) instead of OOB.
+    mask = (loaded_topk_indices >= 0) & (loaded_topk_indices < PAGE_TABLE_LEN)
     loaded_kv_indices = tl.load(page_table_ptr + loaded_topk_indices, mask=mask)
     tl.store(result_ptr + offset, loaded_kv_indices, mask=mask)
     tl.store(result_ptr + offset, -1, mask=~mask)
@@ -148,6 +154,7 @@ def transform_index_page_table_decode_fast(
         result,
         page_size,
         page_table_row_stride=page_table.stride(0),
+        PAGE_TABLE_LEN=page_table.shape[1],
     )
     return result
 
