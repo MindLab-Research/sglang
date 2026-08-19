@@ -3974,6 +3974,21 @@ class MLATokenToKVPool(KVCache):
             _page_64 = loc // _ps
             _owner = (_page_64 % _dws == get_attention_dcp_rank()) & _valid
             loc = torch.where(_owner, _slot, torch.full_like(loc, self.size))
+        else:
+            # Unsharded path (EAGLE draft runs under dcp_disabled). No bound
+            # existed here: garbage slot ids from upstream (pre-alloc allocator
+            # racing / torn req_to_token reads feeding
+            # assign_draft_cache_locs) flowed straight into the paged KV write
+            # — the async-assert probe caught index >= size+page_size
+            # (2026-08-19: 1855360, Xid 31 WRITE faults). Route invalid lanes
+            # to the reserved slot-0 padding row instead of an out-of-pool
+            # write. Note: reassignment (not in-place) so the caller's
+            # out_cache_loc stays untouched for later free-bookkeeping.
+            loc = torch.where(
+                (loc >= 0) & (loc < self.size + self.page_size),
+                loc,
+                torch.zeros_like(loc),
+            )
 
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_mla_kv_buffer (MLA)")
 
@@ -4027,6 +4042,15 @@ class MLATokenToKVPool(KVCache):
         cache_k_rope: torch.Tensor,
         forward_mode=None,
     ):
+        # Final-consumer sanitize (twin of the DSA-pool fix): garbage slot ids
+        # reaching the paged KV write crash with Xid 31 WRITE faults; route
+        # invalid lanes to the reserved slot-0 padding row. Reassignment, not
+        # in-place, so caller bookkeeping tensors are untouched.
+        loc = torch.where(
+            (loc >= 0) & (loc < self.size + self.page_size),
+            loc,
+            torch.zeros_like(loc),
+        )
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_mla_kv_buffer (MLA)")
         layer_id = layer.layer_id
         self._write_mla_kv_buffer(
