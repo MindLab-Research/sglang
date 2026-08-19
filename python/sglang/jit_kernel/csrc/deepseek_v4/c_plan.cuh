@@ -154,6 +154,13 @@ __global__ __launch_bounds__(1024, 1)  //
     warp_max[tx] = 0;
     warp_min[tx] = 0xFFFFFFFFu;
   }
+  // Barrier between the warp-0-driven scratch initialization above and the
+  // per-warp writes below: without it, warp 0 can clobber another warp's
+  // already-written min/max slot, making ragged extend_lens look uniform and
+  // routing the plan down the MTP fast path with out-of-bounds ragged_id
+  // (port of upstream #32467; dormant on the GLM path today but the kernel
+  // is shared with DSV4 deployments).
+  __syncthreads();
 
   // === Stage B: min/max(extend_len) for MTP-uniform detection ===
   // For min, treat threads outside `batch_size` as +inf so they don't pull the min down.

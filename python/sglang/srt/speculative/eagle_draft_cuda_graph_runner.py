@@ -620,12 +620,24 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         # runs it must reflect the padded fake rows (set below), since draft decode
         # backends read seq_lens_sum to size/slice kv_indices.
         raw_seq_lens_sum = forward_batch.seq_lens_sum
+        original_out_cache_loc = forward_batch.out_cache_loc
 
         if bs != raw_bs:
             forward_batch.batch_size = bs
             forward_batch.seq_lens = buffers.seq_lens[:bs]
             forward_batch.req_pool_indices = buffers.req_pool_indices[:bs]
             forward_batch.positions = buffers.positions[:num_tokens]
+            # Replay metadata must see the same padded cache-location layout as
+            # the captured graph, not the raw request batch (port of upstream
+            # #25529): with raw_bs batch entries but padded bs, metadata built
+            # from the raw layout mismatches the graph's static buffers and
+            # surfaces as an async IMA from inside the graph (surfacing at
+            # whatever host sync comes first — observed at
+            # process_batch_result_decode / alloc paths under batch shrink).
+            # Padded lanes are zero-filled above -> reserved cache slot 0.
+            forward_batch.out_cache_loc = buffers.out_cache_loc[
+                : num_tokens * self.speculative_num_steps
+            ]
             if raw_seq_lens_sum is not None:
                 forward_batch.seq_lens_sum = (
                     raw_seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value
@@ -647,39 +659,47 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             forward_batch.seq_lens_cpu = buffers.seq_lens_cpu[:bs]
 
         # forward_batch.batch_size was overwritten to bs above when padding.
-        self.draft_attn_backend.init_forward_metadata_out_graph(forward_batch)
-        self.raw_bs = raw_bs
-        self.bs = bs
+        try:
+            self.draft_attn_backend.init_forward_metadata_out_graph(forward_batch)
+            self.raw_bs = raw_bs
+            self.bs = bs
 
-        # Replay via backend
-        shape_key = self._make_graph_key(bs)
-        timer_ctx = (
-            self.model_runner.device_timer.wrap(metadata={"category": "eagle_draft"})
-            if self.model_runner.device_timer
-            else contextlib.nullcontext()
-        )
-        with timer_ctx:
-            out = self._replay_graph(shape_key, forward_batch)
+            # Replay via backend
+            shape_key = self._make_graph_key(bs)
+            timer_ctx = (
+                self.model_runner.device_timer.wrap(metadata={"category": "eagle_draft"})
+                if self.model_runner.device_timer
+                else contextlib.nullcontext()
+            )
+            with timer_ctx:
+                out = self._replay_graph(shape_key, forward_batch)
+        finally:
+            # Restore the RAW batch view even when metadata init or replay
+            # raises — a padded leftover poisons every later consumer of this
+            # ForwardBatch (port of upstream #25529).
+            if bs != raw_bs:
+                forward_batch.batch_size = raw_bs
+                forward_batch.positions = buffers.positions[:raw_num_token]
+                forward_batch.seq_lens = buffers.seq_lens[:raw_bs]
+                forward_batch.req_pool_indices = buffers.req_pool_indices[:raw_bs]
+                forward_batch.out_cache_loc = original_out_cache_loc
+                if buffers.rids_int is not None and forward_batch.rids_int is not None:
+                    forward_batch.rids_int = buffers.rids_int[:raw_bs]
+                if (
+                    buffers.bootstrap_room_ids_int is not None
+                    and forward_batch.bootstrap_room_ids_int is not None
+                ):
+                    forward_batch.bootstrap_room_ids_int = (
+                        buffers.bootstrap_room_ids_int[:raw_bs]
+                    )
+                if forward_batch.seq_lens_cpu is not None:
+                    forward_batch.seq_lens_cpu = buffers.seq_lens_cpu[:raw_bs]
+                forward_batch.seq_lens_sum = raw_seq_lens_sum
+
         if self.buffers.dsa_seed_topk is not None:
             forward_batch.spec_info.dsa_topk_indices = None
 
         if bs != raw_bs:
             out = self._postprocess_output_to_raw_bs(out, raw_bs)
-            forward_batch.batch_size = raw_bs
-            forward_batch.positions = buffers.positions[:raw_num_token]
-            forward_batch.seq_lens = buffers.seq_lens[:raw_bs]
-            forward_batch.req_pool_indices = buffers.req_pool_indices[:raw_bs]
-            if buffers.rids_int is not None and forward_batch.rids_int is not None:
-                forward_batch.rids_int = buffers.rids_int[:raw_bs]
-            if (
-                buffers.bootstrap_room_ids_int is not None
-                and forward_batch.bootstrap_room_ids_int is not None
-            ):
-                forward_batch.bootstrap_room_ids_int = buffers.bootstrap_room_ids_int[
-                    :raw_bs
-                ]
-            if forward_batch.seq_lens_cpu is not None:
-                forward_batch.seq_lens_cpu = buffers.seq_lens_cpu[:raw_bs]
-            forward_batch.seq_lens_sum = raw_seq_lens_sum
 
         return out
