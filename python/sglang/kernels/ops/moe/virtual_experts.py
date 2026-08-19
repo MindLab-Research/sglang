@@ -22,6 +22,7 @@ def _fused_virtual_topk_ids_kernel(
     M,
     top_k: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    max_loras,
 ):
     """
     Fuses _get_virtual_topk_ids: comparison + clamp + arithmetic into one kernel.
@@ -43,15 +44,22 @@ def _fused_virtual_topk_ids_kernel(
     m = offs // top_k
     # k = offs % top_k  # not needed directly
 
-    lora_id = tl.load(token_lora_mapping_ptr + m, mask=valid, other=0)
+    lora_id_g = tl.load(token_lora_mapping_ptr + m, mask=valid, other=0)
+    lora_id_g = tl.where(lora_id_g >= max_loras, -1, lora_id_g)
+    lora_id = lora_id_g
     mask_val = lora_id >= 0
     safe_lora = tl.maximum(lora_id, 0)
 
     base = tl.load(topk_ids_ptr + offs, mask=valid, other=0)
-    # Preserve negative sentinel topk_ids (e.g. -1 for non-local experts after
-    # EP dispatch). Without this, `-1 + safe_lora * num_experts` would land on
-    # a real virtual-expert slot belonging to another adapter and trigger OOB
-    # loads in downstream LoRA kernels.
+    # GARBAGE-GUARD: clamp base topk ids to the expert range. Padding rows on
+    # padded/cuda-graph batches hold UNINITIALISED values (huge positives AND
+    # negatives); the native moe_align kernel uses ids as atomic offsets, so
+    # any out-of-range value produces a wild pointer (Xid 31 FAULT_PDE).
+    # Everything outside [0, E) maps to the designed -1 sentinel.
+    if num_experts_for_weight > 0:
+        base = tl.where(
+            (base < 0) | (base >= num_experts_for_weight), -1, base
+        )
     shifted = base + safe_lora * num_experts_for_weight
     result = tl.where(base < 0, base, shifted)
     tl.store(virtual_topk_ids_ptr + offs, result, mask=valid)
@@ -90,6 +98,15 @@ def _fused_virtual_topk_ids(
     BLOCK_SIZE = 1024
     grid = ((M * top_k + BLOCK_SIZE - 1) // BLOCK_SIZE,)
 
+    # GARBAGE-GUARD (host): neutralise stale/padding mapping ids before
+    # they can multiply into out-of-range virtual expert ids.
+    if max_loras > 0 and token_lora_mapping.numel() > 0:
+        token_lora_mapping = torch.where(
+            (token_lora_mapping >= 0) & (token_lora_mapping < max_loras),
+            token_lora_mapping,
+            torch.full_like(token_lora_mapping, -1),
+        )
+
     _fused_virtual_topk_ids_kernel[grid](
         input_topk,
         token_lora_mapping,
@@ -99,6 +116,8 @@ def _fused_virtual_topk_ids(
         M,
         top_k,
         BLOCK_SIZE,
+    
+        max_loras,
     )
 
     virtual_num_experts = num_experts_for_weight * max_loras

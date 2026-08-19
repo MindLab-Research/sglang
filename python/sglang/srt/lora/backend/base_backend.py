@@ -33,6 +33,31 @@ def get_gathered_moe_num_tokens(forward_batch: ForwardBatch, num_tokens: int) ->
         return max(forward_batch.global_dp_buffer_len, num_tokens)
     global_num_tokens = getattr(forward_batch, "global_num_tokens_cpu", None)
     if not global_num_tokens or any(t is None for t in global_num_tokens):
+        # [CP-LoRA fix] Under prefill CP (--enable-prefill-cp, non-DP), MoE
+        # layers run on CP-GATHERED tokens but every DP field above is unset
+        # (global_dp_buffer_len None, global_num_tokens_cpu empty), so the old
+        # per-rank fallback under-sized token_lora_mapping and the MoE-LoRA
+        # kernels indexed past it -- sticky CUDA IMA surfacing later in
+        # unrelated kernels (MLA bmm / FMHA / MoE gate GEMM / align kernel).
+        # interleave CP splits each sequence into 2*cp_size balanced blocks,
+        # so per-rank counts differ by at most one split block:
+        # ceil_align(local, cp_align) * cp_size is a safe upper bound of the
+        # gathered length. Over-allocation is harmless: kernels index at most
+        # the actual gathered length; the -1 tail means base for foreign tokens.
+        from sglang.srt.runtime_context import get_parallel
+
+        cp_size = get_parallel().attn_cp_size
+        if cp_size > 1:
+            try:
+                from sglang.srt.layers.utils.cp_utils import (
+                    get_cp_padding_align_size,
+                )
+
+                align = max(get_cp_padding_align_size(), 1)
+            except Exception:
+                align = 1
+            upper = ((num_tokens + align - 1) // align) * align * cp_size
+            return max(upper, num_tokens)
         # EAGLE target-verify capture batches may carry None entries in
         # global_num_tokens_cpu; fall back to the per-rank count rather than
         # crashing in ceil_align/max.
@@ -385,6 +410,15 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
             mapping_len=moe_num_tokens,
         )
 
+        # SANITIZE-MAP: mapping ids beyond loaded-adapter slots are stale graph-pool
+        # garbage; force to base (-1) so they cannot become wild virtual expert ids.
+        try:
+            _nslots = int(lora_ranks.numel()) if lora_ranks is not None else 0
+        except Exception:
+            _nslots = 0
+        if _nslots > 0 and token_lora_mapping is not None and token_lora_mapping.numel() > 0:
+            token_lora_mapping.masked_fill_(token_lora_mapping >= _nslots, -1)
+
         # Tier-1 (colocate RL, exactly one adapter loaded): the DP-gathered tail
         # [num_tokens, moe_num_tokens) covers OTHER dp ranks' tokens, which under colocate RL all
         # use that single adapter. The per-rank fill above only wrote [0, num_tokens), leaving the
@@ -451,6 +485,8 @@ def _compute_moe_lora_info_kernel(
     token_lora_mapping_ptr,
     num_segments,
     max_len,
+    mapping_len,
+    num_lora_slots,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -460,11 +496,19 @@ def _compute_moe_lora_info_kernel(
     pid_m = pid % num_pid_m
     seg_start = tl.load(seg_indptr_ptr + pid_seg)
     seg_end = tl.load(seg_indptr_ptr + pid_seg + 1)
+    seg_start = tl.maximum(tl.minimum(seg_start, mapping_len), 0)
+    seg_end = tl.maximum(tl.minimum(seg_end, mapping_len), 0)
     seg_len = seg_end - seg_start
 
     offs = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     valid = offs < seg_len
     lora_id = tl.load(weight_indices_ptr + pid_seg)
+    if (lora_id < 0) or (lora_id >= num_lora_slots):
+        # Base segments carry weight_indices = -1; indexing lora_ranks /
+        # adapter_enabled with -1 OOB-writes 4 bytes before the adapter_enabled
+        # buffer and corrupts adjacent GPU memory (sticky CUDA IMA surfacing in
+        # the next kernel launch — MoE gate GEMM / fused MoE triton load).
+        return
     lora_rank = tl.load(lora_ranks_ptr + lora_id)
     tl.store(
         adapter_enabled_ptr + lora_id,
