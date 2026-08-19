@@ -46,6 +46,14 @@ from sglang.srt.layers.dcp.kernels import fused_localize_lens_cumsum, expand_len
 import os as _os
 import time as _time
 _dcp_debug_flag = _os.environ.get("SGLANG_DCP_DEBUG", "").lower() in ("1", "true", "yes")
+# Diagnosis counter for out-of-range DSA KV slots at the trtllm consumer (see
+# the SANITIZE-SLOTS clamp in _forward_trtllm). Off by default: it pays a GPU
+# sync per forward when enabled.
+_DSA_SLOT_OOB_DIAG = _os.environ.get("SGLANG_DSA_SLOT_OOB_DIAG", "").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 def _dcp_log(msg, *args, **kwargs):
     if _dcp_debug_flag:
         logger.warning(msg, *args, **kwargs)
@@ -432,6 +440,17 @@ class DeepseekSparseAttnBackend(
         super().__init__()
         self.forward_metadata: DSAMetadata
         self.device = model_runner.device
+        # DSA-SLOT-OOB diag counter (env SGLANG_DSA_SLOT_OOB_DIAG=1):
+        # incremented IN-GRAPH at the trtllm consumer (see SANITIZE-SLOTS in
+        # _forward_trtllm), read+reset throttled from the eager
+        # _apply_cuda_graph_metadata path. Persistent so graph replays
+        # accumulate into the same buffer.
+        self._oob_counter = (
+            torch.zeros(1, dtype=torch.int64, device=model_runner.device)
+            if _DSA_SLOT_OOB_DIAG
+            else None
+        )
+        self._oob_last_read = _time.time()
         assert isinstance(model_runner.page_size, int)
         self.real_page_size = model_runner.page_size
         self.num_splits = (
@@ -1589,6 +1608,22 @@ class DeepseekSparseAttnBackend(
         also call this directly via _apply_cuda_graph_metadata when they
         need to pass out_cache_loc / actual_forward_mode explicitly.
         """
+        # Eager side of the DSA-SLOT-OOB diag (runs every step, outside the
+        # graph): throttled read+reset of the counter the graph replays
+        # increment. .item() syncs, so it must live HERE, never in-graph.
+        if _DSA_SLOT_OOB_DIAG and self._oob_counter is not None:
+            now = _time.time()
+            if now - self._oob_last_read > 30.0:
+                self._oob_last_read = now
+                n = int(self._oob_counter.item())
+                if n:
+                    logger.warning(
+                        "DSA-SLOT-OOB window_slots=%d — upstream (indexer topk "
+                        "lanes / transfer metadata) leaked out-of-range KV "
+                        "slots; clamp kept trtllm in-bounds",
+                        n,
+                    )
+                self._oob_counter.zero_()
         if bs not in self.decode_cuda_graph_metadata:
             self._build_forward_metadata_cuda_graph(
                 bs,
@@ -1847,7 +1882,11 @@ class DeepseekSparseAttnBackend(
                     self.dsa_index_topk,
                 )
             )
-            if not torch.cuda.is_current_stream_capturing():
+            if _dcp_debug_flag and not torch.cuda.is_current_stream_capturing():
+                # Full-stream-drain probe (nonzero) — env-gated since it pays a
+                # complete stream sync per step AND, when a transfer op on this
+                # stream is stuck, the sync NEVER returns, hanging the whole
+                # event loop (8-rank watchdog kill, 2026-08-19 incident).
                 _rpt = metadata.real_page_table
                 _rpt_valid = _rpt[_rpt >= 0]
                 _dcp_log(
@@ -3208,6 +3247,35 @@ class DeepseekSparseAttnBackend(
 
         q = q_all.view(batch_size, 1, num_heads, head_dim)
         kv = kv_cache.view(-1, 1, self.real_page_size, self.kv_cache_dim)
+        # SANITIZE-SLOTS: every producer of page_table_1 feeds token-level KV
+        # slot ids that trtllm dereferences as kv[slot // page_size] with NO
+        # bounds check. Two sources can carry out-of-range values: (a) the
+        # DCP direct-pass paths (page_table_1 = topk_indices) and the fused
+        # topk path hand over raw indexer output, which under KV-transfer
+        # storms races ahead of metadata and contains garbage slots; (b)
+        # _pad_topk_indices pads rows with -1, which the non-DCP
+        # transform_index path masks (>=0) but the direct paths do not.
+        # Either way trtllm reads kv[-1 or huge] -> OOB -> sticky IMA takes
+        # down the whole TP group. Clamp in-place to the real token capacity:
+        # valid slots are unchanged (they live in [0, capacity)); invalid
+        # lanes redirect to slot 0 (in-bounds, contributes at most one
+        # unrelated token) instead of crashing. CUDA-graph safe: the clamp is
+        # captured as a graph node and re-executed on replay over the fresh
+        # buffer contents.
+        page_table_1.clamp_(min=0, max=kv.shape[0] * self.real_page_size - 1)
+        if _DSA_SLOT_OOB_DIAG and self._oob_counter is not None:
+            # In-graph accumulation: this whole block is captured (allocations
+            # during capture land in the graph pool), so it re-executes on
+            # every replay and increments the persistent counter. The eager
+            # reader lives in _apply_cuda_graph_metadata (runs every step,
+            # outside the graph) — .item() sync is graph-illegal here.
+            try:
+                _cap = kv.shape[0] * self.real_page_size
+                self._oob_counter.add_(
+                    ((page_table_1 < 0) | (page_table_1 >= _cap)).sum()
+                )
+            except Exception:
+                pass
         block_tables = page_table_1.unsqueeze(1)
         seq_lens = metadata.cache_seqlens_int32 if seq_lens is None else seq_lens
 
