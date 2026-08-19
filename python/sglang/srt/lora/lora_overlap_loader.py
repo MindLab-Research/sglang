@@ -86,10 +86,16 @@ class LoRAOverlapLoader:
         if not self.lora_manager.validate_lora_batch(new_lora_set):
             return False
 
-        with self.load_stream_context:
-            self.lora_manager.fetch_new_loras({lora_id}, loras_to_be_loaded)
-            event = self.device_module.Event()
-            event.record(self.load_stream)
+        # SYNC-LOAD FIX: run the load on the CURRENT stream instead of a
+        # private load_stream. The async load_stream raced the compute stream
+        # on memory-pool buffers (written on load_stream, read by forward on
+        # the compute stream, with no reverse dependency), corrupting weights/
+        # workspaces consumed by the first forward after a load (sticky
+        # CUBLAS_STATUS_EXECUTION_FAILED in the MLA bmm / IMA in FMHA/MoE).
+        # Loading is once-per-adapter; the lost overlap is negligible.
+        self.lora_manager.fetch_new_loras({lora_id}, loras_to_be_loaded)
+        event = self.device_module.Event()
+        event.record()
 
         self.lora_to_overlap_load_event[lora_id] = event
         return True
