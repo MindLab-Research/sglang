@@ -2486,6 +2486,7 @@ class DeepseekSparseAttnBackend(
                 page_table=metadata.page_table_1,
                 topk_indices=topk_indices,
                 page_size=1,
+                kv_pool_capacity=self.token_to_kv_pool.size,
             )
 
         if self.dsa_decode_impl == "flashmla_sparse":
@@ -3232,6 +3233,11 @@ class DeepseekSparseAttnBackend(
                     page_table=metadata.page_table_1,
                     topk_indices=topk_indices,
                     page_size=1,
+                    # Real pool capacity: torn req_to_token reads can put
+                    # garbage slot ids in the page-table content itself; the
+                    # kernel clamps loaded values so trtllm never addresses
+                    # out-of-pool memory (see kernel comment).
+                    kv_pool_capacity=self.token_to_kv_pool.size,
                 )
 
         q_scale = 1.0

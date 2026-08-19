@@ -50,6 +50,7 @@ def transform_index_page_table_decode_kernel(
     page_size: tl.constexpr,
     page_table_row_stride: tl.constexpr,
     PAGE_TABLE_LEN: tl.constexpr,
+    KV_POOL_CAP: tl.constexpr,
 ):
     TOPK: tl.constexpr = 2048
     req_id = tl.program_id(0)
@@ -66,6 +67,15 @@ def transform_index_page_table_decode_kernel(
     # faults). Masked lanes degrade to "no KV selected" (-1) instead of OOB.
     mask = (loaded_topk_indices >= 0) & (loaded_topk_indices < PAGE_TABLE_LEN)
     loaded_kv_indices = tl.load(page_table_ptr + loaded_topk_indices, mask=mask)
+    # The page-table CONTENT itself can carry out-of-range slot ids: replay
+    # metadata rebuilds rows from req_to_token, which verify/draft-extend
+    # mutate concurrently — a torn read hands this kernel garbage slots that
+    # trtllm would then dereference (kv[slot // page_size]). Clamp loaded
+    # values to the real pool capacity so every emitted slot id is in-pool
+    # (over-range lanes collapse to slot 0, the reserved padding row). This
+    # is the load-side twin of the SANITIZE-SLOTS clamp at the trtllm call
+    # site; both together keep trtllm addressing valid memory.
+    loaded_kv_indices = tl.minimum(tl.maximum(loaded_kv_indices, 0), KV_POOL_CAP - 1)
     tl.store(result_ptr + offset, loaded_kv_indices, mask=mask)
     tl.store(result_ptr + offset, -1, mask=~mask)
 
@@ -83,6 +93,7 @@ def transform_index_page_table_prefill_kernel(
     result_stride_0: tl.constexpr,
     result_stride_1: tl.constexpr,
     PAGE_TABLE_IS_EXPANDED: tl.constexpr,
+    PAGE_TABLE_LEN: tl.constexpr,
     TOPK: tl.constexpr,
     BLOCK_Q: tl.constexpr,
     BLOCK_TOPK: tl.constexpr,
@@ -103,7 +114,16 @@ def transform_index_page_table_prefill_kernel(
         mask=mask,
         other=-1,
     )
-    valid_topk_mask = mask & (loaded_topk_indices >= 0)
+    # Upper bound required (same as the decode twin): under KV-transfer
+    # storms the indexer output can race ahead of metadata and contain
+    # values >= page_table row width; only masking >= 0 lets those lanes
+    # read past the row (CUDA IMA, sticky faults surface at the next sync
+    # point — observed at alloc_for_decode_prealloc on the decode nodes).
+    valid_topk_mask = (
+        mask
+        & (loaded_topk_indices >= 0)
+        & (loaded_topk_indices < PAGE_TABLE_LEN)
+    )
 
     if PAGE_TABLE_IS_EXPANDED:
         page_table_rows = token_indices
@@ -130,12 +150,16 @@ def transform_index_page_table_decode_fast(
     topk_indices: torch.Tensor,
     result: Optional[torch.Tensor] = None,
     page_size: int = 1,
+    kv_pool_capacity: Optional[int] = None,
 ) -> torch.Tensor:
     """
     Transform the page table according to topk indices for sparse topk attention.
     Args:
         page_table: [qo_len, max_seqlen_k], the original page table
         topk_indices: [qo_len, topk], the topk indices for each query position
+        kv_pool_capacity: real KV pool size (slots); loaded slot ids are
+            clamped into [0, capacity) so torn req_to_token reads cannot hand
+            trtllm an out-of-pool slot. None disables the clamp (tests).
     Returns:
         transformed_page_table: [qo_len, topk], the transformed page table
         For out-of-bound indices in topk_indices, this should be filled with -1.
@@ -146,6 +170,8 @@ def transform_index_page_table_decode_fast(
     qo_len = topk_indices.shape[0]
     if result is None:
         result = torch.empty_like(topk_indices, dtype=torch.int32)
+    if kv_pool_capacity is None:
+        kv_pool_capacity = 2**31 - 1
     # Launch triton kernel
     grid = (qo_len,)
     transform_index_page_table_decode_kernel[grid](
@@ -155,6 +181,7 @@ def transform_index_page_table_decode_fast(
         page_size,
         page_table_row_stride=page_table.stride(0),
         PAGE_TABLE_LEN=page_table.shape[1],
+        KV_POOL_CAP=kv_pool_capacity,
     )
     return result
 
@@ -201,6 +228,7 @@ def transform_index_page_table_prefill_fast(
         result.stride(0),
         result.stride(1),
         PAGE_TABLE_IS_EXPANDED=page_table_is_expanded,
+        PAGE_TABLE_LEN=page_table.shape[1],
         TOPK=topk_indices.shape[1],
         BLOCK_Q=block_q,
         BLOCK_TOPK=block_topk,
