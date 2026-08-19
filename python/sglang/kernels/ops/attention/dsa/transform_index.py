@@ -70,12 +70,13 @@ def transform_index_page_table_decode_kernel(
     # The page-table CONTENT itself can carry out-of-range slot ids: replay
     # metadata rebuilds rows from req_to_token, which verify/draft-extend
     # mutate concurrently — a torn read hands this kernel garbage slots that
-    # trtllm would then dereference (kv[slot // page_size]). Clamp loaded
-    # values to the real pool capacity so every emitted slot id is in-pool
-    # (over-range lanes collapse to slot 0, the reserved padding row). This
-    # is the load-side twin of the SANITIZE-SLOTS clamp at the trtllm call
-    # site; both together keep trtllm addressing valid memory.
-    loaded_kv_indices = tl.minimum(tl.maximum(loaded_kv_indices, 0), KV_POOL_CAP - 1)
+    # trtllm would then dereference (kv[slot // page_size]). Emit -1 (the
+    # kernel's established invalid encoding; trtllm contributes nothing for
+    # those lanes) for garbage CONTENT — NOT a clamp to cap-1, which would
+    # silently read some OTHER request's real KV (wrong attention output).
+    # Load-side twin of the SANITIZE-SLOTS clamp at the trtllm call site.
+    _valid_val = (loaded_kv_indices >= 0) & (loaded_kv_indices < KV_POOL_CAP)
+    loaded_kv_indices = tl.where(_valid_val, loaded_kv_indices, -1)
     tl.store(result_ptr + offset, loaded_kv_indices, mask=mask)
     tl.store(result_ptr + offset, -1, mask=~mask)
 

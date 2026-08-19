@@ -3981,13 +3981,15 @@ class MLATokenToKVPool(KVCache):
             # assign_draft_cache_locs) flowed straight into the paged KV write
             # — the async-assert probe caught index >= size+page_size
             # (2026-08-19: 1855360, Xid 31 WRITE faults). Route invalid lanes
-            # to the reserved slot-0 padding row instead of an out-of-pool
-            # write. Note: reassignment (not in-place) so the caller's
+            # to the SCRATCH page at self.size (the same padding target the
+            # DCP branch above uses) — never slot 0, which can be a real
+            # allocatable slot in this fork; clobbering it would corrupt a
+            # live request. Reassignment (not in-place) so the caller's
             # out_cache_loc stays untouched for later free-bookkeeping.
             loc = torch.where(
-                (loc >= 0) & (loc < self.size + self.page_size),
+                (loc >= 0) & (loc < self.size),
                 loc,
-                torch.zeros_like(loc),
+                torch.full_like(loc, self.size),
             )
 
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_mla_kv_buffer (MLA)")
@@ -4044,12 +4046,13 @@ class MLATokenToKVPool(KVCache):
     ):
         # Final-consumer sanitize (twin of the DSA-pool fix): garbage slot ids
         # reaching the paged KV write crash with Xid 31 WRITE faults; route
-        # invalid lanes to the reserved slot-0 padding row. Reassignment, not
+        # invalid lanes to the scratch page at self.size (established padding
+        # target — slot 0 may be a real allocatable slot). Reassignment, not
         # in-place, so caller bookkeeping tensors are untouched.
         loc = torch.where(
-            (loc >= 0) & (loc < self.size + self.page_size),
+            (loc >= 0) & (loc < self.size),
             loc,
-            torch.zeros_like(loc),
+            torch.full_like(loc, self.size),
         )
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_mla_kv_buffer (MLA)")
         layer_id = layer.layer_id

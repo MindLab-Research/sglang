@@ -2114,6 +2114,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         req.kv_committed_len = fill_len
 
         if prefix_len > 0:
+            prefix_indices = _guard_kv_indices(
+                prefix_indices,
+                self.token_to_kv_pool_allocator.size,
+                "pre_alloc.prefix_indices",
+            )
             self.req_to_token_pool.write(
                 (req.req_pool_idx, slice(0, prefix_len)), prefix_indices
             )
@@ -2197,6 +2202,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             f"req={req.rid}"
         )
 
+        kv_loc = _guard_kv_indices(
+            kv_loc, self.token_to_kv_pool_allocator.size, "pre_alloc.kv_loc"
+        )
         self.req_to_token_pool.write(
             (
                 req.req_pool_idx,
@@ -2262,7 +2270,32 @@ def alloc_for_decode_prealloc_hisparse(
             last_loc=last_loc,
             extend_num_tokens=fill_len,
         )
-    return kv_loc
+    return _guard_kv_indices(kv_loc, allocator.size, "prealloc_hisparse.kv_loc")
+
+
+def _guard_kv_indices(
+    t: Optional[torch.Tensor], cap: int, ctx: str
+) -> Optional[torch.Tensor]:
+    """Producer-boundary guard (2026-08-19 crash family): validate slot-id
+    tensors BEFORE they enter req_to_token / downstream consumers. On
+    detection, log actual garbage samples (the value pattern identifies the
+    producer: uninit -1 / 4e9-scale / cap+n each point elsewhere) and
+    contain in-range so corruption cannot propagate. Called once per request
+    on the prealloc path (NOT per decode step), so the sync is acceptable.
+    """
+    if t is None or t.numel() == 0:
+        return t
+    bad = (t < 0) | (t >= cap)
+    if bool(bad.any()):
+        n = int(bad.sum())
+        samples = t[bad][:8].tolist()
+        logger.error(
+            "[KV-PRODUCER-OOB] %s: %d/%d bad slots, samples=%s, cap=%d "
+            "— producer emitted garbage; containing in-range",
+            ctx, n, t.numel(), samples, cap,
+        )
+        t = torch.where(bad, torch.zeros_like(t), t)
+    return t
 
 
 def alloc_for_decode_prealloc(
@@ -2316,7 +2349,7 @@ def alloc_for_decode_prealloc(
                 last_loc=last_loc,
                 extend_num_tokens=delta_len,
             )
-    return kv_loc
+    return _guard_kv_indices(kv_loc, allocator.size, "prealloc.kv_loc")
 
 
 class DecodeTransferQueue(DecodeHiCacheTransferMixin):
