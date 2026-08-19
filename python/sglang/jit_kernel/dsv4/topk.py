@@ -50,6 +50,9 @@ def topk_transform_512(
     page_size: int,
     out_raw_indices: Optional[torch.Tensor] = None,
 ) -> None:
+    # Enforce the same non-negative-lengths contract as the v2 entry (the
+    # kernels read lengths as uint32; a negative padded row poisons the run).
+    seq_lens.clamp_(min=0)
     if is_hip_runtime():
         torch.ops.sgl_kernel.deepseek_v4_topk_transform_512(
             scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
@@ -80,10 +83,14 @@ def plan_topk_v2(
     Producers of padded rows must clamp their lengths to 0 (0 selects the
     trivial all-(-1) output path, which is safe).
 
-    If ``out`` is provided, the kernel writes directly into it (in-place),
-    avoiding a per-step GPU allocation + copy in the decode path.
+    This entry now ENFORCES the contract: lengths are clamped to >= 0
+    in-place before the device call, so a racing/misbehaving producer can no
+    longer poison the plan (2026-08-19 transfer-storm incidents: stale
+    metadata leaked negative lengths and the resulting ~4e9 read crashed
+    decode TP groups).
     """
     module = _jit_topk_v2_module()
+    seq_lens.clamp_(min=0)
     bs = seq_lens.shape[0]
     if out is None:
         metadata = seq_lens.new_empty(bs + 1, _PLAN_METADATA_INTS_PER_BATCH)
@@ -112,8 +119,13 @@ def topk_transform_512_v2(
     (GLM 5.2 MTP DP-idle companion rows hit exactly this). A length of 0 is
     the valid way to express "no tokens": the row takes the trivial path and
     the output is all -1.
+
+    This entry now ENFORCES the non-negativity contract in-place (see
+    plan_topk_v2) so racing producers of padded rows cannot reach the device
+    kernel with poisoned lengths.
     """
     module = _jit_topk_v2_module()
+    seq_lens.clamp_(min=0)
     module.topk_transform(
         scores,
         seq_lens,

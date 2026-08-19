@@ -6,6 +6,37 @@ from typing import List, Optional
 
 import torch
 
+# Spec-stage bisection probes (see _stage_sync_probe): off by default.
+import os as _os
+
+_STAGE_SYNC = _os.environ.get("SGLANG_DSA_STAGE_SYNC", "").lower() in ("1", "true", "yes")
+
+# Isolation kill-switch: disable ONLY the EAGLE draft cuda graph (draft() then
+# runs eager draft_forward; target decode/verify graphs are untouched so
+# throughput stays representative). Used to bisect the async-fault family
+# between draft-graph-replay and everything else.
+_EAGLE_NO_DRAFT_GRAPH = _os.environ.get("SGLANG_EAGLE_DISABLE_DRAFT_GRAPH", "").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+
+def _stage_sync_probe(stage: str):
+    """Bisection probe (SGLANG_DSA_STAGE_SYNC=1): synchronize at spec-stage
+    boundaries. When an async fault is pending from an earlier kernel, the
+    FIRST sync that raises localizes the producing stage — the label rides
+    the traceback. Off by default (each sync costs a bubble). Module-level
+    so both EagleWorker and EagleDraftWorker can call it.
+
+    MUST stay a no-op while a CUDA graph is being captured: synchronize()
+    during capture is illegal (cudaErrorStreamCaptureInvalidated) and kills
+    the server at startup — draft_forward/verify run inside capture. During
+    replay (the fault window) capturing is False and the sync is live.
+    """
+    if _STAGE_SYNC and not torch.cuda.is_current_stream_capturing():
+        torch.cuda.synchronize()
+
 from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
@@ -399,7 +430,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # Capture draft
         decode_backend = self.server_args.cuda_graph_config.decode.backend
         capture_bs, _ = get_batch_sizes_to_capture(self.draft_runner)
-        if self.speculative_num_steps > 1:
+        if self.speculative_num_steps > 1 and not _EAGLE_NO_DRAFT_GRAPH:
             tic = time.perf_counter()
             before_mem = get_available_gpu_memory(self.device, self.gpu_id)
             log_info_on_rank0(
@@ -471,6 +502,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         supports_cuda_draft_extend_graph = (
             _is_cuda or _is_musa
         ) and graph_supported_backend
+        # Isolation kill-switch (see _EAGLE_NO_DRAFT_GRAPH): disabling ALL
+        # EAGLE-side graphs (draft decode + draft extend + spec verify) for
+        # the async-fault family bisection — target decode/verify graphs stay.
+        if _EAGLE_NO_DRAFT_GRAPH:
+            supports_cuda_draft_extend_graph = False
         # Capture extend
         # TODO: support draft extend cuda graph for more attention backends
         if (
@@ -674,6 +710,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 canary_index_ctx,
             ):
                 logits_output = self.draft_runner.forward(forward_batch).logits_output
+            _stage_sync_probe(f"draft_step_{i}")
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
             maybe_detect_inf(logits_output.next_token_logits, f"draft_forward step {i}")
             if self.server_args.speculative_use_rejection_sampling:
@@ -1235,9 +1272,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     spec_stage_span("draft"),
                 ):
                     verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
+            _stage_sync_probe("after_draft")
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
             batch_output = self.verify(batch)
+            _stage_sync_probe("after_verify")
             # Publish before draft_extend so the fence is at verify-end.
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
@@ -1256,6 +1295,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     spec_stage_span("draft_extend"),
                 ):
                     self.draft_worker._draft_extend_for_decode(batch, batch_output)
+            _stage_sync_probe("after_draft_extend")
 
             return batch_output
 
