@@ -169,7 +169,16 @@ def build_replay_fb_view(
         ),
         num_padding=bs - raw_bs,
         encoder_lens=buffers.encoder_lens[:bs] if is_encoder_decoder else None,
-        out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
+        # Replay metadata must see the same PADDED cache-location layout the
+        # captured graph was built with (port of upstream #25529 to the
+        # verify/target runner). Passing the raw forward_batch.out_cache_loc
+        # while batch_size/seq_lens/req_pool_indices are padded makes DSA's
+        # target-verify metadata build a padded-bs view over a raw-layout
+        # buffer -> invalid KV slots inside the captured graph -> async IMA
+        # (WRITE fault) surfacing at the next host sync. The registry
+        # zero-fills the padding tail, so padded lanes address reserved
+        # slot 0.
+        out_cache_loc=buffers.out_cache_loc[:num_tokens],
         out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
         # The mamba-track registry slot (VIRTUAL ids) is the v2p translate SOURCE
         # for the backend, which copies the result into its own static buffer and
