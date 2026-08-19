@@ -3268,6 +3268,27 @@ class DeepseekSparseAttnBackend(
         # unrelated token) instead of crashing. CUDA-graph safe: the clamp is
         # captured as a graph node and re-executed on replay over the fresh
         # buffer contents.
+        # READ-side domain repair (companion to the write-side repair in
+        # prepare_for_draft): req_to_token rows can hold GLOBAL DCP virtual
+        # slot ids (2026-08-20 fingerprint: sequential ids just above the
+        # local pool, e.g. 1855232/2166202 — they encode the token's REAL
+        # rank-interleaved slot). The write path repairs locs; this page
+        # table is built from the SAME cells and must apply the SAME
+        # inverse the target KV-write uses, or the -1/clamp below erases
+        # those lanes and draft attention reads nothing (accept 3.0->1.0
+        # cliff). Values already local (< capacity) pass through unchanged.
+        try:
+            _dws_r = get_attention_dcp_world_size()
+        except Exception:
+            _dws_r = 1
+        if _dws_r > 1:
+            _cap_r = kv.shape[0] * self.real_page_size
+            page_table_1 = torch.where(
+                page_table_1 >= _cap_r,
+                (page_table_1 // (self.real_page_size * _dws_r)) * self.real_page_size
+                + (page_table_1 % self.real_page_size),
+                page_table_1,
+            )
         page_table_1.clamp_(min=0, max=kv.shape[0] * self.real_page_size - 1)
         if _DSA_SLOT_OOB_DIAG and self._oob_counter is not None:
             # In-graph accumulation: this whole block is captured (allocations
