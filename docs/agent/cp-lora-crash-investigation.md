@@ -80,19 +80,50 @@ LoRA 请求路径的某处（prepare_lora_batch / hook 构建）在 CP gather �
 2. **CP gathered 尺寸**（`base_backend.get_gathered_moe_num_tokens` v2）：CP 下 MoE 跑 gathered token 集（=Σ各 rank），但 `global_num_tokens_cpu` 只存本 rank 值 → mapping 分配 8、kernel 索引 48 → OOB。实测 DIAG：nt=6 moe_nt=8（错）→ 修复后 64 ✓
 3. **mapping/seg/lora_id 消毒**（`_compute_moe_lora_info_kernel` + SANITIZE-MAP）：SEG-CLAMP 钳 seg 到 [0, mapping_len]，lora_id 上界，host 端 masked_fill_
 
-### 服务器级残余（未解）
+### 服务器级残余（CP×VE 路径，另案未解，已出圈）
+
+> ⚠️ 定性修正（2026-08-19 下午）：本节残余是**单机 CP×VE 路径**的问题，与 PD 集群崩溃（已解，见下节）**不是同一根因**。用户决策 BF16 不开 CP，本残余出圈挂起。
 
 全部消毒生效后（eager、干净 M=6、尺寸正确、权重 checksum 不变），仍崩：**layer-0 gate GEMM 报 `cudaErrorIllegalAddress`（CP0 rank、VE impl 之前、Xid 先于 Python 异常 16s）**。已排除：graph 池垃圾（全部钳制）、尺寸、加载污染（canary+probe 24 次干净）、`.cu` align kernel（独立测干净+naive 绕过仍崩）、torch 分配器冲突（LoRA 池=torch.zeros）、cublas workspace。**指向 CP attention 路径与 LoRA 权重加载的更深层交互**（CP0 是 layersplit broadcast owner）。
 
 ### 铁的对照事实
 
-- **无 CP + LoRA：全链正常**（两次验证含正确输出）——唯一可服务 LoRA 的形态
+- **无 CP + LoRA（VE 路径）：全链正常**（单机 + PD 集群双验证）——可服务 LoRA 的形态
 - CP + base：正常（生产一直跑）
-- CP + LoRA：崩（上述残余）
+- CP + LoRA（单机 VE 路径）：崩（上述残余，另案）
+- PD prefill（无 VE flag，classic 路径）：崩——**即上一晚所有 PD 崩溃的真因，见下节**
+
+---
+
+## 2026-08-19 下午结案：PD 集群 LoRA 崩溃 = 启动脚本 flag 缺失
+
+### 根因
+
+`1021:/root/start_glm52_bf16_pd.sh` 的 **prefill 块缺 `--lora-use-virtual-experts`**（line 46 只到 `--max-loras-per-batch 2`，留有空续行 `\` 残迹——曾有后被删）。无 flag 时 `_add_lora_down_delta` 走 **classic `fused_moe_lora` kernel 路径**（`fused_moe_lora_kernel.py`，`expert_id` 无 clamp 直接索引权重，无任何加固）→ 首个 LoRA 请求 CUDA IMA。
+
+**为什么排查了 20 小时**：所有单机对照测试脚本（`start_singlecp_*.sh`）都带 VE flag 走**加固过的 VE 路径**，全部通过——对照实验从设计上就无效。"单机过、PD 崩"的表象诱导我们排除了 CP/layersplit/HiCache/cuda-graph/VE 垃圾/双挂载等所有真凶之外的方向。崩溃 batch 的 nt=4/nt=23 形态与单机通过的测试完全相同，路径差异才是唯一变量。
+
+### 修复与验证
+
+- 修复 = 脚本补回 `--lora-use-virtual-experts --max-lora-chunk-size 128`（sed 一处，prefill/decode 两块生效；备份 `.bak.nove_*`）。仓库 `start_pd.sh`/`recover_b300_pd.sh` 本来就正确。
+- 按 runbook 双端 + smg router 一起重启（只重启 prefill 会导致 decode mooncake 会话过期 → `KVTransferError: Aborted by AbortReq`；router 熔断器记死旧 prefill → 503）。
+- 验收：11/11 请求通过（base/L0/L2 混合轮 8/8），prefill/decode 均 0 Scheduler hit，temp=0 下 L0 输出与 base 逐字不同（LoRA 真实生效）。
+
+### 附带发现
+
+- **colon 语法不生效**：`model: "glm52-bf16-pd:L0"` 被原样当作 model 名处理，输出与 base 相同；LoRA 正确入口是请求体 `lora_path: "L0"` 字段（MoL harness 侧注意）。
+- `lora_overlap_loader.py` SYNC-LOAD 修复（load_stream 竞态 → 权重损坏 → sticky CUBLAS 失败）已随本结案 commit。
+
+### 教训（方法论）
+
+1. **对照实验前先 diff 两边启动 flags 逐条对比**——"同代码"假设在本案是假的，一个 flag 切换了整条 kernel 路径。
+2. 空续行 `\` 残迹是 flag 被删的物证；脚本编辑后 `grep -n` 关键 flag 应成为重启 checklist 项。
+3. PD 重启必须双端+router 成套（AGENTS §5.3 铁律的又一实例：health 200 ≠ 可服务）。
 
 ### 1021 遗留补丁状态（远端 venv，均有 .bak）
 
 - ve.py `ff62a067`→`de2922a9`(+DIAG-W)：双界钳制 ✓（已 commit 本地）
 - base_backend `62296778`：CP-fix v2 + SEG-CLAMP + SANITIZE-MAP + DIAG-PREP（已 commit 本地）
+- lora_overlap_loader：SYNC-LOAD 修复 + CANARY 探针（远端版）；**干净版已 commit 本地**
 - lora_moe_runners `a2e2aa01`：ALIGN-NATIVE-NAIVE（.cu align 绕过，env `SGLANG_LORA_ALIGN_CUDA=1` 可回开）——未 commit（未证明必要）
 - mem_pool/lora_manager：残留 PHASE-LOG 打印（无害，一次性）
