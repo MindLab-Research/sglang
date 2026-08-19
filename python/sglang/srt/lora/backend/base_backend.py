@@ -580,6 +580,8 @@ def _compute_moe_lora_info(
             token_lora_mapping,
             weight_indices.numel(),
             max_len,
+            mapping_len,
+            adapter_enabled.numel(),
             BLOCK_SIZE=block_size,
         )
         return adapter_enabled, token_lora_mapping

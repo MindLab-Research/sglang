@@ -1,4 +1,5 @@
 import dataclasses
+import logging
 from typing import List, Optional, Tuple
 
 import torch
@@ -17,6 +18,8 @@ from sglang.srt.lora.utils import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
+
+logger = logging.getLogger(__name__)
 
 MIN_CHUNK_SIZE = 16
 
@@ -41,6 +44,13 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
     ):
         super().__init__(max_loras_per_batch, device)
         self.max_chunk_size = server_args.max_lora_chunk_size
+        # CP-shard context: (forward_batch, req_weight_indices, chunk_size) of the
+        # latest prepare_lora_batch, plus a cache for the rebuilt shard batch info.
+        self._cp_prepare_ctx: Optional[Tuple[ForwardBatch, List[int], int]] = None
+        self._cp_shard_cache_key: Optional[int] = None
+        self._cp_shard_batch_info: Optional[LoRABatchInfo] = None
+        self._cp_shard_covered: int = -1
+        self._cp_full_covered: int = -1
 
     def run_lora_a_embedding(
         self,
@@ -57,7 +67,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         return chunked_embedding_lora_a_forward(
             input_ids=input_ids,
             weights=weights,
-            batch_info=self.batch_info,
+            batch_info=self._resolve_batch_info(None, input_ids.shape[0]),
             vocab_size=vocab_size,
         )
 
@@ -70,9 +80,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         *args,
         **kwargs,
     ) -> torch.Tensor:
-        batch_info = (
-            pruned_batch_info if pruned_batch_info is not None else self.batch_info
-        )
+        batch_info = self._resolve_batch_info(pruned_batch_info, x.shape[0])
         return chunked_sgmv_lora_shrink_forward(
             x=x,
             weights=weights,
@@ -93,9 +101,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         # For simple lora B, we use slice offsets [0, output_dim]
         output_dim = weights.shape[-2]
         max_slice_size = output_dim
-        batch_info = (
-            pruned_batch_info if pruned_batch_info is not None else self.batch_info
-        )
+        batch_info = self._resolve_batch_info(pruned_batch_info, x.shape[0])
         return chunked_sgmv_lora_expand_forward(
             x=x,
             weights=weights,
@@ -123,16 +129,17 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         # qkv_lora_b: (num_lora, total_output_dim, r)
         assert isinstance(qkv_lora_b, torch.Tensor)
 
+        batch_info = self._resolve_batch_info(None, x.shape[0])
         lora_a_output = chunked_sgmv_lora_shrink_forward(
             x=x,
             weights=qkv_lora_a,
-            batch_info=self.batch_info,
+            batch_info=batch_info,
             num_slices=n_slices,
         )
         lora_output = chunked_sgmv_lora_expand_forward(
             x=lora_a_output,
             weights=qkv_lora_b,
-            batch_info=self.batch_info,
+            batch_info=batch_info,
             slice_offsets=output_offset,
             max_slice_size=max_qkv_out_dim,
             base_output=base_output,
@@ -156,17 +163,18 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         assert isinstance(gate_up_lora_b, torch.Tensor)
         output_dim = gate_up_lora_b.shape[-2] // 2
 
+        batch_info = self._resolve_batch_info(None, x.shape[0])
         # lora_a_output: (s, 2 * r)
         lora_a_output = chunked_sgmv_lora_shrink_forward(
             x=x,
             weights=gate_up_lora_a,
-            batch_info=self.batch_info,
+            batch_info=batch_info,
             num_slices=2,
         )
         lora_output = chunked_sgmv_lora_expand_forward(
             x=lora_a_output,
             weights=gate_up_lora_b,
-            batch_info=self.batch_info,
+            batch_info=batch_info,
             slice_offsets=output_offset,
             max_slice_size=output_dim,
             base_output=base_output,
@@ -205,6 +213,187 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         else:  # num_tokens < 64
             chunk_size = 16
         return min(self.max_chunk_size, chunk_size)
+
+    # ------------------------------------------------------------------
+    # Prefill-CP support for dense-layer csgmv calls.
+    #
+    # ``prepare_lora_batch`` runs BEFORE the model forward builds
+    # ``forward_batch.attn_cp_metadata``, so its segments/permutation cover the
+    # full (pre-split) local tokens. Under prefill-CP the dense MLP layers run
+    # on THIS rank's zigzag shard of the batch, whose row count is ~1/cp of the
+    # pre-split count — the csgmv kernels index ``x`` via ``permutation``, so
+    # any perm value >= x rows is an OOB read/write (CUDA IMA on the first
+    # LoRA forward). By the time the layers call run_*_lora the metadata is
+    # ready, so we rebuild a shard-aligned batch info lazily here.
+    # ------------------------------------------------------------------
+
+    def _cp_shard_row_request_ids(
+        self, forward_batch: ForwardBatch
+    ) -> Optional[Tuple[List[int], int]]:
+        """Per-request attribution of THIS rank's CP-shard rows (prefill-CP).
+
+        Mirrors the model's CP token split — ``dsa_cp_round_robin_split_data``
+        (round-robin: rank owns positions p % cp_size == cp_rank, ascending)
+        and ``cp_split_and_rebuild_data`` (in-seq zigzag: rank owns block r
+        plus the mirror block of every sequence, in [all-prev, all-mirror]
+        order). Returns ``(row_req_ids, total_rows)`` or None when CP is not
+        active for this batch. Never reads ``attn_cp_metadata`` for the
+        round-robin layout: that mode attaches an EMPTY metadata object, so
+        keying on it silently disables the shard view (the original bug).
+        """
+        import bisect
+
+        from sglang.srt.runtime_context import get_parallel, get_server_args
+
+        parallel = get_parallel()
+        cp_size = getattr(parallel, "attn_cp_size", None) or 1
+        cp_rank = getattr(parallel, "attn_cp_rank", None)
+        if cp_size <= 1 or cp_rank is None:
+            return None
+        if not forward_batch.forward_mode.is_context_parallel_extend():
+            return None
+        server_args = get_server_args()
+        if not getattr(server_args, "enable_prefill_cp", False):
+            return None
+
+        extend = forward_batch.extend_seq_lens_cpu
+        if extend is None or len(extend) == 0:
+            return None
+        extend_list = [int(x) for x in extend]
+        bs = len(extend_list)
+        input_ids = getattr(forward_batch, "input_ids", None)
+        rows = (
+            int(input_ids.shape[0]) if input_ids is not None else sum(extend_list)
+        )
+
+        dsa_cp = getattr(server_args, "enable_dsa_prefill_context_parallel", False)
+        mode = getattr(server_args, "dsa_prefill_cp_mode", None) or getattr(
+            server_args, "prefill_cp_mode", ""
+        )
+
+        row_req: Optional[List[int]] = None
+        if dsa_cp and mode == "round-robin-split":
+            cum = [0]
+            for L in extend_list:
+                cum.append(cum[-1] + L)
+            real = cum[-1]
+            row_req = []
+            for p in range(cp_rank, rows, cp_size):
+                if p >= real:
+                    # Padding tail: attribute to the last request; its rows are
+                    # discarded together with the padding.
+                    row_req.append(bs - 1)
+                else:
+                    row_req.append(bisect.bisect_right(cum, p) - 1)
+        else:
+            metadata = getattr(forward_batch, "attn_cp_metadata", None)
+            split_list = getattr(metadata, "split_list", None)
+            zigzag = getattr(metadata, "zigzag_index", None)
+            if not split_list or not zigzag:
+                return None
+            seg_n = max(len(split_list) // max(bs, 1), 1)
+            row_req = []
+            for j in zigzag:
+                row_req.extend([j // seg_n] * split_list[j])
+
+        if not row_req:
+            return None
+        return row_req, len(row_req)
+
+    def _cp_shard_batch_info_or_none(self) -> Optional[LoRABatchInfo]:
+        if self._cp_prepare_ctx is None:
+            return None
+        forward_batch, req_weight_indices, chunk_size = self._cp_prepare_ctx
+
+        cache_key = id(forward_batch)
+        if self._cp_shard_cache_key == cache_key:
+            return self._cp_shard_batch_info
+
+        layout = self._cp_shard_row_request_ids(forward_batch)
+        if layout is None:
+            return None
+        row_req, total = layout
+        if total > sum(int(x) for x in (forward_batch.extend_seq_lens_cpu or [0])):
+            # Guard against stale metadata: shard rows can never exceed the
+            # pre-split token count.
+            return None
+
+        # Mirror _get_permutation: stable sort by adapter id so tokens group
+        # by adapter, then chunk each group (mirror _get_segments_info).
+        row_wi = [req_weight_indices[s] for s in row_req]
+        order = sorted(range(total), key=lambda i: row_wi[i])
+        weights_reordered = [row_wi[i] for i in order]
+
+        seg_wi: List[int] = []
+        seg_lens: List[int] = []
+        i = 0
+        while i < total:
+            w = weights_reordered[i]
+            j = i
+            while j < total and weights_reordered[j] == w:
+                j += 1
+            group_len = j - i
+            num_segs = (group_len + chunk_size - 1) // chunk_size
+            seg_wi.extend([w] * num_segs)
+            seg_lens.extend([chunk_size] * (num_segs - 1))
+            seg_lens.append(group_len - (num_segs - 1) * chunk_size)
+            i = j
+
+        num_segments = len(seg_wi)
+        seg_indptr_cpu = torch.zeros(
+            (num_segments + 1,), dtype=torch.int32, pin_memory=True
+        )
+        seg_indptr_cpu[1:] = torch.cumsum(
+            torch.tensor(seg_lens, dtype=torch.int32), dim=0
+        )
+        permutation_cpu = torch.tensor(order, dtype=torch.int32, pin_memory=True)
+
+        shard = dataclasses.replace(
+            self.batch_info,
+            num_segments=num_segments,
+            max_len=chunk_size,
+            seg_indptr=seg_indptr_cpu.to(self.device, non_blocking=True),
+            weight_indices=torch.tensor(
+                seg_wi, dtype=torch.int32, pin_memory=True
+            ).to(self.device, non_blocking=True),
+            permutation=permutation_cpu.to(self.device, non_blocking=True),
+        )
+        self._cp_shard_cache_key = cache_key
+        self._cp_shard_batch_info = shard
+        self._cp_shard_covered = total
+        return shard
+
+    def _resolve_batch_info(
+        self, pruned: Optional[LoRABatchInfo], x_rows: int
+    ) -> LoRABatchInfo:
+        """Pick the batch info whose covered rows match the actual rows of x.
+
+        Priority: explicit ``pruned`` (lm_head) > CP shard view (dense / attn
+        layers under prefill-CP run on this rank's token shard) > full
+        pre-split view. The kernels index ``x`` via ``permutation``, so any
+        covered count != x_rows is an OOB access; on a residual mismatch clamp
+        the shard permutation (loud log) instead of going OOB.
+        """
+        if pruned is not None:
+            return pruned
+        if self._cp_prepare_ctx is not None:
+            shard = self._cp_shard_batch_info_or_none()
+            if shard is not None and self._cp_shard_covered == x_rows:
+                return shard
+            if self._cp_full_covered == x_rows:
+                return self.batch_info
+            if shard is not None:
+                logger.warning(
+                    "CP LoRA batch shape mismatch: shard=%d full=%d x_rows=%d "
+                    "(clamping shard permutation to stay in-bounds)",
+                    self._cp_shard_covered,
+                    self._cp_full_covered,
+                    x_rows,
+                )
+                perm = torch.clamp(shard.permutation, max=max(x_rows - 1, 0))
+                return dataclasses.replace(shard, permutation=perm)
+        return self.batch_info
+
 
     @staticmethod
     def _build_req_seg_indptr(forward_batch: ForwardBatch) -> torch.Tensor:
@@ -340,6 +529,16 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         batch_info = self._add_moe_lora_info(forward_batch, batch_info)
 
         self.batch_info = batch_info
+        # CP-shard context for dense/attn-layer csgmv calls (see
+        # _cp_shard_batch_info_or_none): stash what the shard rebuild needs —
+        # the forward_batch (CP state is read from parallel runtime + CPU seq
+        # lens, never from late-attached metadata), the per-request adapter
+        # ids, the chunk size, and the full-view covered row count.
+        self._cp_prepare_ctx = (forward_batch, list(weight_indices), chunk_size)
+        self._cp_shard_cache_key = None
+        self._cp_shard_batch_info = None
+        self._cp_shard_covered = -1
+        self._cp_full_covered = int(len(permutation))
         self.lm_head_batch_info, self.lm_head_pass_batch_infos = (
             self._prepare_lm_head_batch_info(forward_batch, weight_indices, batch_info)
         )
