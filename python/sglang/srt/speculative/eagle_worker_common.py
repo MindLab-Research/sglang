@@ -2,10 +2,22 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Optional
 
+import logging
+import os as _os
+
 import torch
 
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_draft_cache_locs_contiguous,
+)
+
+# Probe gate for the draft-loc source validation (see prepare_for_draft):
+# reuses the stage-sync probe env so the currently-instrumented deployment
+# logs garbage samples while production (env unset) pays only the clamp.
+_DRAFT_LOC_PROBE = _os.environ.get("SGLANG_DSA_STAGE_SYNC", "").lower() in (
+    "1",
+    "true",
+    "yes",
 )
 from sglang.kernels.ops.speculative.eagle import fill_bonus_tokens_func
 from sglang.srt.layers.logprob_processor import compute_spec_v2_logprobs
@@ -289,6 +301,37 @@ def prepare_for_draft(
                 topk,
                 page_size,
             )
+
+        # ---- Source validation (2026-08-19 crash/accept-cliff family) ----
+        # batch.out_cache_loc is the SINGLE source every consumer reads
+        # (draft KV write, draft attention page-table build, and the free of
+        # unaccepted tree slots). Under drain-phase churn a torn kv_start /
+        # stale req_to_token read produces ids beyond the draft pool; before
+        # this fix they crashed the paged KV write (Xid 31, TP-group death)
+        # and, with the write-side sanitize in place, still poisoned the
+        # allocator via free() — permanently killing EAGLE (accept 3.0 → 1.0
+        # cliff on fresh requests). Clamp HERE so garbage never enters system
+        # state through any downstream path. Collapsed lanes duplicate an
+        # in-pool slot: worst case one draft branch candidate is wrong and
+        # verify rejects it (speculation lost for that branch, output safe).
+        _pool = draft_model_runner.token_to_kv_pool
+        _cap = int(_pool.size) + int(getattr(_pool, "page_size", 1) or 1)
+        if _DRAFT_LOC_PROBE:
+            # Env-gated diagnostics (piggybacks SGLANG_DSA_STAGE_SYNC): sync
+            # + sample log only while probing; zero cost in production.
+            _bad = (batch.out_cache_loc < 0) | (batch.out_cache_loc >= _cap)
+            if bool(_bad.any()):
+                _n = int(_bad.sum())
+                _samples = batch.out_cache_loc[_bad][:8].tolist()
+                logging.getLogger(__name__).error(
+                    "[DRAFT-LOC-OOB] %d/%d bad draft locs, samples=%s, cap=%d "
+                    "— contained at source",
+                    _n,
+                    batch.out_cache_loc.numel(),
+                    _samples,
+                    _cap,
+                )
+        batch.out_cache_loc = batch.out_cache_loc.clamp_(min=0, max=_cap - 1)
 
     # Get a forward batch
     # Actual width of the next draft-decode forward: topk tokens per req.
