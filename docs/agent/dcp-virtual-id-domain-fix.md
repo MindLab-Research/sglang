@@ -106,3 +106,65 @@ PagedTokenToKVPoolAllocator(
 - rsync 后必须 `find ... \( -name '__pycache__' -o -name '*.pyc' \) | xargs rm -rf`（AGENTS 铁律）
 - 重启脚本：`/root/start_1p2d_lora.sh`（1100/1103 各一份，已备份到本地 `deploy/restore/`）
 - 验证链：health 200×2 → router 重启 → warmup → stress80_mix 20min → nodecheck → drain 后 fresh 请求
+
+---
+
+## 6. 终局：draft pool 尺寸丢失才是总根因（commit `371a991947`，2026-08-20 晚）
+
+> 本章是最终结论。第 2-3 章的"虚拟 id 全程保留"修复（9db63a6abb）在 **target 侧**正确且必要，
+> 但当时没发现 draft pool 本身的尺寸已经错了——所以 accept 仍停留在 1.4-2.2。
+
+### 6.1 完整因果链
+
+1. **v0.5.16 merge（`31d5960589`）把 draft pool 构造改走 `KVCacheConfigurator.configure() → _derive_pool_sizes()`**，
+   而 `draft_pool_token_multiplier`（draft pool = size×dcp）留死在 `_apply_memory_pool_config`
+   （draft worker 不再经过 `init_memory_pool`，永远到不了那行代码）。
+2. **draft pool 从 7.4M（全虚拟空间）缩到 1.85M（target 本地尺寸）**。而 req_to_token 存虚拟 id
+   （可达 7.4M）——draft 的写/读/free 全部用虚拟 id 直接索引 draft pool → 越界。
+3. 越界之后的全部"修复"（set_mla_kv_buffer scratch sanitize、prepare_for_draft 虚拟→本地压缩、
+   读路径 repair）都是对错误尺寸的补偿：own-rank 虚拟 id 压缩成本地 id（碰撞），**foreign-rank
+   虚拟 id（3/4 的 draft 槽位）全部挤进一个 scratch 页互相覆盖** → draft attention 读到垃圾 KV
+   → draft 输出近乎随机 → **accept rate 0.07（len 1.38）**。
+4. **pre-merge 为什么正常**：merge 前 draft 走 `init_memory_pool → _apply_memory_pool_config`
+   （multiplier 生效）→ draft pool = 7.4M，`prepare_for_draft` 无任何转换、`_write_mla_kv_buffer`
+   无 else-sanitize——虚拟 id 全程直通 draft pool。merge 后两条 wiring 都变了，两个补偿 bug 叠加。
+
+### 6.2 修复三件套（`371a991947`）
+
+| 文件 | 修改 | 原理 |
+|---|---|---|
+| `mem_cache/kv_cache_configurator.py` `_derive_pool_sizes` | draft worker（EAGLE/STANDALONE + dcp>1）时 `max_total_num_tokens ×= dcp_size`（hybrid 同步扩 full/swa） | **恢复全量 draft pool**。内存本就预留：target 的 cell_size 已按 `(1 + draft_layers/num_layers × dcp)` 缩放（pool_configurator L147-173） |
+| `speculative/eagle_worker_common.py` | `prepare_for_draft` / `prepare_for_draft_extend`：**移除全部虚拟→本地转换**，只保留垃圾 clamp（≥ draft pool size → scratch 页） | 虚拟 id 是全量 draft pool 的**合法直接索引**（draft 不分片）。压缩转换 = id 空间折叠 = 槽位碰撞 |
+| `speculative/spec_utils.py` `move_accept_tokens` | `accept_out_cache_loc` 与 `tgt_cache_loc` **双侧同公式转换**（target pool 域：own→local、foreign→scratch） | src 现在是原始虚拟 id（prepare_for_draft 不再预转换），单侧转换会导致 src 以虚拟 id 直接索引 target 池 → OOB 读 |
+
+**读路径无需改动**：`_repair_global_kv_slots_`（mtp_precompute）与 dsa_backend 的读修复都以
+各自 backend 的 `token_to_kv_pool.size` 为界——draft pool 恢复 7.4M 后，合法虚拟 id `< size`
+全部直通（修复自动变 no-op）；target pool 仍是 1.85M，target 侧转换照常正确。
+`_localize_index_k_cache_locs` 是 ContextVar-gated（draft=dcp_disabled 直接 return，原始虚拟 id
+直通 draft index_k 缓存 7.4M；target=dcp_enabled 转换）——与 pool 尺寸配套后自然正确。
+
+### 6.3 验证（1102/1104 测试环境，DCP=4，EAGLE topk=1 steps=5）
+
+| 指标 | merge 后（坏） | 本修复后 |
+|---|---|---|
+| draft pool | 1,857,088 / 1.22 GB | **7,421,696 / 4.89 GB**（=size×4） |
+| accept len | 1.38-1.60 | **2.23-3.17 稳定** |
+| accept rate | 0.07-0.10 | **0.24-0.43** |
+| 10min 8并发压测 | 崩溃/退化 | **428/428 成功，0 崩溃，0 OOB** |
+| LoRA L2 8000-token | — | 200、adapter 激活、输出干净无循环 |
+
+### 6.4 认知修正：accept ~5.9 是病态不是健康
+
+- **accept 单请求 ~5.9 ≈ 每个 draft token 全接受 = 极大概率是死循环/复读**（draft 沿着退化
+  轨道走，target 全盘接受）。历史"健康单请求 5.9"的判据是错的。
+- **健康基准修正：accept len 2.2-3.2 / rate 0.24-0.43**（8 并发实测），与"64 并发 ~3.2"
+  的历史数据吻合。**>5 即应怀疑死循环**，配合重复行检测确认。
+- （`docs/agent/dsv4-radix-nondet-postmortem.md` 的 FORCE_MISS 结论——kernel 级非确定——
+  与此独立：那是输出分布分叉，这是 accept 统计。）
+
+### 6.5 判据更新（grep 用）
+
+- `grep "KV Cache is allocated" decode.log`：draft 行 `#tokens` 必须 = target 行 × dcp_size
+  （DCP=4：7,421,696 vs 1,855,424）。**draft 行 #tokens == target 行 = multiplier 又丢了**（merge/重构回归的签名）
+- `grep -c 'DRAFT-LOC-OOB\|DSA-SLOT-OOB' decode.log` → 0；>0 = 有 id 越界（查 pool 尺寸）
+- accept len 健康带 2.2-3.2；<1.5 = draft 域错；>5 = 疑似死循环（查输出重复）
