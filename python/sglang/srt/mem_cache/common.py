@@ -99,6 +99,19 @@ def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
     if getattr(req, "skip_radix_cache_insert", False):
         return
 
+    # [RADIX-EXTRAKEY-DIAG] 插入时的 extra_key（对比 match 侧是否一致）
+    # 无条件打印（包括 None）——确认存和查的 extra_key 是否一致
+    if getattr(maybe_cache_unfinished_req, "_diag_logged", 0) < 30:
+        maybe_cache_unfinished_req._diag_logged = (
+            getattr(maybe_cache_unfinished_req, "_diag_logged", 0) + 1
+        )
+        logger.info(
+            f"[RADIX-EXTRAKEY-DIAG] INSERT extra_key={req.extra_key!r} "
+            f"rid={getattr(req, 'rid', '?')} lora_id={getattr(req, 'lora_id', '?')} "
+            f"lora_path={getattr(req, 'lora_path', '?')} "
+            f"tokens_len={len(req.origin_input_ids) + len(req.output_ids)}"
+        )
+
     tree_cache.cache_unfinished_req(req, **kwargs)
 
 

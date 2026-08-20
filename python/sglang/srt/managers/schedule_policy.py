@@ -100,6 +100,19 @@ def match_prefix_for_req(
     if token_ids is None:
         token_ids = req.origin_input_ids + req.output_ids
 
+    # [RADIX-EXTRAKEY-DIAG] 查询时的 extra_key（对比 insert 侧是否一致）
+    # 无条件打印（包括 None）——确认 LoRA 请求的 extra_key 是否正确传递
+    if getattr(match_prefix_for_req, "_diag_logged", 0) < 30:
+        match_prefix_for_req._diag_logged = (
+            getattr(match_prefix_for_req, "_diag_logged", 0) + 1
+        )
+        logger.info(
+            f"[RADIX-EXTRAKEY-DIAG] MATCH extra_key={req.extra_key!r} "
+            f"rid={getattr(req, 'rid', '?')} lora_id={getattr(req, 'lora_id', '?')} "
+            f"lora_path={getattr(req, 'lora_path', '?')} "
+            f"tokens_len={len(token_ids)}"
+        )
+
     # unified_kv SWA lives in a per-request ring that's not content-stable and is
     # never stored in the radix tree, so a reused prefix carries stale SWA. Cap
     # the match by the trailing sliding window so it gets re-prefilled, rewriting
