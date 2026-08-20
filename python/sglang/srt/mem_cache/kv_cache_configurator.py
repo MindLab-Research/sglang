@@ -256,9 +256,43 @@ class KVCacheConfigurator:
         max_running_requests = config.max_running_requests
         full_max_total_num_tokens = None
         swa_max_total_num_tokens = None
+
+        # (2026-08-20 root fix) EAGLE/STANDALONE draft pool must cover the
+        # target allocator's FULL virtual id space. The draft runs UNSHARDED
+        # (@dcp_disabled) and is direct-indexed by the target's virtual slot
+        # ids stored in req_to_token, so it needs one physical row per virtual
+        # slot (size * dcp_size). Pre-v0.5.16 this multiplier lived in
+        # _apply_memory_pool_config; the merge moved draft pool construction
+        # onto this path and silently dropped it, shrinking the draft pool to
+        # the target's LOCAL size — every virtual id >= size then had to be
+        # sanitized/converted downstream (scratch-page pileups, id-space
+        # compression), corrupting the draft KV domain and cratering the
+        # EAGLE accept rate (0.07). The memory is already budgeted: the
+        # target's cell_size was scaled by (1 + draft_layers/num_layers *
+        # dcp_size) in pool_configurator when resolving max_total_num_tokens.
+        draft_pool_token_multiplier = 1
+        if (
+            self.is_draft_worker
+            and (
+                self.spec_algorithm.is_eagle()
+                or self.spec_algorithm.is_standalone()
+            )
+            and self.server_args.dcp_size > 1
+        ):
+            draft_pool_token_multiplier = self.server_args.dcp_size
+            max_total_num_tokens = (
+                max_total_num_tokens * draft_pool_token_multiplier
+            )
         if self.is_hybrid_swa:
             full_max_total_num_tokens = config.full_max_total_num_tokens
             swa_max_total_num_tokens = config.swa_max_total_num_tokens
+            if draft_pool_token_multiplier > 1:
+                full_max_total_num_tokens = (
+                    full_max_total_num_tokens * draft_pool_token_multiplier
+                )
+                swa_max_total_num_tokens = (
+                    swa_max_total_num_tokens * draft_pool_token_multiplier
+                )
 
         # DSV4 compressed-attention pool sizes. Draft worker reuses target's
         # full/swa sizes but does NOT own c4/c128/state pools (those live on

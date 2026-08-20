@@ -193,37 +193,20 @@ def prepare_for_draft_extend(
         if draft_model_runner.spec_algorithm.is_standalone()
         else CaptureHiddenMode.FULL
     )
-    # (2026-08-20) Same virtual->local mapping as prepare_for_draft: draft
-    # extend's out_cache_loc carries DCP virtual ids that direct-index
-    # consumers (fused_store_index_k_cache) fault on (Xid 31,
-    # after_draft_extend crash). Use REAL dcp config (server_args bypasses
-    # the @dcp_disabled() ContextVar that hid the 3c68f20891 attempt).
+    # (2026-08-20 ROOT FIX, same as prepare_for_draft) The draft pool is
+    # UNSHARDED at size*dcp — virtual ids in out_cache_loc are VALID direct
+    # indices. Keep them RAW; only torn-read garbage (>= pool capacity)
+    # routes to the scratch page. Never compress virtual->local here (that
+    # collided foreign-rank slots onto one scratch page -> accept cliff).
     _pe = draft_model_runner.token_to_kv_pool
     _le = batch.out_cache_loc
     if _le is not None and _le.numel() > 0:
-        _sze = int(_pe.size)
-        _pge = int(getattr(_pe, "page_size", 1) or 1)
-        try:
-            _sae = getattr(draft_model_runner, "server_args", None)
-            _dwse = int(getattr(_sae, "dcp_size", 1) or 1)
-            _tpe = int(getattr(draft_model_runner, "tp_rank", 0) or 0)
-            _dre = (_tpe % _dwse) if _dwse > 1 else 0
-        except Exception:
-            _dwse = 1
-            _dre = 0
-        if _dwse > 1:
-            _vire = _le >= _sze
-            _owne = ((_le // _pge) % _dwse) == _dre
-            _repe = (_le // (_pge * _dwse)) * _pge + (_le % _pge)
-            batch.out_cache_loc = torch.where(
-                _vire & _owne,
-                _repe,
-                torch.where(
-                    _vire & ~_owne,
-                    torch.full_like(_le, _sze),
-                    _le,
-                ),
-            ).clamp_(min=0)
+        _cape = int(_pe.size)  # size*dcp: full virtual space is in-pool
+        batch.out_cache_loc = torch.where(
+            (_le >= 0) & (_le < _cape),
+            _le,
+            torch.full_like(_le, _cape),
+        )
 
     batch.forward_mode = (
         ForwardMode.IDLE
@@ -346,66 +329,47 @@ def prepare_for_draft(
                 page_size,
             )
 
-        # ---- Source validation + domain repair (2026-08-19/20 family) ----
+        # ---- Source validation (2026-08-19/20 crash family) ----
         # batch.out_cache_loc is the SINGLE source every consumer reads
         # (draft KV write, draft attention page-table build, index_k store,
         # free of unaccepted tree slots). req_to_token rows carry FULL DCP
         # VIRTUAL ids (round-robin virtual space, allocator page_size=64*dcp).
-        # Direct-index consumers (fused_store_index_k_cache, draft KV write
-        # else-branch) fault Xid 31 when the virtual id >= local pool size —
-        # and the watermark crosses that bound under normal load (DRAFT-LOC-OOB
-        # 10k+ per session), so this is NOT intermittent-by-luck.
-        # (2026-08-20 fix) 3c68f20891 tried to convert here but was silently
-        # disabled: prepare_for_draft runs under @dcp_disabled(), so
-        # get_attention_dcp_world_size() returns 1. Use the REAL dcp config
-        # (server_args, ContextVar-independent) and map only own-rank virtual
-        # pages to local; foreign-rank pages route to the scratch page.
+        #
+        # (2026-08-20 ROOT FIX) The draft pool is UNSHARDED and sized
+        # size*dcp (one physical row per target virtual slot — restored in
+        # kv_cache_configurator._derive_pool_sizes after the v0.5.16 wiring
+        # regression shrank it to the target's local size). Virtual ids are
+        # therefore VALID DIRECT indices into the draft pool: keep them RAW.
+        # Do NOT compress virtual->local here: the draft pool is not sharded,
+        # and the id-space compression routes 3/4 of draft slots (foreign
+        # ranks) onto one scratch page — the accept-rate-0.07 root cause.
+        # Only torn-read GARBAGE (>= pool capacity, from drain-race stale
+        # req_to_token reads — the original Xid 31 family) routes to the
+        # scratch page, preserving the source clamp of 0e5f7704e1.
         _pool = draft_model_runner.token_to_kv_pool
-        _size = int(_pool.size)
-        _page = int(getattr(_pool, "page_size", 1) or 1)
-        _cap = _size + _page
+        _cap = int(_pool.size)  # size*dcp: full virtual space is in-pool
         _loc = batch.out_cache_loc
-        try:
-            _sa = getattr(draft_model_runner, "server_args", None)
-            _dws = int(getattr(_sa, "dcp_size", 1) or 1)
-            _tp = int(getattr(draft_model_runner, "tp_rank", 0) or 0)
-            _drank = (_tp % _dws) if _dws > 1 else 0
-        except Exception:
-            _dws = 1
-            _drank = 0
         if _DRAFT_LOC_PROBE:
             _bad = (_loc < 0) | (_loc >= _cap)
             if bool(_bad.any()):
                 _n = int(_bad.sum())
                 _samples = _loc[_bad][:8].tolist()
                 logging.getLogger(__name__).error(
-                    "[DRAFT-LOC-OOB] %d/%d draft locs above local pool, "
-                    "samples=%s, local_cap=%d — mapping virtual->local "
-                    "(dws=%d, rank=%d)",
+                    "[DRAFT-LOC-OOB] %d/%d draft locs above draft pool, "
+                    "samples=%s, draft_pool_cap=%d",
                     _n,
                     _loc.numel(),
                     _samples,
                     _cap,
-                    _dws,
-                    _drank,
                 )
-        if _dws > 1:
-            _virtual = _loc >= _size
-            _own = ((_loc // _page) % _dws) == _drank
-            _repaired = (_loc // (_page * _dws)) * _page + (_loc % _page)
-            # own virtual page -> local physical; foreign rank -> scratch;
-            # in-pool ids pass through unchanged.
-            _loc = torch.where(
-                _virtual & _own,
-                _repaired,
-                torch.where(
-                    _virtual & ~_own,
-                    torch.full_like(_loc, _size),
-                    _loc,
-                ),
-            )
-        # Negative-lane only clamp; local ids are already < cap.
-        batch.out_cache_loc = _loc.clamp_(min=0)
+        # Garbage (negative / above capacity) -> scratch page at _cap
+        # ([size, size+page) is the pool's padded scratch page); valid
+        # virtual ids pass through UNCHANGED.
+        batch.out_cache_loc = torch.where(
+            (_loc >= 0) & (_loc < _cap),
+            _loc,
+            torch.full_like(_loc, _cap),
+        )
 
     # Get a forward batch
     # Actual width of the next draft-decode forward: topk tokens per req.

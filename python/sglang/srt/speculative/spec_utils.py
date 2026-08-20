@@ -657,9 +657,12 @@ def move_accept_tokens_to_target_kvcache(
     # (2026-08-20) tgt_cache_loc comes from the row (assign_extend_cache_locs)
     # and carries DCP VIRTUAL ids; move_kv_cache indexes the physical pool
     # directly, so >= local-pool ids misplace/miswrite -> verify KV wrong ->
-    # EAGLE accept cliff. Map own-rank virtual pages to local (same formula as
-    # prepare_for_draft); accept_out_cache_loc derives from batch.out_cache_loc
-    # which prepare_for_draft already localized.
+    # EAGLE accept cliff. Map own-rank virtual pages to local (same formula
+    # as the target KV-write path). accept_out_cache_loc derives from
+    # batch.out_cache_loc which prepare_for_draft now keeps in the RAW
+    # VIRTUAL domain (2026-08-20 root fix: draft pool is unsharded at
+    # size*dcp), so it must be localized with the SAME mapping here —
+    # otherwise src/dst live in different domains and the move reads OOB.
     try:
         from sglang.srt.server_args import get_server_args
         from sglang.srt.runtime_context import get_parallel
@@ -674,15 +677,19 @@ def move_accept_tokens_to_target_kvcache(
         _pool = token_to_kv_pool_allocator.get_kvcache()
         _sz = int(_pool.size)
         _pg = int(getattr(_pool, "page_size", 1) or 1)
-        _t = tgt_cache_loc
-        _virt = _t >= _sz
-        _own = ((_t // _pg) % _dws) == _drank
-        _rep = (_t // (_pg * _dws)) * _pg + (_t % _pg)
-        tgt_cache_loc = torch.where(
-            _virt & _own,
-            _rep,
-            torch.where(_virt & ~_own, torch.full_like(_t, _sz), _t),
-        )
+
+        def _to_target_local(_t: torch.Tensor) -> torch.Tensor:
+            _virt = _t >= _sz
+            _own = ((_t // _pg) % _dws) == _drank
+            _rep = (_t // (_pg * _dws)) * _pg + (_t % _pg)
+            return torch.where(
+                _virt & _own,
+                _rep,
+                torch.where(_virt & ~_own, torch.full_like(_t, _sz), _t),
+            )
+
+        tgt_cache_loc = _to_target_local(tgt_cache_loc)
+        accept_out_cache_loc = _to_target_local(accept_out_cache_loc)
     token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
         tgt_cache_loc, accept_out_cache_loc
     )
