@@ -75,3 +75,33 @@
   加固（RADIX-EXTRAKEY-DIAG 日志已在 match/insert 两侧就位，commit `2289765206`）。
 - 生产恢复顺序：确认 1103 带修复重启完成后，router 改回双 decode（`--decode 10.0.58.36:30200`）
   → gateway(31001) → proxy(31000, `MOL_UPSTREAM_RUNTIME=sglang`) → 公网 18777 验证。
+
+## 6. 第二 bug：HiCache × LoRA 命名空间污染（2026-08-20 晚 结案）
+
+**症状**：启用三级 HiCache（page_first + write_back）后，LoRA 请求出现**随机性**乱码
+（首 token id=0、accept 健康但输出 token soup、上下文完全丢失——正文输出无关内容如
+GitHub README）；base 始终干净；权重 checksum 完好；乱码后状态持续（"污染扩散"）。
+
+**触发规律**（实测）：与 KV 分配位置/请求历史相关——同一请求形态在不同 session
+随机好坏；chat 加载触发型请求、流式、radix 命中重复均可触发；/generate 短 prompt
+（单 segment）几乎不触发。
+
+**根因**：HiCache host 层（write_back/page_first 路径）的前缀匹配/写回**不正确处理
+LoRA extra_key 命名空间** → 跨 adapter KV 复用污染（L1 请求读到 L0 的 KV → 前向
+上下文错乱 → 乱码）。与上游 #25351（LoRA prefix cache namespace collision）同族，
+但发生在 host 层。
+
+**修复**：**生产禁用 HiCache**（从 1101 prefill 启动参数移除
+--enable-hierarchical-cache 系列）。禁用后全形态验证套件全绿：加载触发型 chat ×4、
+流式、radix 命中重复、新 prompt、16 并发混合、生产形态多轮流式、公网 18777 流式。
+
+**后续**（未做）：修复 host 层 extra_key 隔离（radix host 匹配路径需消费
+RadixKey.extra_key 并在写回时保留命名空间），之后可重新启用三级缓存。
+判据：重复"加载触发型 chat + 流式 + 多 adapter 混合"套件（本文件 §6 的复现形态）。
+
+**排查中的方法论教训**：
+1. bangs 计数启发式不可靠（soup 可能只含 1 个 '!'）——必须人眼看文本
+2. 污染状态毁掉一切后续测试——每个假设验证前必须双端全新重启
+3. "干净"的验证要覆盖真实流量形态（chat 模板/流式/thinking/多轮）——只测 /generate
+   短 prompt 会漏掉整类 bug
+4. 随机性好坏 = 怀疑 KV 分配位置/host 层；确定性好坏 = 怀疑代码路径
