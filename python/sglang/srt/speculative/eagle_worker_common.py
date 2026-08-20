@@ -21,10 +21,16 @@ _DRAFT_LOC_PROBE = _os.environ.get("SGLANG_DSA_STAGE_SYNC", "").lower() in (
 )
 
 try:
-    from sglang.srt.layers.dcp.comm import get_attention_dcp_world_size
+    from sglang.srt.layers.dcp.comm import (
+        get_attention_dcp_rank,
+        get_attention_dcp_world_size,
+    )
 except Exception:  # pragma: no cover - non-DCP builds
     def get_attention_dcp_world_size():
         return 1
+
+    def get_attention_dcp_rank():
+        return 0
 from sglang.kernels.ops.speculative.eagle import fill_bonus_tokens_func
 from sglang.srt.layers.logprob_processor import compute_spec_v2_logprobs
 from sglang.srt.managers.utils import GenerationBatchResult
@@ -317,10 +323,17 @@ def prepare_for_draft(
         # just above the local pool size) while the draft path needs LOCAL
         # ids — previously these crashed the paged KV write (Xid 31,
         # TP-group death) or, contained, still poisoned free() and killed
-        # EAGLE accept (3.0 -> 1.0 cliff). Convert out-of-pool values back
-        # to the LOCAL slot those tokens actually occupy — the exact inverse
-        # the target KV-write path uses — so draft locs are CORRECT, not
-        # merely clamped. In-pool values pass through unchanged.
+        # EAGLE accept (3.0 -> 1.0 cliff). NOTE (2026-08-20 root cause):
+        # req_to_token rows carry FULL DCP virtual ids (whole-page
+        # round-robin virtual space, allocator page_size=256=64*dcp).
+        # The KV-write path (set_mla_kv_buffer DCP branch) performs the
+        # virtual->local mapping + owner filter itself — converting HERE
+        # double-maps local ids and mis-maps foreign-rank pages (accept
+        # cliff), and ALSO feeds local ids into free() (allocator expects
+        # virtual ids; local ids round to wrong virtual pages -> allocator
+        # poisoning). So out_cache_loc keeps VIRTUAL ids untouched; every
+        # consumer either maps them (write path / read page-table repair)
+        # or owns them (free).
         _pool = draft_model_runner.token_to_kv_pool
         _size = int(_pool.size)
         _page = int(getattr(_pool, "page_size", 1) or 1)
@@ -332,8 +345,9 @@ def prepare_for_draft(
                 _n = int(_bad.sum())
                 _samples = _loc[_bad][:8].tolist()
                 logging.getLogger(__name__).error(
-                    "[DRAFT-LOC-OOB] %d/%d bad draft locs, samples=%s, cap=%d "
-                    "— repairing global->local at source",
+                    "[DRAFT-LOC-OOB] %d/%d draft locs above local pool, "
+                    "samples=%s, local_cap=%d — virtual ids kept (DCP "
+                    "write path maps them); DO NOT convert here (double-map)",
                     _n,
                     _loc.numel(),
                     _samples,
@@ -341,15 +355,33 @@ def prepare_for_draft(
                 )
         try:
             _dws = get_attention_dcp_world_size()
+            _drank = get_attention_dcp_rank()
         except Exception:
             _dws = 1
-        if _dws > 1:
-            _loc = torch.where(
-                _loc >= _size,
-                (_loc // (_page * _dws)) * _page + (_loc % _page),
-                _loc,
-            )
-        batch.out_cache_loc = _loc.clamp_(min=0, max=_cap - 1)
+            _drank = 0
+        if _DRAFT_LOC_PROBE and _dws > 1:
+            # Rank-ownership audit: virtual page v is owned by rank v%dcp.
+            # Foreign-rank lanes in THIS rank's draft locs = cross-rank row
+            # contamination (fingerprint of the producer bug); log samples.
+            _vg = _loc >= _size
+            if bool(_vg.any()):
+                _own = ((_loc // _page) % _dws) == _drank
+                _foreign = _vg & ~_own
+                if bool(_foreign.any()):
+                    logging.getLogger(__name__).error(
+                        "[DRAFT-LOC-FOREIGN] %d/%d foreign-rank virtual ids, "
+                        "samples=%s rank=%d dws=%d — write path routes to "
+                        "scratch; read path masks",
+                        int(_foreign.sum()),
+                        _loc.numel(),
+                        _loc[_foreign][:8].tolist(),
+                        _drank,
+                        _dws,
+                    )
+        # Negative-lane only clamp: keep virtual ids (>= local cap is legal
+        # in the round-robin virtual space). Clamping max would corrupt the
+        # mapping the DCP write path applies.
+        batch.out_cache_loc = _loc.clamp_(min=0)
 
     # Get a forward batch
     # Actual width of the next draft-decode forward: topk tokens per req.

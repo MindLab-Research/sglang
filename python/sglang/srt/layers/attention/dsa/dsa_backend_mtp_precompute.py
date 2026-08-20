@@ -119,11 +119,16 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         values pass through unchanged.
         """
         try:
-            from sglang.srt.layers.dcp.comm import get_attention_dcp_world_size
+            from sglang.srt.layers.dcp.comm import (
+                get_attention_dcp_rank,
+                get_attention_dcp_world_size,
+            )
 
             dws = get_attention_dcp_world_size()
+            drank = get_attention_dcp_rank()
         except Exception:
             dws = 1
+            drank = 0
         if dws <= 1:
             return
         size = int(self.token_to_kv_pool.size)
@@ -131,7 +136,22 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         for t in tensors:
             if t is None or t.numel() == 0:
                 continue
-            t.copy_(torch.where(t >= size, (t // (ps * dws)) * ps + (t % ps), t))
+            # (2026-08-20) Rank ownership: virtual page v (64-slot) is owned
+            # by rank v%dcp. ONLY own-rank virtual ids may be mapped into
+            # this rank's local pool — foreign-rank ids map to a DIFFERENT
+            # rank's physical page, i.e. the wrong local page (EAGLE accept
+            # cliff, cross-rank KV pollution). Route foreign lanes to slot 0
+            # (in-pool, safe; garbage is intercepted by target verify).
+            _own = ((t // ps) % dws) == drank
+            _virtual = t >= size
+            _repaired = (t // (ps * dws)) * ps + (t % ps)
+            t.copy_(
+                torch.where(
+                    _virtual & _own,
+                    _repaired,
+                    torch.where(_virtual & ~_own, torch.zeros_like(t), t),
+                )
+            )
 
     def _precompute_replay_metadata(
         self,

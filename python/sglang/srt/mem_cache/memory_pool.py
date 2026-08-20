@@ -4049,12 +4049,31 @@ class MLATokenToKVPool(KVCache):
         # invalid lanes to the scratch page at self.size (established padding
         # target — slot 0 may be a real allocatable slot). Reassignment, not
         # in-place, so caller bookkeeping tensors are untouched.
-        loc = torch.where(
-            (loc >= 0) & (loc < self.size),
-            loc,
-            torch.full_like(loc, self.size),
-        )
-        maybe_detect_oob(loc, 0, self.size + self.page_size, "set_mla_kv_buffer (MLA)")
+        # DCP (2026-08-20 root cause): under DCP, loc is the FULL round-robin
+        # VIRTUAL id (allocator capacity = size*dcp, virtual page 256 = 4
+        # physical pages). Values >= self.size are LEGAL virtual ids and must
+        # reach _write_mla_kv_buffer's DCP branch intact — it maps
+        # virtual->local and applies the owner filter. Sanitizing here would
+        # route them to the scratch page and then double-map the scratch id
+        # (writes to a wrong slot); so skip sanitize + widen the OOB window
+        # for DCP.
+        if dcp_enabled():
+            _dws = get_attention_dcp_world_size()
+            maybe_detect_oob(
+                loc,
+                0,
+                self.size * _dws + self.page_size,
+                "set_mla_kv_buffer (MLA) DCP",
+            )
+        else:
+            loc = torch.where(
+                (loc >= 0) & (loc < self.size),
+                loc,
+                torch.full_like(loc, self.size),
+            )
+            maybe_detect_oob(
+                loc, 0, self.size + self.page_size, "set_mla_kv_buffer (MLA)"
+            )
         layer_id = layer.layer_id
         self._write_mla_kv_buffer(
             self.kv_buffer[layer_id - self.start_layer],
