@@ -654,6 +654,35 @@ def move_accept_tokens_to_target_kvcache(
         accept_out_cache_loc,
         size,
     )
+    # (2026-08-20) tgt_cache_loc comes from the row (assign_extend_cache_locs)
+    # and carries DCP VIRTUAL ids; move_kv_cache indexes the physical pool
+    # directly, so >= local-pool ids misplace/miswrite -> verify KV wrong ->
+    # EAGLE accept cliff. Map own-rank virtual pages to local (same formula as
+    # prepare_for_draft); accept_out_cache_loc derives from batch.out_cache_loc
+    # which prepare_for_draft already localized.
+    try:
+        from sglang.srt.server_args import get_server_args
+        from sglang.srt.runtime_context import get_parallel
+
+        _dws = int(get_server_args().dcp_size or 1)
+        _tp = get_parallel().tp_rank
+        _drank = (_tp % _dws) if _dws > 1 else 0
+    except Exception:
+        _dws = 1
+        _drank = 0
+    if _dws > 1:
+        _pool = token_to_kv_pool_allocator.get_kvcache()
+        _sz = int(_pool.size)
+        _pg = int(getattr(_pool, "page_size", 1) or 1)
+        _t = tgt_cache_loc
+        _virt = _t >= _sz
+        _own = ((_t // _pg) % _dws) == _drank
+        _rep = (_t // (_pg * _dws)) * _pg + (_t % _pg)
+        tgt_cache_loc = torch.where(
+            _virt & _own,
+            _rep,
+            torch.where(_virt & ~_own, torch.full_like(_t, _sz), _t),
+        )
     token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
         tgt_cache_loc, accept_out_cache_loc
     )
