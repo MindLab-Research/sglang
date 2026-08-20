@@ -59,23 +59,28 @@ bash /root/start_pd.sh router --prefill 10.0.0.75:30100 --decode 10.0.0.67:30200
 
 **处理**：不要改 prefill collective 代码。如果死锁，重启 prefill。
 
-### 2. 请求随机永久卡死（已修复 cd15c85d68）
+### 2. 请求随机永久卡死（结构性修复：预留先于 bootstrap + 非阻塞释放）
 
 **症状**：低负载下偶尔一个请求永久不返回，health 200、零崩溃、日志无错误。
 
 **根因链**（三个环节）：
-1. prefill 端 sender 卡 `WaitingForInput` 无超时（receiver 有）→ 不发 hidden ACK
-2. decode 端 `_release_pd_hidden_rows` 等 ACK 超时(300s)后 `return` → hidden rows 泄漏 → hidden pool 永久满
-3. 新请求 `dspark_pool.alloc()` 返回 `None` → `pop_preallocated` 里无限 `continue` → 永久卡死
+1. decode 端 bootstrap（`receiver.init`）先于 hidden rows 分配 → sender 进入 `WaitingForInput`（prefill 侧无超时）
+2. pool 满时 `dspark_pool.alloc()` 返回 `None` → `pop_preallocated` 无限 `continue`（不发 KV indices）→ sender 永久卡死
+3. `_release_pd_hidden_rows` 等 ACK **阻塞 300s** 后 `return` 不释放 → rows 泄漏 → pool 永久满（回到 2）；且该调用跑在调度线程 → 整个 decode 冻结 300s
 
-**为什么之前的修复被回退**：都改了 collective 行为或 conn.py 的 poll 逻辑，间接导致 prefill 死锁。
+**为什么 cd15c85d68（超时兜底）被替换**：用户要求"根本不可能卡"——超时兜底仍会卡 600s 才 abort，且 300s 阻塞等待冻结调度线程。
 
-**本次修复（cd15c85d68，全在 decode 端纯本地逻辑，不触碰 collective/poll）**：
-- `_release_pd_hidden_rows`：ACK 超时后仍释放 rows（不再 `return`），避免 pool 泄漏
-- `DecodeRequest` 加 `enqueue_time` 字段，入队时打 `time.monotonic()` 时间戳
-- `pop_preallocated` 的 alloc 失败分支：超过 `waiting_timeout`(600s) 则 `prepare_abort` + `kv_receiver.abort()`（abort 通知 prefill 释放 sender，间接解除环节 1）
+**结构性修复（decode 端纯本地，零超时依赖，不触碰 collective/poll）**：
+- **预留先于 bootstrap**（`_try_prealloc_pd_hidden_rows`，在 `add()` fast path 和 `_resolve_pending_reqs` 的 `init()` 前调用）：
+  用 prefix-free 上界 `min(_rebootstrap_prefill_len, pool.size)` 预留 rows。pool 满 → 请求留在 `pending_reqs` **不 bootstrap** → sender 根本不存在 → 无卡可谈（背压而非死锁）。pop 时按实际 `pd_hidden_window_rows` 裁剪多余部分还回 pool。
+- **释放非阻塞化**（`_release_pd_hidden_rows` + `drain_pending_pd_hidden_releases`）：
+  `wait_ack_completions(room, timeout_s=0.0)` 非阻塞探测（ACK 是 decode 本地的 CUDA 注入完成事件，正常 µs 级完成）；未完成则 park 到 `_pending_pd_hidden_releases`，每 tick 由 `pop_preallocated` 顶部 drain 重试——**永不放弃（不泄漏）、永不阻塞调度线程、无需任何超时**。
+- **alloc-None 分支改 fail-fast**：预留机制下已 bootstrap 的请求必有 reserved rows，`alloc()==None` 只能是不变量违规 → 立即 abort(503) + `kv_receiver.abort()`（通知 prefill 释放 sender），绝不 spin。
+- **failed_reqs 统一释放**：pop 循环尾对全部 failed_reqs 释放 hidden rows（幂等），覆盖 6 个 config-abort 分支的预留泄漏。
 
-**安全性**：`pop_preallocated` 内 poll 是 local-only（注释明确 "no cross-rank all_reduce"），abort 不改变 collective 调用次数，不会 rank 间错位。
+**不变量证明**：`pd_hidden_len = upper_bound - total_prefix_len ≤ upper_bound` 且 `total_prefix_len ≤ len-1`（match 少最后 1 token）→ `window_rows = min(hidden_len, pool.size) ≤ min(upper, pool.size) = len(reserved)`，切片恒有效。
+
+**验证 grep**：`PD hidden ACK still pending at release; parking`（park 发生，正常少见）、`invariant violated`（不应出现）。
 
 **临时缓解（仍有效）**：router 的 `--request-timeout-secs 3600`（1 小时）会最终超时返回 503。
 
