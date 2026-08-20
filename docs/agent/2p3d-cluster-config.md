@@ -236,15 +236,18 @@ curl -X POST http://10.0.58.38:30200/flush_cache
 - **1102 测试 router**（sglang_router python CLI）与 1101 smg router 是不同实现；线上链路统一用 smg。
 - **模型名两层**：公网请求 model 必须用 `Macaron-V1-Venti`（proxy 层）；直接打 router 用
   `glm52-fp8-official`。LoRA 触发只认请求体 `lora_path` 字段。
-- **LoRA 多加载乱码问题（2026-08-20 排查中，未结案）**：第二及以上 LoRA adapter 加载/请求后，
-  LoRA 前向持续乱码且 sticky（flush+unload+reload 不恢复）；伴随 radix 跨请求串数据（base 读到
-  别人 prompt，双端 flush_cache 可恢复 base）。EAGLE accept 同步崩到 1.0。base 权重本身健康。
-  1P1D 测试集群（1102/1104，sglang_venv）未复现——其从未加载第二个 LoRA。排查期间 proxy 保持下线。
+- **LoRA 多加载乱码问题（2026-08-21 已修复，commit `f070d3d466`）**：第 5 个 uid（base+L0..L3）
+  超过 `max_loras_per_batch=4` 触发 LRU 驱逐 → CUDA graph 的 `token_lora_mapping` 尾部 stale
+  adapter id + rank-0/base 映射到 slot 0 → 乱码且 sticky 传染（上游 #29157/#29468 同源缺陷）。
+  修复 = #29468 移植（CG buffer 全量重置 -1 + rank-0→-1）。已验证：串行全序列 + 16 并发混合
+  全绿，accept 2.5-3.1，0 异常。**完整根因/验证/判据工具见 `docs/agent/lora-multi-adapter-garbling.md`**。
+  排查期间 proxy 保持下线；恢复线上按该文档 §5 顺序。
 
-## 8. 当前（2026-08-20 23:30 CST）状态快照
+## 8. 当前（2026-08-21 00:5x UTC / 08:5x CST）状态快照
 
-- prefill 1101 / decode 1100 / decode 1103：运行（回滚版 lora_manager，max-loras 4/4），health 200
-- router：运行，**实验形态（仅挂 1100 单 decode）**——恢复线上需改回双 decode 重启
-- gateway / proxy：**停止**（乱码排查期间，proxy 按用户指令下线）
-- KV cache（回滚版重启后实测）：prefill 1,505,344 tokens / 77.43 GB；
-  decode target ≈1,644K / 84.57 GB + draft ×4（371a991947 修复生效）
+- 三台均已部署 LoRA 乱码修复 `f070d3d466`（base_backend.py md5 `066721b7a32cde289a99936c93985f50`）
+- prefill 1101 / decode 1100：**已带修复重启并全量验证**（串行 11 请求 + 16 并发混合全绿）
+- decode 1103：已部署修复并重启（health 验证后即可回归）
+- router：运行，单 decode 实验形态（1100）——**恢复线上需改回双 decode 重启**
+- gateway / proxy：停止（乱码排查期间，按用户指令下线；结案后按 §5 顺序恢复）
+- 验证工具已留在 1101：`/root/lora_test.sh`、`/root/lora_verify_seq.sh`、`/root/lora_stress.sh`
