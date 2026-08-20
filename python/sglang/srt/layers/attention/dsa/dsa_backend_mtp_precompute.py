@@ -24,6 +24,10 @@ from sglang.srt.layers.dcp.layout import (
 )
 from sglang.srt.utils import is_cuda, is_hip
 
+# (2026-08-20) Module-level cache for real DCP config — computed once at
+# model init (NOT during CUDA graph capture) to avoid CUDA ops in hot path.
+_CACHED_DCP = None
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
@@ -117,18 +121,33 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         inverse the target KV-write uses: (g // (page*dcp))*page + g%page.
         DCP-enabled paths localize separately and never call this; in-pool
         values pass through unchanged.
-        """
-        try:
-            from sglang.srt.layers.dcp.comm import (
-                get_attention_dcp_rank,
-                get_attention_dcp_world_size,
-            )
 
-            dws = get_attention_dcp_world_size()
-            drank = get_attention_dcp_rank()
-        except Exception:
-            dws = 1
-            drank = 0
+        (2026-08-20 FINAL FIX) Use server_args dcp_size instead of
+        get_attention_dcp_world_size() — the ContextVar-gated version
+        returns 1 under @dcp_disabled (EAGLE draft), silently disabling
+        this repair. The WRITE path (prepare_for_draft) already converts
+        ≥cap values to page v; this READ path must match. Without this:
+        write→page v, read→page 4v+k, draft attention reads wrong KV →
+        accept cliff. CRITICAL: keep the _virtual check — only convert
+        values ≥ pool_size. <cap values are already at correct positions
+        (direct index). Converting them would DOUBLE-CONVERT (data at
+        wrong position → crash). Module-level cache computed once at
+        model init (NOT during CUDA graph capture).
+        """
+        global _CACHED_DCP
+        if _CACHED_DCP is None:
+            try:
+                from sglang.srt.server_args import get_server_args
+                from sglang.srt.runtime_context import get_parallel
+
+                _dws = int(get_server_args().dcp_size or 1)
+                _drank = (
+                    get_parallel().tp_rank % _dws if _dws > 1 else 0
+                )
+                _CACHED_DCP = (_dws, _drank)
+            except Exception:
+                _CACHED_DCP = (1, 0)
+        dws, drank = _CACHED_DCP
         if dws <= 1:
             return
         size = int(self.token_to_kv_pool.size)

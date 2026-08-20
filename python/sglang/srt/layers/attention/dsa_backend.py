@@ -145,6 +145,10 @@ from sglang.srt.layers.dcp.layout import (
     update_local_kv_lens_for_dcp,
 )
 
+# (2026-08-20) Module-level cache for real DCP config — computed once at
+# model init (NOT during CUDA graph capture) to avoid CUDA ops in hot path.
+_CACHED_DCP = None
+
 if _is_hip:
     try:
         from aiter import (  # noqa: F401
@@ -3284,8 +3288,21 @@ class DeepseekSparseAttnBackend(
         # -1 (clamp below lands on slot 0, in-pool safe; verify intercepts
         # garbage).
         try:
-            _dws_r = get_attention_dcp_world_size()
-            _drank_r = get_attention_dcp_rank()
+            # (2026-08-20 FINAL FIX) Use cached server_args dcp config —
+            # ContextVar-gated version returns 1 under @dcp_disabled (EAGLE
+            # draft), silently disabling this repair. Must match write path.
+            # CRITICAL: keep _virtual check (only convert ≥cap values).
+            global _CACHED_DCP
+            if _CACHED_DCP is None:
+                from sglang.srt.server_args import get_server_args
+                from sglang.srt.runtime_context import get_parallel
+
+                _dws = int(get_server_args().dcp_size or 1)
+                _drank = (
+                    get_parallel().tp_rank % _dws if _dws > 1 else 0
+                )
+                _CACHED_DCP = (_dws, _drank)
+            _dws_r, _drank_r = _CACHED_DCP
         except Exception:
             _dws_r = 1
             _drank_r = 0
