@@ -193,7 +193,7 @@ def all_gather_kv_cache_for_mha_chunk_extend(
     prefix_kv_lens_cpu: torch.Tensor,
     prefix_starts_cpu: torch.Tensor = None,
 ):
-    if get_parallel().dcp_enabled:
+    if dcp_enabled():
         kv_a = kv_a.unsqueeze(1)
         gathered_kv = all_gather_kv_cache_for_dcp(
             kv_a,
@@ -320,12 +320,11 @@ def all_gather_kv_cache_for_dcp(
     """
     prefix_kv_a and prefix_k_pe should have same shape, expect for last dim
     """
-    parallel = get_parallel()
-    if not parallel.dcp_enabled:
+    if not dcp_enabled():
         return torch.cat([prefix_kv_a, prefix_k_pe], dim=-1)
     # 1. compute max kv_lens for each seq
-    dcp_world_size = parallel.dcp_size
-    dcp_rank = parallel.dcp_rank
+    dcp_world_size = get_parallel().dcp_size
+    dcp_rank = get_parallel().dcp_rank
 
     if prefix_starts_cpu is None:
         prefix_starts_cpu = torch.zeros_like(prefix_kv_lens_cpu)

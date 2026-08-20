@@ -1474,23 +1474,20 @@ class KVCacheConfigurator:
                         )
                     else:
                         token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
-                            # (2026-08-20 ROOT FIX) DCP virtual-page space MUST
-                            # equal the physical pool. Each virtual page
-                            # (page_size=64*dcp=256 slots) maps to 4 physical
-                            # 64-slot pages (physical page 4v+k owned by rank k),
-                            # so the virtual-page count is bounded by
-                            # physical_pages/dcp = size/256. capacity=size*dcp
-                            # minted 28992 virtual pages but only 7248 have
-                            # physical backing -> "ghost" virtual pages whose KV
-                            # has nowhere to live -> Xid 31 (direct-index
-                            # consumers) / scratch (set_mla_kv_buffer) once the
-                            # watermark passes the physical bound (this is why
-                            # the bug is INTERMITTENT: it only fires when
-                            # cumulative allocation pushes virtual page > 7248).
-                            # Per-rank virtual space of `size` still yields 4x
-                            # single-request capacity (each rank stores 1/dcp of
-                            # the sequence in its own 1.85M-slot pool).
-                            sizes.max_total_num_tokens,
+                            # DCP virtual-page space: each virtual page
+                            # (page_size=64*dcp=256 slots) spans 4 physical
+                            # 64-slot pages (page 4v+k owned by rank k), but a
+                            # rank only WRITES its own 64-slot segment of each
+                            # virtual page. Capacity in virtual SLOTS must
+                            # therefore be size*dcp so each rank's effective
+                            # tokens = (size*dcp/256)*64 = size (full physical
+                            # pool). NOTE (2026-08-20): capacity=size here cut
+                            # each rank's effective KV to size/4 (pool fills at
+                            # 4x rate -> retract/offload storm -> Xid 43); the
+                            # merge-0.5.16 regression is the dcp_enabled()
+                            # ContextVar loss (parallel.dcp_enabled), NOT this
+                            # capacity — see dcp-virtual-id-domain-fix.md.
+                            sizes.max_total_num_tokens * self.server_args.dcp_size,
                             page_size=self.server_args.page_size
                             * self.server_args.dcp_size,
                             dtype=self.kv_cache_dtype,
