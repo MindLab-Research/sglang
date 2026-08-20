@@ -515,7 +515,12 @@ def _compute_moe_lora_info_kernel(
         (lora_rank > 0).to(tl.int32),
         mask=pid_m == 0,
     )
-    tl.store(token_lora_mapping_ptr + seg_start + offs, lora_id, mask=valid)
+    # (port of upstream #29468, fixes #29157) rank-0 slots (base) must map to
+    # the no-LoRA sentinel -1, NOT slot 0 — a base/padding token mapped to a
+    # real slot id gets routed through that adapter's virtual experts and
+    # corrupts decode output under concurrent multi-LoRA serving.
+    map_val = tl.where(lora_rank > 0, lora_id, -1)
+    tl.store(token_lora_mapping_ptr + seg_start + offs, map_val, mask=valid)
 
 
 def _compute_moe_lora_info(
@@ -540,6 +545,15 @@ def _compute_moe_lora_info(
         assert (
             mapping_len <= token_lora_mapping.shape[0]
         ), "mapping_len must be less than or equal to the shape of token_lora_mapping"
+        # (port of upstream #29468, fixes #29157) The preallocated CUDA-graph
+        # mapping buffer is longer than the active prefix, and the captured
+        # graph reads up to the captured tier width — reset the ENTIRE buffer
+        # so replay-time padding rows never read a stale adapter id left by a
+        # previous (possibly different-adapter) batch. A stale in-range id is
+        # NOT caught by the >= nslots sanitize and routes padding tokens
+        # through the wrong adapter's virtual experts.
+        if token_lora_mapping.shape[0] > num_tokens:
+            token_lora_mapping.fill_(-1)
         token_lora_mapping = token_lora_mapping[:mapping_len]
     else:
         token_lora_mapping = torch.empty(
@@ -608,8 +622,15 @@ def _compute_moe_lora_info(
     )
 
     # Fill only the per-rank prefix [0, num_tokens); the gathered tail keeps the -1 set above.
+    # (port of upstream #29468) rank-0 slots (base) and negative request-to-LoRA
+    # ids map to the no-LoRA sentinel -1 instead of slot 0 / a wrapped index.
+    wi_i32 = weight_indices.to(torch.int32)
+    keep = (wi_i32 >= 0) & (
+        lora_ranks[wi_i32.clamp(min=0).long()] > 0
+    )
+    wi_i32 = torch.where(keep, wi_i32, torch.full_like(wi_i32, -1))
     torch.index_select(
-        weight_indices.to(torch.int32),
+        wi_i32,
         0,
         req_indices,
         out=token_lora_mapping[:num_tokens],
