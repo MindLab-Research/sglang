@@ -243,11 +243,11 @@ curl -X POST http://10.0.58.38:30200/flush_cache
   全绿，accept 2.5-3.1，0 异常。**完整根因/验证/判据工具见 `docs/agent/lora-multi-adapter-garbling.md`**。
   排查期间 proxy 保持下线；恢复线上按该文档 §5 顺序。
 
-## 8. 当前（2026-08-21 00:5x UTC / 08:5x CST）状态快照
+## 8. 当前（2026-08-21 05:4x UTC / 13:4x CST）状态快照
 
-- 三台均已部署 LoRA 乱码修复 `f070d3d466`（base_backend.py md5 `066721b7a32cde289a99936c93985f50`）
-- prefill 1101 / decode 1100：**已带修复重启并全量验证**（串行 11 请求 + 16 并发混合全绿）
-- decode 1103：已部署修复并重启（health 验证后即可回归）
-- router：运行，单 decode 实验形态（1100）——**恢复线上需改回双 decode 重启**
-- gateway / proxy：停止（乱码排查期间，按用户指令下线；结案后按 §5 顺序恢复）
-- 验证工具已留在 1101：`/root/lora_test.sh`、`/root/lora_verify_seq.sh`、`/root/lora_stress.sh`
+- **线上服务已恢复并全量验证**（公网 18777 流式+thinking 零乱码）
+- 配置：4 slot（无 base 流量 → 零驱逐）+ **无 layersplit**（排查期移除，可评估恢复）+ **无 HiCache**（Bug#2 根因，禁用）
+- 代码：f070d3d466（#29468 移植）+ 插桩（mem_pool 探针/schedule_batch 诊断，env 门控）
+- 验证工具（1101）：lora_test.sh / lora_fast_test.sh / lora_gauntlet.sh / lora_stress.sh / lora_prod_shape_test.sh
+- 1102/1104 测试对：sglang_venv + 当前代码（5/5 参数，供后续根因复现用）
+
