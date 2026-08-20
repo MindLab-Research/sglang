@@ -106,6 +106,33 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
     which are used to optimize CUDA graph replay in multi-step scenarios.
     """
 
+    def _repair_global_kv_slots_(self, *tensors) -> None:
+        """In-place global->local repair for slot tensors gathered from
+        req_to_token (2026-08-19/20 crash family). Some req_to_token cells
+        hold GLOBAL DCP virtual slots (fingerprint: sequential allocator
+        runs just above the local pool size, e.g. 1995115..1995119 vs
+        cap 1855232); every draft-side reader of these tables (indexer
+        paged-MQA, trtllm attention, transform kernels) assumes LOCAL ids
+        and faults with an async IMA otherwise. Convert with the exact
+        inverse the target KV-write uses: (g // (page*dcp))*page + g%page.
+        DCP-enabled paths localize separately and never call this; in-pool
+        values pass through unchanged.
+        """
+        try:
+            from sglang.srt.layers.dcp.comm import get_attention_dcp_world_size
+
+            dws = get_attention_dcp_world_size()
+        except Exception:
+            dws = 1
+        if dws <= 1:
+            return
+        size = int(self.token_to_kv_pool.size)
+        ps = int(self.real_page_size)
+        for t in tensors:
+            if t is None or t.numel() == 0:
+                continue
+            t.copy_(torch.where(t >= size, (t // (ps * dws)) * ps + (t % ps), t))
+
     def _precompute_replay_metadata(
         self,
         bs: int,
@@ -200,6 +227,12 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
             seqlens_expanded = cache_seqlens
             seqlens_expanded_size = bs
 
+            if not dcp_enabled():
+                # Draft semantics: req_to_token cells can hold GLOBAL dcp
+                # virtual slots; repair gathered tables to LOCAL ids before
+                # any indexer/attention consumer (2026-08-20 IMA family).
+                self._repair_global_kv_slots_(page_indices, real_page_table)
+
             if dcp_enabled():
                 (
                     cache_seqlens,
@@ -242,6 +275,8 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
 
         # Get page indices from cache
         page_indices = self.req_to_token[req_pool_indices, :max_len].contiguous()
+        if not dcp_enabled():
+            self._repair_global_kv_slots_(page_indices)
 
         # Compute DSA seqlens
         dsa_cache_seqlens = compute_dsa_seqlens(
@@ -362,6 +397,11 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
                 next_n=self.speculative_num_draft_tokens,
             )
 
+            if not dcp_enabled():
+                # Draft-extend semantics: same global->local repair as the
+                # decode branch (see _repair_global_kv_slots_).
+                self._repair_global_kv_slots_(page_indices, real_page_table)
+
             if dcp_enabled():
                 (
                     cache_seqlens,
@@ -407,6 +447,8 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         page_indices = torch.repeat_interleave(
             page_indices, repeats=self.speculative_num_draft_tokens, dim=0
         ).contiguous()
+        if not dcp_enabled():
+            self._repair_global_kv_slots_(page_indices)
 
         # Generate expanded seqlens on device. seq_lens_cpu is optional for DSA
         # CUDA graph replay, so this fallback must not require a host mirror.
