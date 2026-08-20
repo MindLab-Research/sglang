@@ -1474,7 +1474,23 @@ class KVCacheConfigurator:
                         )
                     else:
                         token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
-                            sizes.max_total_num_tokens * self.server_args.dcp_size,
+                            # (2026-08-20 ROOT FIX) DCP virtual-page space MUST
+                            # equal the physical pool. Each virtual page
+                            # (page_size=64*dcp=256 slots) maps to 4 physical
+                            # 64-slot pages (physical page 4v+k owned by rank k),
+                            # so the virtual-page count is bounded by
+                            # physical_pages/dcp = size/256. capacity=size*dcp
+                            # minted 28992 virtual pages but only 7248 have
+                            # physical backing -> "ghost" virtual pages whose KV
+                            # has nowhere to live -> Xid 31 (direct-index
+                            # consumers) / scratch (set_mla_kv_buffer) once the
+                            # watermark passes the physical bound (this is why
+                            # the bug is INTERMITTENT: it only fires when
+                            # cumulative allocation pushes virtual page > 7248).
+                            # Per-rank virtual space of `size` still yields 4x
+                            # single-request capacity (each rank stores 1/dcp of
+                            # the sequence in its own 1.85M-slot pool).
+                            sizes.max_total_num_tokens,
                             page_size=self.server_args.page_size
                             * self.server_args.dcp_size,
                             dtype=self.kv_cache_dtype,

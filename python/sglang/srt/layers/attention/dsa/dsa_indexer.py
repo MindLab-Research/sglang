@@ -371,7 +371,15 @@ class Indexer(MultiPlatformOp):
     def _localize_index_k_cache_locs(
         self, out_cache_loc: torch.Tensor
     ) -> torch.Tensor:
-        """Map global virtual slots to this rank's whole-page DCP pool."""
+        """Map virtual slots above the physical bound to this rank's local pool.
+
+        (2026-08-20) Only ids >= the physical pool size are virtual-space ids
+        needing mapping; in-pool ids are already local physical slots (the
+        round-robin virtual space coincides numerically below the physical
+        bound — this is the root reason the bug is intermittent). With the
+        allocator capacity fix (virtual pages == physical pages) this is a
+        no-op guard; it stays as defense for stray ids.
+        """
         if not dcp_enabled():
             return out_cache_loc
 
@@ -379,14 +387,22 @@ class Indexer(MultiPlatformOp):
         dcp_size = get_attention_dcp_world_size()
         dcp_rank = get_attention_dcp_rank()
         page_size = pool.page_size
+        local_size = int(pool.size)
         valid = out_cache_loc >= 0
+        virtual = out_cache_loc >= local_size
         global_page = out_cache_loc // page_size
         owner = (global_page % dcp_size == dcp_rank) & valid
         local_slot = (
             (global_page // dcp_size) * page_size + out_cache_loc % page_size
         )
         return torch.where(
-            owner, local_slot, torch.full_like(out_cache_loc, pool.size)
+            virtual & owner,
+            local_slot,
+            torch.where(
+                virtual & ~owner,
+                torch.full_like(out_cache_loc, local_size),
+                out_cache_loc,
+            ),
         )
 
     _MQA_LOGITS_BYTES_PER_ELEM = 4
