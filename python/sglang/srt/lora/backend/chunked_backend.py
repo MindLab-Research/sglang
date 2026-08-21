@@ -331,16 +331,15 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
 
         # Mirror _get_permutation: stable sort by adapter id so tokens group
         # by adapter, then chunk each group (mirror _get_segments_info).
-        # Pad rows carry sentinel -1 (see _cp_shard_row_request_ids). Map them
-        # to adapter slot 0 — the BASE slot whose lora_ranks[0] == 0, so every
-        # LoRA kernel early-returns on their segments and padding activations
-        # receive NO delta. (Applying a delta to pad rows NaN'd their KV slots
-        # and real queries attending those slots got poisoned — the CP-LoRA
-        # garbling root cause.) Keeping the segments covering ALL shard rows
-        # preserves the exact segment structure the kernels are validated
-        # against; excluding rows instead (permutation shorter than x) hit an
-        # IMA in the absorbed step kernels (2026-08-21 warmup crash).
-        row_wi = [req_weight_indices[s] if s >= 0 else 0 for s in row_req]
+        # Pad rows carry sentinel -1 (see _cp_shard_row_request_ids). Emit
+        # weight_indices = -1 for their segments and guard every consuming
+        # kernel with a negative-slot skip: padding receives NO delta from ANY
+        # adapter regardless of which adapter occupies which slot. (Slot-0
+        # mapping was the first fix but breaks when base is LRU-evicted and an
+        # adapter takes slot 0 — pure-LoRA traffic evicts base on the 4th
+        # adapter load, and lora_ranks[0] becomes nonzero for that batch.)
+        # Rows stay covered so covered == x_rows holds (the validated layout).
+        row_wi = [req_weight_indices[s] if s >= 0 else -1 for s in row_req]
         order = sorted(range(total), key=lambda i: row_wi[i])
         weights_reordered = [row_wi[i] for i in order]
 

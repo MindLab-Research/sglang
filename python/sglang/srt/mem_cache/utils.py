@@ -13,6 +13,8 @@
 # ==============================================================================
 """Common utilities."""
 
+import hashlib
+
 from typing import Any, Callable, List, Optional, Tuple
 
 from sglang.kernels.ops.kvcache.mla_buffer import (
@@ -107,8 +109,22 @@ def get_hash_str(
     token_ids: List[int],
     prior_hash: Optional[str] = None,
     page_size: Optional[int] = None,
+    extra_key: Optional[str] = None,
 ) -> str | List[str]:
-    prior_digest = bytes.fromhex(prior_hash) if prior_hash else None
+    # [HICACHE-LORA-ISOLATION] The storage-layer hash chain historically
+    # mixed ONLY tokens: two adapters (lora_path L0 vs L1) with the same
+    # prompt produced IDENTICAL file-level keys, so one adapter's host/file
+    # KV was served to the other (cross-adapter pollution -> garbled
+    # continuations). Seed the chain root with extra_key (which carries the
+    # lora identity from RadixKey.extra_key): every descendant page hash then
+    # diverges per adapter while mid-chain extensions are unaffected (they
+    # inherit the seed through prior_hash).
+    if prior_hash is None and extra_key is not None:
+        prior_digest = hashlib.sha256(
+            ("sglang-extra-key:" + str(extra_key)).encode()
+        ).digest()
+    else:
+        prior_digest = bytes.fromhex(prior_hash) if prior_hash else None
     return get_native_hash(token_ids, prior_digest, page_size)
 
 
@@ -130,7 +146,13 @@ def compute_node_hash_values(node: Any, page_size: int) -> List[str]:
         if len(node.parent.key) > 0 and len(node.parent.hash_value) > 0:
             parent_hash = node.parent.hash_value[-1]
 
-    hash_values = get_hash_str(node.key, parent_hash, page_size=page_size)
+    # [HICACHE-LORA-ISOLATION] chain root must carry the adapter identity
+    extra_key = None
+    if parent_hash is None:
+        extra_key = getattr(getattr(node, "key", None), "extra_key", None)
+    hash_values = get_hash_str(
+        node.key, parent_hash, page_size=page_size, extra_key=extra_key
+    )
     assert isinstance(hash_values, list)
     return hash_values
 

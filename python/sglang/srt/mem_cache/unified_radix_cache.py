@@ -595,6 +595,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             prefetch_key,
             last_hash,
             prefix_keys,
+            extra_key=getattr(prefetch_key, "extra_key", None),
         )
         hash_values, storage_hit_count = self.cache_controller._storage_hit_query(
             operation
@@ -2116,6 +2117,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             last_hash,
             prefix_keys,
             extra_pools=aux_xfers or None,
+            extra_key=getattr(prefetch_key, "extra_key", None),
         )
         self.ongoing_prefetch[req_id] = _OngoingPrefetch(
             last_host_node,

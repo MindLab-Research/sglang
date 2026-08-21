@@ -197,8 +197,11 @@ class PrefetchOperation(StorageOperation):
         token_ids: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        extra_key: Optional[str] = None,
     ):
         self.request_id = request_id
+        # [HICACHE-LORA-ISOLATION] adapter identity for hash-chain seeding
+        self.extra_key = extra_key
 
         self._lock = threading.Lock()
         self._terminated_flag = False
@@ -916,12 +919,13 @@ class HiCacheController:
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        extra_key: Optional[str] = None,
     ) -> PrefetchOperation:
         """
         Prefetch KV caches from storage backend to host memory.
         """
         operation = PrefetchOperation(
-            request_id, new_input_tokens, last_hash, prefix_keys
+            request_id, new_input_tokens, last_hash, prefix_keys, extra_key
         )
         self.prefetch_queue.put(operation)
         return operation
@@ -1053,7 +1057,11 @@ class HiCacheController:
         storage_query_count = 0
         hash_value = []
         page_hashes = self.get_hash_str(
-            tokens_to_fetch, last_hash, page_size=self.page_size
+            tokens_to_fetch,
+            last_hash,
+            page_size=self.page_size,
+            # [HICACHE-LORA-ISOLATION] seed fresh chains with adapter identity
+            extra_key=getattr(operation, "extra_key", None),
         )
 
         for start in range(0, len(page_hashes), STORAGE_BATCH_SIZE):

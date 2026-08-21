@@ -126,8 +126,11 @@ class PrefetchOperation(StorageOperation):
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
         pool_transfers: Optional[list[PoolTransfer]] = None,
+        extra_key: Optional[str] = None,
     ):
         self.request_id = request_id
+        # [HICACHE-LORA-ISOLATION] adapter identity for hash-chain seeding
+        self.extra_key = extra_key
         self._lock = threading.Lock()
         self._terminated_flag = False
         self._io_finished_event = threading.Event()
@@ -570,6 +573,7 @@ class HybridCacheController(BaseHiCacheController):
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
         extra_pools: Optional[list[PoolTransfer]] = None,
+        extra_key: Optional[str] = None,
     ) -> PrefetchOperation:
         operation = PrefetchOperation(
             request_id,
@@ -577,6 +581,7 @@ class HybridCacheController(BaseHiCacheController):
             last_hash,
             prefix_keys=prefix_keys,
             pool_transfers=extra_pools,
+            extra_key=extra_key,
         )
         self.prefetch_queue.put(operation)
         return operation
@@ -602,7 +607,11 @@ class HybridCacheController(BaseHiCacheController):
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
         from sglang.srt.mem_cache.hicache_storage import PoolTransferResult
         hash_value = self.get_hash_str(
-            operation.token_ids, operation.last_hash, page_size=self.page_size
+            operation.token_ids,
+            operation.last_hash,
+            page_size=self.page_size,
+            # [HICACHE-LORA-ISOLATION] seed fresh chains with adapter identity
+            extra_key=getattr(operation, "extra_key", None),
         )
 
         extra_info = HiCacheStorageExtraInfo(

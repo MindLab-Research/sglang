@@ -209,7 +209,11 @@ class RadixKey:
 
     def hash_page(self, start: int, end: int, prior_hash: Optional[str] = None) -> str:
         """SHA256 for logical units [start, end); bigram mode feeds overlapping (t_i, t_{i+1}) byte pairs."""
-        hash_value = get_hash_str(self[start:end], prior_hash)
+        # [HICACHE-LORA-ISOLATION] seed chain roots with the adapter identity
+        # (extra_key carries lora id); mid-chain calls inherit via prior_hash.
+        hash_value = get_hash_str(
+            self[start:end], prior_hash, extra_key=self.extra_key
+        )
         assert isinstance(hash_value, str)
         return hash_value
 
