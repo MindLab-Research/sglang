@@ -949,16 +949,16 @@ class LoRAMemoryPool:
                     "No available buffer slots found. Please ensure the number of active (pinned) loras is less than max_loras_per_batch."
                 )
 
-            # Prefer evicting LoRA adapters over the base model (None).
-            # Only evict None when the batch consists entirely of LoRA requests
-            # and no other adapters can be evicted.
-            non_none_candidates = candidates - {None}
-            if non_none_candidates:
-                # Prioritize evicting actual LoRA adapters
-                candidates_to_use = non_none_candidates
-            else:
-                # Only None is available for eviction (batch is all LoRA requests)
-                candidates_to_use = candidates
+            # Eviction candidates are equal: base (None) and LoRA adapters
+            # are treated uniformly by the policy. The old prefer-LoRA-
+            # over-base hack pinned base to a slot forever under pure-LoRA
+            # traffic (single-request chunked-prefill batches keep cur_uids
+            # narrow, so OTHER adapters are always the candidates) and forced
+            # L0..L3 into mutual-eviction churn while an in-flight long
+            # prefill's adapter got swapped mid-request (mid-generation
+            # garbling, 2026-08-21). Let the policy pick the true LRU/FIFO
+            # victim including base.
+            candidates_to_use = candidates
 
             # Select victim using eviction policy
             victim_uid = self.eviction_policy.select_victim(candidates_to_use)
