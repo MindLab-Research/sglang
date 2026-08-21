@@ -141,7 +141,7 @@ def resolve_lora_local_path(name: str, path: str) -> str:
             time.sleep(1)
             continue
         try:
-            archive = os.path.join(cache_root, f"{name}{suffix}")
+            archive = os.path.join(cache_root, f"{key}{suffix}")
             logger.info("downloading lora %s from %s", name, path)
             _stream_download(path, archive)
             logger.info("extracting lora %s -> %s", name, target)
@@ -184,7 +184,7 @@ def _stream_download(url: str, dest: str) -> None:
     import subprocess
 
     subprocess.run(
-        ["curl", "-sfL", "--retry", "3", "--retry-delay", "2", "-o", dest, url],
+        ["curl", "-sfL", "--retry", "8", "--retry-delay", "3", "--retry-all-errors", "--connect-timeout", "10", "-o", dest, url],
         check=True,
         timeout=3600,
     )

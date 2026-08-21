@@ -27,10 +27,14 @@ class FanOutCommunicator(Generic[T]):
         send: Callable[[T], None],
         fan_out: int,
         mode: str = "queueing",
+        expected_type: Optional[type] = None,
     ):
         self._send = send
         self._fan_out = fan_out
         self._mode = mode
+        # When set, responses of other types arriving on the same IPC stream
+        # are dropped instead of being miscounted as results.
+        self._expected_type = expected_type
         self._result_event: Optional[asyncio.Event] = None
         self._result_values: Optional[List[T]] = None
         self._result_fan_out: Optional[int] = None
@@ -88,6 +92,16 @@ class FanOutCommunicator(Generic[T]):
         self._fan_out = fan_out
 
     def handle_recv(self, recv_obj: T):
+        if (
+            self._expected_type is not None
+            and not isinstance(recv_obj, self._expected_type)
+        ):
+            logger.warning(
+                "FanOutCommunicator: dropping mismatched response type=%s (expected %s)",
+                type(recv_obj).__name__,
+                self._expected_type.__name__,
+            )
+            return
         if (
             self._result_values is None
             or self._result_event is None

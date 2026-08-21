@@ -138,6 +138,7 @@ class TokenizerControlMixin:
                 self._dispatch_to_scheduler,
                 server_args.dp_size,
                 mode,
+                expected_type=resp_type,
             )
             setattr(self, f"{name}_communicator", comm)
             dispatch_pairs.append((resp_type, comm.handle_recv))
