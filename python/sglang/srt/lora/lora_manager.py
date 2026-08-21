@@ -16,6 +16,7 @@
 # and "Punica: Multi-Tenant LoRA Serving"
 
 import logging
+import os
 import re
 from typing import Dict, Iterable, List, Optional
 
@@ -97,7 +98,22 @@ def resolve_lora_local_path(name: str, path: str) -> str:
     from urllib.parse import urlparse
 
     cache_root = os.environ.get("SGLANG_LORA_CACHE_DIR", "/root/glm52_local/loras")
-    target = os.path.join(cache_root, name)
+    # When the adapter is registered under its URL (the router passes
+    # lora_name=path so runtime lora_path lookups hit), the raw URL is not a
+    # valid directory component — derive a safe cache key from it instead.
+    if name.startswith("http://") or name.startswith("https://"):
+        import hashlib
+        from urllib.parse import urlparse as _urlparse
+
+        base = os.path.basename(_urlparse(name).path)
+        for _ext in (".tar.zst", ".tzst", ".tar.gz", ".tgz", ".tar"):
+            if base.endswith(_ext):
+                base = base[: -len(_ext)]
+                break
+        key = f"{base}-{hashlib.sha1(name.encode()).hexdigest()[:8]}"
+    else:
+        key = name
+    target = os.path.join(cache_root, key)
     # Done marker is a .done file we write after extraction — the checkpoint
     # tarball may not contain adapter_config.json, so we must not key on it.
     marker = os.path.join(target, ".done")
@@ -1048,7 +1064,47 @@ class LoRAManager:
 
         from sglang.srt.models.inkling_common.dense_mlp import InklingBatchDenseMLP
 
+        # [LORA-FAMILY-BISECT] runtime diagnostic (env SGLANG_LORA_FAMILY):
+        # wrap ONLY the selected module family/leaves so the garbling trigger
+        # can be bisected at runtime without repacking adapters. Accepted:
+        #   "attn" | "mlp" | leaf-set like "kv_a+qb" / "kv_a,o_proj"
+        # where kv_a={fused_qkv_a_proj_with_mqa,q_a_proj,kv_a_proj_with_mqa},
+        # qb=q_b_proj, kvb=kv_b_proj, o=o_proj. Unset = wrap everything.
+        _fam = os.environ.get("SGLANG_LORA_FAMILY", "").lower() or None
+        _ATTN_SET = (
+            "q_a_proj", "q_b_proj", "kv_a_proj_with_mqa",
+            "fused_qkv_a_proj_with_mqa", "kv_b_proj", "o_proj", "qkv_proj",
+            "q_proj", "k_proj", "v_proj",
+        )
+        _MLP_LEAVES = ("gate_up_proj", "up_proj", "gate_proj", "down_proj")
+        _ALIASES = {
+            "kv_a": ("fused_qkv_a_proj_with_mqa", "q_a_proj", "kv_a_proj_with_mqa"),
+            "qb": ("q_b_proj",),
+            "kvb": ("kv_b_proj",),
+            "o": ("o_proj",),
+        }
+        _allow_leaves = None
+        if _fam not in (None, "attn", "mlp"):
+            _allow_leaves = set()
+            for tok in _fam.replace("+", ",").split(","):
+                tok = tok.strip()
+                if not tok:
+                    continue
+                _allow_leaves.update(_ALIASES.get(tok, (tok,)))
+            _fam = "leaves"
+
         for module_name, module in self.base_model.named_modules():
+            if _fam is not None:
+                leaf = module_name.split(".")[-1]
+                if _fam == "attn":
+                    if leaf not in _ATTN_SET:
+                        continue
+                elif _fam == "mlp":
+                    if leaf not in _MLP_LEAVES and not isinstance(module, FusedMoE):
+                        continue
+                else:  # explicit leaf allowlist
+                    if leaf not in _allow_leaves:
+                        continue
             # Handle embed_tokens and lm_head before the should_apply_lora gate,
             # since VL models' should_apply_lora patterns only match language
             # model layers and would incorrectly skip these.

@@ -1301,6 +1301,27 @@ class Req(ReqDllmMixin):
             else:
                 self.cache_protected_len = len(self.prefix_indices)
 
+            # [LORA-REQ-MATCH] (debug probe, env SGLANG_LORA_REQ_DIAG=1): the
+            # ACTUAL PD-prefill match site (the match_prefix_for_req diag in
+            # schedule_policy.py never fires in PD prefill — different path).
+            import os as _os
+
+            if _os.environ.get("SGLANG_LORA_REQ_DIAG", "").lower() in (
+                "1",
+                "true",
+                "yes",
+            ):
+                _n = getattr(self.__class__, "_req_diag_n", 0)
+                if _n < 400:
+                    self.__class__._req_diag_n = _n + 1
+                    logger.info(
+                        f"[LORA-REQ-MATCH] rid={getattr(self, 'rid', '?')} "
+                        f"lora_id={getattr(self, 'lora_id', None)} "
+                        f"matched={len(self.prefix_indices)} "
+                        f"prompt={len(token_ids_to_match)} "
+                        f"cache_protected={self.cache_protected_len}"
+                    )
+
             if self.is_dllm():
                 self._update_block_offset_for_dllm()
 

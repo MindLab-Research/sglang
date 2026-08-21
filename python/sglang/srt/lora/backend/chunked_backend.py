@@ -1,5 +1,6 @@
 import dataclasses
 import logging
+import os
 from typing import List, Optional, Tuple
 
 import torch
@@ -22,6 +23,10 @@ from sglang.srt.server_args import ServerArgs
 logger = logging.getLogger(__name__)
 
 MIN_CHUNK_SIZE = 16
+
+# [LORA-CP-DBG] runtime probe: logs every _resolve_batch_info decision
+# (view picked, row counts, segment shapes) — set SGLANG_LORA_CP_DEBUG=1.
+_LORA_CP_DEBUG = bool(os.environ.get("SGLANG_LORA_CP_DEBUG", ""))
 
 
 class ChunkedSgmvLoRABackend(BaseLoRABackend):
@@ -272,6 +277,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         )
 
         row_req: Optional[List[int]] = None
+        real = None
         if dsa_cp and mode == "round-robin-split":
             cum = [0]
             for L in extend_list:
@@ -280,9 +286,14 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
             row_req = []
             for p in range(cp_rank, rows, cp_size):
                 if p >= real:
-                    # Padding tail: attribute to the last request; its rows are
-                    # discarded together with the padding.
-                    row_req.append(bs - 1)
+                    # Padding tail: LoRA must NOT apply a delta here. Pad-row
+                    # activations are garbage-prone; a delta on them can
+                    # produce NaN which then flows into the KV cache pad
+                    # slots — real queries attending those slots get NaN'd
+                    # (observed: layer-N gate NaN on pads only, layer-N+1
+                    # attention output NaN on ALL real rows). Sentinel -1
+                    # excludes the row from every LoRA segment.
+                    row_req.append(-1)
                 else:
                     row_req.append(bisect.bisect_right(cum, p) - 1)
         else:
@@ -320,7 +331,16 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
 
         # Mirror _get_permutation: stable sort by adapter id so tokens group
         # by adapter, then chunk each group (mirror _get_segments_info).
-        row_wi = [req_weight_indices[s] for s in row_req]
+        # Pad rows carry sentinel -1 (see _cp_shard_row_request_ids). Map them
+        # to adapter slot 0 — the BASE slot whose lora_ranks[0] == 0, so every
+        # LoRA kernel early-returns on their segments and padding activations
+        # receive NO delta. (Applying a delta to pad rows NaN'd their KV slots
+        # and real queries attending those slots got poisoned — the CP-LoRA
+        # garbling root cause.) Keeping the segments covering ALL shard rows
+        # preserves the exact segment structure the kernels are validated
+        # against; excluding rows instead (permutation shorter than x) hit an
+        # IMA in the absorbed step kernels (2026-08-21 warmup crash).
+        row_wi = [req_weight_indices[s] if s >= 0 else 0 for s in row_req]
         order = sorted(range(total), key=lambda i: row_wi[i])
         weights_reordered = [row_wi[i] for i in order]
 
@@ -374,15 +394,19 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         covered count != x_rows is an OOB access; on a residual mismatch clamp
         the shard permutation (loud log) instead of going OOB.
         """
+        picked = None
         if pruned is not None:
-            return pruned
-        if self._cp_prepare_ctx is not None:
+            picked = "pruned"
+            result = pruned
+        elif self._cp_prepare_ctx is not None:
             shard = self._cp_shard_batch_info_or_none()
             if shard is not None and self._cp_shard_covered == x_rows:
-                return shard
-            if self._cp_full_covered == x_rows:
-                return self.batch_info
-            if shard is not None:
+                picked = "shard"
+                result = shard
+            elif self._cp_full_covered == x_rows:
+                picked = "full"
+                result = self.batch_info
+            elif shard is not None:
                 logger.warning(
                     "CP LoRA batch shape mismatch: shard=%d full=%d x_rows=%d "
                     "(clamping shard permutation to stay in-bounds)",
@@ -390,9 +414,35 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
                     self._cp_full_covered,
                     x_rows,
                 )
+                picked = "clamp"
                 perm = torch.clamp(shard.permutation, max=max(x_rows - 1, 0))
-                return dataclasses.replace(shard, permutation=perm)
-        return self.batch_info
+                result = dataclasses.replace(shard, permutation=perm)
+            else:
+                picked = "full_silent_mismatch" if self._cp_full_covered != x_rows else "full"
+                result = self.batch_info
+        else:
+            picked = "full_nocp" if self._cp_full_covered != x_rows else "nocp"
+            result = self.batch_info
+        if _LORA_CP_DEBUG:
+            seg_lens = None
+            if result is not None and result.num_segments:
+                try:
+                    indptr = result.seg_indptr[: result.num_segments + 1].tolist()
+                    seg_lens = [indptr[i + 1] - indptr[i] for i in range(len(indptr) - 1)]
+                except Exception:
+                    seg_lens = "?"
+            logger.info(
+                "[LORA-CP-DBG] pick=%s x_rows=%d shard_cov=%d full_cov=%d "
+                "nseg=%s segs=%s max_len=%s",
+                picked,
+                x_rows,
+                self._cp_shard_covered,
+                self._cp_full_covered,
+                getattr(result, "num_segments", None),
+                seg_lens,
+                getattr(result, "max_len", None),
+            )
+        return result
 
 
     @staticmethod

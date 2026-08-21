@@ -40,6 +40,7 @@ def is_kv_b_lora_active(attn_module: DeepseekV2AttentionMLA) -> bool:
 
 def _get_state(
     attn_module: DeepseekV2AttentionMLA,
+    x_rows: Optional[int] = None,
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor, LoRABatchInfo]]:
     if not is_kv_b_lora_active(attn_module):
         return None
@@ -57,6 +58,21 @@ def _get_state(
     sgemm_info = getattr(lora_backend, "_sgemm_info", None)
     if callable(sgemm_info):
         batch_info = sgemm_info()
+
+    # Prefill-CP shard alignment: under prefill-CP the absorbed-MLA
+    # intermediates (q_nope / attn_output / *_out) hold only THIS rank's
+    # shard rows (~1/cp_size of the batch), but ``batch_info`` (built in
+    # prepare_lora_batch, before the model forward splits the tokens) covers
+    # the FULL pre-split rows. The step kernels index x/output rows via
+    # ``permutation``/``seg_indptr`` — feeding them the full view with
+    # shard-sized tensors is an OOB read/write that silently corrupts the
+    # allocations adjacent to the shard tensors (observed as NaN k_pe /
+    # zeroed q_pe and garbled first tokens). Resolve through the backend's
+    # CP-aware view picker so the covered rows match x exactly.
+    if x_rows is not None and sgemm_info is None:
+        resolver = getattr(lora_backend, "_resolve_batch_info", None)
+        if callable(resolver):
+            batch_info = resolver(None, x_rows)
     return attn_module.kv_b_proj.A_buffer, attn_module.kv_b_proj.B_buffer, batch_info
 
 
@@ -75,7 +91,7 @@ def apply_q_correction(
       step A_q : ``(S,H,qk_nope) @ B_kc[slot, h] (qk_nope, rank) -> (S,H,rank)``
       step B_q : ``(S,H,rank)    @ A[slot] (rank, kv_lora_rank)  -> += q_nope_out``
     """
-    state = _get_state(attn_module)
+    state = _get_state(attn_module, q_nope.shape[0])
     if state is None:
         return q_nope_out
     A_buf, B_buf, batch_info = state
@@ -97,7 +113,7 @@ def apply_v_correction(
     ``(S, H*v_head_dim)`` view of the absorbed BMM result; we pass strides
     matching the implicit ``(S, H, v_head_dim)`` layout to step B_v.
     """
-    state = _get_state(attn_module)
+    state = _get_state(attn_module, attn_output.shape[0])
     if state is None:
         return attn_bmm_flat
     A_buf, B_buf, batch_info = state

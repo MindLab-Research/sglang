@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -91,6 +92,9 @@ from sglang.srt.utils.custom_op import register_custom_op
 
 logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
+# [MLA-AUDIT] forensic probe switch (env SGLANG_MLA_AUDIT=1): see the probe
+# block after _split_q_nope_pe in forward — fires only on corrupt rope slices.
+_MLA_AUDIT = bool(os.environ.get("SGLANG_MLA_AUDIT", ""))
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -444,6 +448,54 @@ class DeepseekMLAForwardMixin:
 
         if q_nope is None:
             q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)
+
+        # [MLA-AUDIT] forensic probe (env SGLANG_MLA_AUDIT=1): fires ONLY when
+        # the rope slices are already corrupt at the split point (q_pe ~ 0 or
+        # NaN in q_pe/k_pe) — i.e. the writer is upstream of rotary: q_b_proj
+        # (q) / fused_qkv_a_proj_with_mqa (latent_cache) base+LoRA output.
+        # MUST NOT run during CUDA graph capture: the .item() host syncs below
+        # invalidate the capture stream and crash decode at startup.
+        if _MLA_AUDIT:
+            try:
+                # Never probe during CUDA graph capture: the .item() host
+                # syncs below invalidate the capture stream (decode startup
+                # crash — observed 2026-08-21).
+                from sglang.srt.model_executor.runner import (
+                    get_is_capture_mode as _gcm,
+                )
+
+                if not _gcm():
+                    _qp0 = float(q_pe.abs().max().item())
+                    _kp0 = float(k_pe.abs().max().item())
+                    if (
+                        not (_qp0 > 1e-3)
+                        or torch.isnan(q_pe).any().item()
+                        or torch.isnan(k_pe).any().item()
+                    ):
+                        _qn0 = float(q_nope.abs().max().item())
+                        _lc0 = float(latent_cache.abs().max().item())
+                        _h0 = float(hidden_states.abs().max().item())
+                        import logging as _lg
+
+                        _lg.getLogger(__name__).warning(
+                            "[MLA-AUDIT] layer=%s mode=%s rows=%d "
+                            "q_pe=%.3e k_pe=%.3e q_nope=%.3e latent=%.3e hidden=%.3e "
+                            "q_nan=%s k_nan=%s pos=[%s,%s]",
+                            self.layer_id,
+                            forward_batch.forward_mode,
+                            q_pe.shape[0],
+                            _qp0,
+                            _kp0,
+                            _qn0,
+                            _lc0,
+                            _h0,
+                            torch.isnan(q_pe).any().item(),
+                            torch.isnan(k_pe).any().item(),
+                            int(positions.min().item()) if positions.numel() else -1,
+                            int(positions.max().item()) if positions.numel() else -1,
+                        )
+            except Exception:
+                pass
 
         _kvb_q = None
         if fusion_plan is not None:

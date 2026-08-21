@@ -968,8 +968,9 @@ class LoRAMemoryPool:
             self.uid_to_buffer_id.pop(victim_uid)
             self.eviction_policy.remove(victim_uid)
             self.buffer_id_to_uid[victim_buffer_id] = EMPTY_SLOT
-            logger.debug(
-                f"Evicting LoRA {victim_uid} from buffer slot {victim_buffer_id}."
+            logger.info(
+                f"[LORA-EVICT] victim={victim_uid} slot={victim_buffer_id} "
+                f"pool_full_map_after={self.uid_to_buffer_id}"
             )
             return victim_buffer_id
 
@@ -991,6 +992,45 @@ class LoRAMemoryPool:
                 )
                 self.uid_to_buffer_id[uid] = buffer_id
                 self.buffer_id_to_uid[buffer_id] = uid
+                logger.info(
+                    f"[LORA-ASSIGN] uid={uid} -> slot={buffer_id} "
+                    f"map_now={self.uid_to_buffer_id}"
+                )
+
+        # [LORA-CHECKSUM] (debug probe, env SGLANG_LORA_WEIGHT_CHECKSUM=1):
+        # per-slot weight checksums compared across batches. A change outside a
+        # load/evict/free event means a FORWARD wrote into the weight buffers
+        # (an OOB write from some LoRA kernel) — localizes the corruption batch.
+        import os as _os
+
+        if (
+            _os.environ.get("SGLANG_LORA_WEIGHT_CHECKSUM", "").lower()
+            in ("1", "true", "yes")
+            and self.A_buffer
+        ):
+            try:
+                sums = getattr(self, "_slot_checksums", None)
+                if sums is None:
+                    sums = self._slot_checksums = {}
+                for slot in range(self.max_loras_per_batch):
+                    total = 0.0
+                    for buffers in (
+                        *self.A_buffer.values(),
+                        *self.B_buffer.values(),
+                    ):
+                        for tensor in buffers:
+                            total += tensor[slot].double().sum().item()
+                    prev = sums.get(slot)
+                    if prev is not None and abs(total - prev) > 1e-6 * max(
+                        1.0, abs(prev)
+                    ):
+                        logger.info(
+                            f"[LORA-CHECKSUM] slot={slot} CHANGED "
+                            f"{prev:.6e} -> {total:.6e}"
+                        )
+                    sums[slot] = total
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"[LORA-CHECKSUM] probe failed: {e}")
 
     def _clear_buffer_slot_for_base(self, buffer_id: int) -> None:
         """Make an evicted slot safe for graph-captured base-model replay."""
@@ -1017,6 +1057,7 @@ class LoRAMemoryPool:
         del self.uid_to_buffer_id[uid]
         self.buffer_id_to_uid[buffer_id] = EMPTY_SLOT
         self.eviction_policy.remove(uid)
+        logger.info(f"[LORA-FREE] remove_lora uid={uid} slot={buffer_id}")
         return buffer_id
 
     def free_lora(self, uid: Optional[str]) -> None:
@@ -1037,6 +1078,7 @@ class LoRAMemoryPool:
         buffer_id = self.uid_to_buffer_id.pop(uid, None)
         if buffer_id is None:
             return
+        logger.info(f"[LORA-FREE] free_lora uid={uid} slot={buffer_id}")
         try:
             self.eviction_policy.remove(uid)
         except Exception:

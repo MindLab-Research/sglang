@@ -217,7 +217,14 @@ def _moe_lora_shrink_splitk_kernel(
     # Token routing (same pattern as fused_moe_triton_kernels)
     offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
     offs_token = tl.load(sorted_token_ids_ptr + offs_token_id).to(tl.int64)
-    token_mask = offs_token < num_valid_tokens
+    # The align-block-size buffers keep a worst-case-sized UNINITIALIZED slack
+    # past the real tokens; freed-memory reuse can leave negative values there
+    # (e.g. -1 fills from token_lora_mapping tails). A negative offs_token
+    # passes a plain upper-bound mask and the store below then writes at
+    # c_ptr + offs_token*stride — BEFORE the tensor, corrupting the
+    # neighbouring allocation (observed as NaN activations / garbled LoRA
+    # outputs). Reject the negative range explicitly.
+    token_mask = (offs_token >= 0) & (offs_token < num_valid_tokens)
 
     off_expert = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
     if off_expert == -1:
@@ -663,6 +670,16 @@ def _merged_experts_fused_moe_lora_add_impl(
         # to another pooled tensor / lie past a page -> cudaErrorIllegalInstruction during capture.
         # Keep the full worst-case-allocated buffers so every unmasked read stays in-allocation.
         expert_ids = fused_sanitize_expert_ids(expert_ids, virtual_num_experts)
+        # Defense-in-depth for the uninitialized slack in sorted_token_ids:
+        # negative garbage (freed-memory reuse, e.g. -1 fills) would pass the
+        # upper-bound-only masks in the downstream GEMM kernels and index
+        # BEFORE the destination tensors. Clamp negatives to a large sentinel
+        # that every `offs_token < num_valid_tokens` mask rejects.
+        sorted_token_ids = torch.where(
+            sorted_token_ids < 0,
+            sorted_token_ids.new_full((), 2**30),
+            sorted_token_ids,
+        )
         result = (
             sorted_token_ids,
             expert_ids,
@@ -689,7 +706,19 @@ def _merged_experts_fused_moe_lora_add_impl(
     # topk_ids.shape[0] (the DP-gathered token count under --enable-dp-attention). An
     # under-sized mapping means unmasked OOB reads/writes that surface as a sticky,
     # hard-to-attribute CUDA IMA — fail loudly on the host instead.
-    pass
+    _mapping_numel = token_lora_mapping.numel() if token_lora_mapping is not None else 0
+    if _mapping_numel < topk_ids.shape[0]:
+        import logging as _logging
+
+        _logging.getLogger(__name__).error(
+            "[LORA-MAP-OOB] mapping_numel=%d < topk_rows=%d (deficit=%d) — "
+            "VE kernels will read mapping OOB (random wrong-adapter weights "
+            "= garbled output); mapping head=%s",
+            _mapping_numel,
+            topk_ids.shape[0],
+            topk_ids.shape[0] - _mapping_numel,
+            token_lora_mapping[:8].tolist() if token_lora_mapping is not None else None,
+        )
     intermediate = torch.zeros(
         [topk_ids.shape[0], topk_ids.shape[1], max_lora_rank],
         dtype=hidden_states.dtype,
