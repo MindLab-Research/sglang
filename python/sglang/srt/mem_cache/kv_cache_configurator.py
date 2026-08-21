@@ -1134,6 +1134,48 @@ class KVCacheConfigurator:
             dsa_cp_layer_shard_rank,
             dsa_cp_layer_shard_size,
         ) = get_glm_dsa_cp_layer_shard_info(self)
+
+        # [BRANCH-POOL-RESTORE] The legacy layersplit flag runs the LOCAL pool
+        # (CpLayerSplitKVPool): the only layersplit implementation ever
+        # validated on this cluster (pre-merge). The merge's
+        # LayerSplitDSATokenToKVPool (#29421) deadlocks in warmup NCCL
+        # collectives here in EVERY configuration it can be built in
+        # (2026-08-21: dual-flag and new-flag-only both froze in DeepGEMM
+        # warmup at 77% with GPUs spinning). Old flag takes precedence; the
+        # upstream pool remains reachable for new-flag-only configs.
+        if getattr(self.server_args, "enable_dsa_prefill_cp_layersplit", False):
+            from sglang.srt.mem_cache.cp_layersplit_pool import (
+                build_kv_pool_maybe_layersplit,
+            )
+
+            parallel = get_parallel()
+            return build_kv_pool_maybe_layersplit(
+                server_args=self.server_args,
+                num_layers=self.layer_info.num_effective_layers,
+                attn_cp_size=parallel.attn_cp_size,
+                attn_cp_rank=parallel.attn_cp_rank,
+                inner_pool_cls=DSATokenToKVPool,
+                base_kwargs=dict(
+                    size=max_total_num_tokens,
+                    page_size=self.server_args.page_size,
+                    dtype=self.kv_cache_dtype,
+                    kv_lora_rank=self.model_config.kv_lora_rank,
+                    qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                    layer_num=self.layer_info.num_effective_layers,
+                    device=self.device,
+                    kv_cache_dim=calculate_mla_kv_cache_dim(
+                        model_config=self.model_config,
+                        kv_cache_dtype=self.kv_cache_dtype,
+                        server_args=self.server_args,
+                    ),
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    start_layer=self.layer_info.start_layer,
+                    end_layer=self.layer_info.end_layer,
+                    index_head_dim=get_dsa_index_head_dim(self.model_config.hf_config),
+                ),
+                layer_offset=self.layer_info.start_layer,
+            )
+
         pool_kwargs = {}
         if self.server_args.enable_hisparse and not self.is_draft_worker:
             PoolCls = HiSparseDSATokenToKVPool

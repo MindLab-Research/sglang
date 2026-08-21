@@ -76,6 +76,10 @@ def _chunked_lora_expand_kernel(
     # which starts from row seg_start of x with length seg_len.
     # qkv_id decides which of q,k,v to compute (0: q, 1: k, 2: v)
     w_index = tl.load(weight_indices + pid_s)
+    # [PAD-NO-DELTA] -1 slot = padding segment (CP shard view): skip before
+    # the lora_ranks load (negative index would read OOB).
+    if w_index < 0:
+        return
     cur_rank = tl.load(lora_ranks + w_index)
 
     # If rank is 0, this kernel is a no-op.

@@ -149,6 +149,10 @@ def _step_a_q_kernel(
         return
 
     w_index = tl.load(weight_indices + batch_id)
+    # [PAD-NO-DELTA] -1 slot = padding segment (CP shard view): skip before
+    # the lora_ranks load (negative index would read OOB).
+    if w_index < 0:
+        return
     cur_rank = tl.load(lora_ranks + w_index)
     if cur_rank == 0:
         return
@@ -338,6 +342,10 @@ def _step_b_q_kernel(
         return
 
     w_index = tl.load(weight_indices + batch_id)
+    # [PAD-NO-DELTA] -1 slot = padding segment (CP shard view): skip before
+    # the lora_ranks load (negative index would read OOB).
+    if w_index < 0:
+        return
     cur_rank = tl.load(lora_ranks + w_index)
     if cur_rank == 0:
         return
@@ -525,6 +533,10 @@ def _step_a_v_kernel(
         return
 
     w_index = tl.load(weight_indices + batch_id)
+    # [PAD-NO-DELTA] -1 slot = padding segment (CP shard view): skip before
+    # the lora_ranks load (negative index would read OOB).
+    if w_index < 0:
+        return
     cur_rank = tl.load(lora_ranks + w_index)
     if cur_rank == 0:
         return
@@ -708,6 +720,10 @@ def _step_b_v_kernel(
         return
 
     w_index = tl.load(weight_indices + batch_id)
+    # [PAD-NO-DELTA] -1 slot = padding segment (CP shard view): skip before
+    # the lora_ranks load (negative index would read OOB).
+    if w_index < 0:
+        return
     cur_rank = tl.load(lora_ranks + w_index)
     if cur_rank == 0:
         return

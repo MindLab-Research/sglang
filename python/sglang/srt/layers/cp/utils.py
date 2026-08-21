@@ -57,9 +57,18 @@ def is_glm_dsa_cache_layer_split_enabled(model_runner: "ModelRunner") -> bool:
     """
     from sglang.srt.configs.model_config import is_deepseek_dsa
 
+    # Honor EITHER flag: the legacy --enable-dsa-prefill-cp-layersplit (our
+    # branch, drives the CpLayerSplitKVPool restore path in the configurator)
+    # or the new --enable-dsa-cache-layer-split (upstream pool). Cell sizing
+    # must reflect the sharded per-rank layout either way.
     return (
         not model_runner.is_draft_worker
-        and model_runner.server_args.enable_dsa_cache_layer_split
+        and (
+            model_runner.server_args.enable_dsa_cache_layer_split
+            or getattr(
+                model_runner.server_args, "enable_dsa_prefill_cp_layersplit", False
+            )
+        )
         and model_runner.use_mla_backend
         and is_deepseek_dsa(model_runner.model_config.hf_config)
     )

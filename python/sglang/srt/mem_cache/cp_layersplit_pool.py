@@ -150,16 +150,16 @@ class CpLayerSplitKVPool:
         self, layer_id: int, forward_batch, kind: str
     ) -> None:
         """Broadcast prefix KV for layer_id from owner rank; kind is ``latent`` or ``indexer``."""
-        from sglang.srt.layers.dp_attention import (
-            get_attention_cp_group,
-            get_attention_cp_rank,
-            get_attention_cp_size,
-        )
+        # Migrated off the retired dp_attention accessors (removed by the
+        # v0.5.16 merge, #30653) to the runtime-context pattern — mirrors
+        # dsa_cache_layer_split._init_layer_broadcast_comm.
+        from sglang.srt.runtime_context import get_parallel
         from sglang.srt.model_executor.forward_context import get_req_to_token_pool
 
-        cp_group = get_attention_cp_group()
-        my_rank = get_attention_cp_rank()
-        cp_size = get_attention_cp_size()
+        parallel = get_parallel()
+        cp_group = parallel.attn_cp_group
+        my_rank = cp_group.rank_in_group
+        cp_size = cp_group.world_size
 
         owner_rank = cp_layersplit_owner_rank(
             layer_id, self._num_layers, cp_size, self._layer_offset

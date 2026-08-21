@@ -84,6 +84,10 @@ def _chunked_lora_shrink_kernel(
     # Current block computes sequence with batch_id,
     # which starts from row seg_start of x with length seg_len
     w_index = tl.load(weight_indices + pid_s)
+    # [PAD-NO-DELTA] -1 slot = padding segment (CP shard view): skip before
+    # the lora_ranks load (negative index would read OOB).
+    if w_index < 0:
+        return
     rank = tl.load(lora_ranks + w_index)
 
     # If rank is 0, this kernel becomes a no-op as the output is always trivially correct.
