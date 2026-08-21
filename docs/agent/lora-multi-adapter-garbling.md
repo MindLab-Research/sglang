@@ -157,3 +157,40 @@ SGLANG_MLA_AUDIT。
 1. "组合才坏"的 bug 用**运行时模块族二分**（一个 env，零 adapter 重打包）比读码快一个量级
 2. 逐层 dump 的**行级 NaN 分析**（pad 行 vs 真实行）是定位毒化传播的金标准
 3. 混沌系统里"净-净也发散"是常态——盯 **NaN/零化的质性签名**，别盯数值幅度
+
+## 8. 第四 bug：slot 逐出 churn 毒化在途长请求（2026-08-21 二次结案，commits `37fae98ed7`+`d56db6bea5`）
+
+> §7 修复上线后生产再次出现**中途数字汤**（18:25 事件：输出进行到一半突变成
+> `2.2.0.0.2.2...` 类数字汤 ~500 字符后**自愈**，重试可恢复）。形态与 §7 的
+> 首 token 乱不同。
+
+**对照实验判决**（1102/1104 测试对，case50 LoRA 轮转 L0-L3，唯一变量=slot 数）：
+| | 4-slot | 5-slot |
+|---|---|---|
+| 乱码 | **2 例**（数字汤 + `0\n`×97）| **0 例（50/50）** |
+| LORA-EVICT | 5+ 次 | **0 次** |
+
+**根因链**：`mem_pool._get_available_buffer_slot` 的 **prefer-LoRA-over-base**
+特殊逻辑（952-961 行）在纯 LoRA 流量下把 base 钉死 slot0（chunked prefill 单请求
+成批 → cur_uids 窄 → 其他 LoRA 永远是候选）→ 4 LoRA 挤 3 slot **连环 LRU 互逐**
+→ 在途 350k chunked prefill（5 分钟）的 adapter 被中途换血 → 换血窗口内计算的
+chunk 读到复用 slot 的**另一个 adapter 权重** → KV 毒化 → decode 读到毒化段即出
+数字汤，adapter 重载完成后自愈。日志判据：`LORA-EVICT` 风暴 + 乱码时间窗重合。
+
+**修复**：①删 prefer-LoRA-over-base——纯 LoRA 流量下 base（从不被请求）成为真
+LRU 冷数据被逐一次，4 LoRA 共存 4 slot，零 churn 零显存代价（**生产主修复**）；
+②5-slot 兜底（VE 模式每 slot ~10GB，prefill 12M→9M tokens 才装得下）；
+③PR #31608 移植（fused_moe.py：hooks 活跃时禁 TMA down——TMA 的 expert-sorted
+block-padded 序与 hook route-major 契约不兼容，B300 默认开 TMA）。
+
+**遗留（defense-in-depth）**：逐出仍不检查在途请求引用（refcount）——长 prefill
+不刷新 LRU 时间戳，理论上仍可被逐；生产 4 LoRA 常驻 + 无第 5 者时无触发面。
+
+## 9. HiCache host/file KV 跨 adapter 污染（同日修复，commit `d56db6bea5`）
+
+存储层 hash 链（`get_hash_str`）只掺 token：L0/L1 同 prompt → 文件级 key 完全相同
+→ 一个 adapter 的 host/file KV 被另一个 adapter 直接命中（HiCache on 时的乱码源
+之一）。修复：hash 链根部掺 `extra_key`（lora 身份）——`sha256("sglang-extra-key:"+
+extra_key)` 作 prior_hash，后代页全部按 adapter 分叉；贯通 6 处（utils/radix_cache/
+cache_controller×2/hybrid×2）。验证：全新 prompt 下 L0 暖 100% 自命中、L1 跨
+adapter **0%**（修复前 100% 污染）、输出全净。
