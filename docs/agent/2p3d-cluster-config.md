@@ -271,3 +271,25 @@ dp_attention accessor 迁移到 `get_parallel()`；cell 计价认双 flag。
 - warmup 冻结 DeepGEMM ~77% + GPU 100% = 新池被误建（检查是否误传新 flag
   `--enable-dsa-cache-layer-split` 或误加别名）
 - 健康标志：`KV Cache is allocated. #tokens: 12000000, KV size: ~79GB`
+
+## 9. mol 1P2D 专门脚本与监控（2026-08-21 定版）
+
+**拓扑**：1101 prefill（layersplit 老池 + LoRA 四 adapter）+ 1100/1103 decode。
+
+**脚本**：
+| 脚本 | 用途 |
+|---|---|
+| `/root/start_1p2d_lora.sh`（1101/1100/1103 各一份）| 引擎启动（prefill 带 §8 定版参数；decode 标准 DCP+EAGLE）|
+| `/root/start_mol_1p2d_stack.sh`（1101）| **上层栈一键拉起**：router → gateway → proxy → otelcol（铁律顺序）+ 公网验证；支持 `status`/`router`/`gateway`/`proxy`/`otel` 子命令 |
+| `/root/manage_otelcol.sh`（1101）| otelcol 生命周期 |
+
+**Grafana 面板**：https://ops-grafana.macaron.xin/d/b300-pd-1p3d-glm52/...（B300 PD 1P2D — GLM-5.2-FP8）
+- namespace `b300-pd-1p3d`，4 个抓取目标（prefill .34:30100 / decode .36+.38:30200 / router .34:29003）
+- **重启任何引擎后必须 `bash /root/manage_otelcol.sh restart`**（引擎重启不改 collector 配置但面板可能 nodata——先查 collector 进程）
+- 验证：`curl localhost:18888/metrics | grep sent_metric_points_total` >0 且 failed=0；VM 查询 `sglang:gen_throughput{service.namespace="b300-pd-1p3d"}` 有 series
+
+**排障速查（2026-08-21 乱码战争总结论）**：
+- LoRA 乱码签名 = `output_ids[0]==0`（NaN logits greedy argmax）→ 查 pad 行 delta（12cda1cd60）
+- layersplit 启动 OOM ~5-7GB / allocated≈260.8GB 恒定 → 老池没接上（5b15d05c64）
+- layersplit warmup 冻结 DeepGEMM ~77% + GPU 100% → 新池被误建（勿用新 flag）
+- 判据工具：1101 `/root/exp_battery.py`（乱码电池）、`/root/wd.sh`（节点本地看门狗）
