@@ -41,6 +41,11 @@ fn default_strategy() -> String {
 /// before giving up (and failing the swap).
 const DRAIN_TIMEOUT_SECS: u64 = 1800; // matches 2× HOP_TIMEOUT
 const DRAIN_POLL_INTERVAL_SECS: u64 = 1;
+/// Hard cap for the engine-side load phase (both engines in parallel).
+/// GLM-5.2 LoRAs carry tens of thousands of target-module tensors and the
+/// engines can take many minutes per load; 35min is generous but finite —
+/// without it a hung engine load wedges the deployment in LOADING forever.
+const LOAD_TIMEOUT_SECS: u64 = 2100;
 
 // ---------------------------------------------------------------------------
 // Engine adapter primitives
@@ -85,23 +90,31 @@ async fn load_on_endpoint(
 ) -> bool {
     let url = format!("{}/load_lora_adapter", base.trim_end_matches('/'));
     let body = json!({ "lora_name": name, "lora_path": path });
+    tracing::info!(url = %url, model = %name, "load_lora_adapter request sent (engine loads can take minutes for large LoRAs)");
     let mut builder = client.post(&url).json(&body);
     builder = auth_header(unit, builder);
     match builder.send().await {
         Ok(res) => {
             let status = res.status();
             if !status.is_success() {
+                // Log the engine's response body — it carries success=false
+                // plus error_message, which is the actual reason for the 4xx.
+                let resp_body = res.text().await.unwrap_or_default();
                 tracing::warn!(
                     url = %url,
                     status = %status,
                     model = %name,
+                    path = %path,
+                    resp_body = %resp_body,
                     "load_lora_adapter rejected by engine"
                 );
+            } else {
+                tracing::info!(url = %url, model = %name, "load_lora_adapter accepted");
             }
             status.is_success()
         }
         Err(e) => {
-            tracing::warn!(url = %url, model = %name, error = %e, "load_lora_adapter failed");
+            tracing::warn!(url = %url, model = %name, path = %path, error = %e, "load_lora_adapter failed");
             false
         }
     }
@@ -121,12 +134,15 @@ async fn unload_on_endpoint(
     builder = auth_header(unit, builder);
     match builder.send().await {
         Ok(res) => {
-            let ok = res.status().is_success();
+            let status = res.status();
+            let ok = status.is_success();
             if !ok {
+                let resp_body = res.text().await.unwrap_or_default();
                 tracing::warn!(
                     url = %url,
-                    status = %res.status(),
+                    status = %status,
                     model = %name,
+                    resp_body = %resp_body,
                     "unload_lora_adapter rejected"
                 );
             }
@@ -503,7 +519,7 @@ async fn execute_deploy(
             return Err(format!("drain timeout: {}", rep));
         }
         replaced_path = state.get_deployment(rep).map(|d| d.path);
-        unload_model_on_unit(&target, rep).await;
+        unload_model_on_unit(&target, replaced_path.as_deref().unwrap_or(rep)).await;
         state.remove_deployment(rep);
         state.remove_child_model(&target.id, rep);
     }
@@ -511,15 +527,46 @@ async fn execute_deploy(
 
     // 3. LOADING: decode first (slower), then prefill. Both must succeed.
     //    Remote URL weights are downloaded by each engine node locally.
+    //    Hard timeout: a hung engine load must not wedge the deployment in
+    //    LOADING forever (engines can legitimately take minutes for large
+    //    LoRAs, so the cap is generous — see LOAD_TIMEOUT_SECS).
     if let Some(d) = state.deployments.write().unwrap().get_mut(&req.name) {
         d.state = "LOADING".to_string();
         d.engine_id = Some(target.id.clone());
         d.replaced_model = replaced.clone();
     }
-    if !load_model_on_unit(&target, &req.name, &req.path).await {
+    let load_started = std::time::Instant::now();
+    // Engine-side registration key = path (NOT the control-plane name), so
+    // runtime requests carrying `lora_path` hit the loaded adapter directly
+    // (sglang indexes loaded adapters by the name passed to load_lora_adapter;
+    // PD decode rejects unknown lora_path with "never been loaded").
+    let load_result = tokio::time::timeout(
+        Duration::from_secs(LOAD_TIMEOUT_SECS),
+        load_model_on_unit(&target, &req.path, &req.path),
+    )
+    .await;
+    let load_ok = match load_result {
+        Ok(ok) => ok,
+        Err(_) => {
+            tracing::error!(
+                name = %req.name,
+                engine = %target.id,
+                elapsed_secs = load_started.elapsed().as_secs(),
+                "execute_deploy: load phase timed out — unloading partial load"
+            );
+            // Best-effort cleanup of whatever did load.
+            let _ = unload_model_on_unit(&target, &req.path).await;
+            return Err(format!(
+                "load timed out on {} after {}s",
+                target.id,
+                load_started.elapsed().as_secs()
+            ));
+        }
+    };
+    if !load_ok {
         // Rollback: try to restore the replacee we just unloaded.
         if let (Some(rep), Some(path)) = (&replaced, &replaced_path) {
-            if load_model_on_unit(&target, rep, path).await {
+            if load_model_on_unit(&target, path, path).await {
                 state.set_deployment(ModelDeployment {
                     name: rep.clone(),
                     model_type: "lora".to_string(),
@@ -532,10 +579,32 @@ async fn execute_deploy(
                 state.add_child_model(&target.id, rep, "lora");
             }
         }
+        // The load partially succeeded on one engine at most — clean up so
+        // the engine does not keep a half-deployed adapter.
+        let _ = unload_model_on_unit(&target, &req.path).await;
         return Err(format!(
             "load failed on {}; check weights exist on all cluster nodes",
             target.id
         ));
+    }
+
+    // 3b. The deployment may have been DELETEd while we were loading (the
+    // delete path unloads what it can). If so, do NOT resurrect it — undo
+    // the load we just performed and report cancellation.
+    let still_loading = {
+        let deps = state.deployments.read().unwrap();
+        deps.get(&req.name)
+            .map(|d| d.state == "LOADING" && d.engine_id.as_deref() == Some(target.id.as_str()))
+            .unwrap_or(false)
+    };
+    if !still_loading {
+        tracing::warn!(
+            name = %req.name,
+            engine = %target.id,
+            "execute_deploy: deployment was removed/mutated during load — rolling back"
+        );
+        let _ = unload_model_on_unit(&target, &req.path).await;
+        return Err("deployment cancelled during load".to_string());
     }
 
     // 4. ACTIVE: the new model is now routable.
@@ -552,23 +621,36 @@ pub async fn delete_model(
         return (StatusCode::NOT_FOUND, Json(json!({ "error": "not_deployed" })));
     };
 
-    // Drain first, then unload on the deployment's engine.
-    state.mark_model_draining(&name);
-    let drained = wait_inflight_zero(&state, &name).await;
-    if !drained {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": "drain_timeout" })),
-        );
+    tracing::info!(model = %name, state = %dep.state, "delete_model: start");
+
+    // Fast paths: a deployment that never reached ACTIVE cannot carry
+    // traffic, so there is nothing to drain — waiting DRAIN_TIMEOUT_SECS
+    // here is what used to hang DELETE for half an hour.
+    let needs_drain = !matches!(dep.state.as_str(), "QUEUED" | "LOADING" | "FAILED");
+    if needs_drain {
+        // Drain first, then unload on the deployment's engine.
+        state.mark_model_draining(&name);
+        let drained = wait_inflight_zero(&state, &name).await;
+        if !drained {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "drain_timeout" })),
+            );
+        }
+    } else {
+        state.mark_model_draining(&name);
     }
 
+    // Unload even for FAILED/LOADING states: the engine may hold a partial
+    // load (unload of a non-existent adapter is a harmless 400).
     if let Some(engine_id) = &dep.engine_id {
         let children = state.list_children();
         if let Some(unit) = children.iter().find(|u| &u.id == engine_id) {
-            unload_model_on_unit(unit, &name).await;
+            unload_model_on_unit(unit, &dep.path).await;
         }
     }
     state.remove_deployment(&name);
+    tracing::info!(model = %name, "delete_model: removed");
     (
         StatusCode::OK,
         Json(json!({ "status": "removed", "model": name })),

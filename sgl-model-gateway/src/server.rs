@@ -699,6 +699,7 @@ pub fn build_app(
     max_payload_size: usize,
     request_id_headers: Vec<String>,
     cors_allowed_origins: Vec<String>,
+    jobs_state: Arc<crate::control_plane::jobs::JobManager>,
 ) -> Router {
     let protected_routes = Router::new()
         .route("/generate", post(generate))
@@ -815,6 +816,30 @@ pub fn build_app(
     let admin_routes = apply_control_plane_auth(admin_routes);
     let worker_routes = apply_control_plane_auth(worker_routes);
 
+    // Training job submission / polling / download endpoints (control plane
+    // auth like admin routes; execution goes through our own /generate).
+    let jobs_routes = Router::new()
+        .route(
+            "/v1/control/jobs",
+            post(crate::control_plane::jobs::submit_jobs)
+                .get(crate::control_plane::jobs::list_jobs),
+        )
+        .route(
+            "/v1/control/jobs/{job_id}",
+            get(crate::control_plane::jobs::get_job_status)
+                .delete(crate::control_plane::jobs::delete_job),
+        )
+        .route(
+            "/v1/control/jobs/{job_id}/result",
+            get(crate::control_plane::jobs::get_job_result),
+        )
+        .route(
+            "/v1/control/jobs/{job_id}/tasks/{task_id}/result",
+            get(crate::control_plane::jobs::get_task_result),
+        )
+        .with_state(jobs_state);
+    let jobs_routes = apply_control_plane_auth(jobs_routes);
+
     // HA management routes
     let mesh_routes = Router::new()
         .route("/ha/status", get(get_cluster_status))
@@ -862,6 +887,7 @@ pub fn build_app(
         .merge(admin_routes)
         .merge(worker_routes)
         .merge(mesh_routes)
+        .merge(jobs_routes)
         .merge(control_plane_routes)
         .layer(axum::extract::DefaultBodyLimit::max(max_payload_size))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
@@ -1260,6 +1286,34 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         api_key: config.router_config.api_key.clone(),
     };
 
+    // Training job manager: executes submitted jobs against this router's own
+    // /generate endpoint (token ids + logprobs). Concurrency / storage /
+    // timeout are env-tunable for deployment flexibility.
+    let jobs_self_url = std::env::var("SMG_JOBS_SELF_URL")
+        .unwrap_or_else(|_| format!("http://127.0.0.1:{}", config.port));
+    let jobs_data_dir =
+        std::env::var("SMG_JOBS_DIR").unwrap_or_else(|_| "./smg-jobs".to_string());
+    let jobs_concurrency = std::env::var("SMG_JOBS_MAX_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(64);
+    let jobs_timeout = std::env::var("SMG_JOBS_REQUEST_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(3600);
+    let jobs_state = crate::control_plane::jobs::JobManager::new(
+        jobs_self_url,
+        auth_config.api_key.clone(),
+        std::path::PathBuf::from(jobs_data_dir),
+        jobs_concurrency,
+        jobs_timeout,
+    );
+    jobs_state.recover_from_disk();
+    info!(
+        "Training job manager ready (concurrency={}, dir from SMG_JOBS_DIR, timeout={}s)",
+        jobs_concurrency, jobs_timeout
+    );
+
     // Initialize control plane authentication if configured
     let control_plane_auth_state =
         crate::auth::ControlPlaneAuthState::try_init(config.control_plane_auth.as_ref()).await;
@@ -1271,6 +1325,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.max_payload_size,
         request_id_headers,
         config.router_config.cors_allowed_origins.clone(),
+        jobs_state,
     );
 
     // TcpListener::bind accepts &str and handles IPv4/IPv6 via ToSocketAddrs

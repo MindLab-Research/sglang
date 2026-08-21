@@ -186,6 +186,14 @@ async fn create_test_app_with_wasm() -> (axum::Router, Arc<AppContext>, TempDir)
 
     let request_id_headers = vec!["x-request-id".to_string(), "x-correlation-id".to_string()];
 
+    let jobs_state = smg::control_plane::jobs::JobManager::new(
+        "http://127.0.0.1:1".to_string(),
+        None,
+        std::env::temp_dir().join("smg-test-jobs-wasm"),
+        4,
+        60,
+    );
+
     let app = build_app(
         app_state,
         smg::middleware::AuthConfig { api_key: None },
@@ -193,6 +201,7 @@ async fn create_test_app_with_wasm() -> (axum::Router, Arc<AppContext>, TempDir)
         256 * 1024 * 1024,
         request_id_headers,
         vec![], // cors_allowed_origins
+        jobs_state,
     );
 
     (app, app_context, temp_dir)

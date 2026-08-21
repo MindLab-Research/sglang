@@ -110,6 +110,15 @@ pub fn create_test_app(
         api_key: router_config.api_key.clone(),
     };
 
+    // Jobs manager for tests (self URL points nowhere; jobs are not exercised)
+    let jobs_state = smg::control_plane::jobs::JobManager::new(
+        "http://127.0.0.1:1".to_string(),
+        None,
+        std::env::temp_dir().join("smg-test-jobs"),
+        4,
+        60,
+    );
+
     // Use the actual server's build_app function
     build_app(
         app_state,
@@ -118,6 +127,7 @@ pub fn create_test_app(
         router_config.max_payload_size,
         request_id_headers,
         router_config.cors_allowed_origins.clone(),
+        jobs_state,
     )
 }
 
@@ -156,6 +166,15 @@ pub fn create_test_app_with_context(
         api_key: router_config.api_key.clone(),
     };
 
+    // Jobs manager for tests (self URL points nowhere; jobs are not exercised)
+    let jobs_state = smg::control_plane::jobs::JobManager::new(
+        "http://127.0.0.1:1".to_string(),
+        None,
+        std::env::temp_dir().join("smg-test-jobs"),
+        4,
+        60,
+    );
+
     // Use the actual server's build_app function
     build_app(
         app_state,
@@ -164,6 +183,7 @@ pub fn create_test_app_with_context(
         router_config.max_payload_size,
         request_id_headers,
         router_config.cors_allowed_origins.clone(),
+        jobs_state,
     )
 }
 

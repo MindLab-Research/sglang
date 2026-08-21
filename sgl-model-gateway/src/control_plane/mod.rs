@@ -25,6 +25,7 @@ use tokio::time;
 use crate::core::WorkerRegistry;
 
 pub mod deploy;
+pub mod jobs;
 
 // ---------------------------------------------------------------------------
 // Data structures
