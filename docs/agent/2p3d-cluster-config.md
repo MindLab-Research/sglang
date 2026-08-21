@@ -251,3 +251,23 @@ curl -X POST http://10.0.58.38:30200/flush_cache
 - 验证工具（1101）：lora_test.sh / lora_fast_test.sh / lora_gauntlet.sh / lora_stress.sh / lora_prod_shape_test.sh
 - 1102/1104 测试对：sglang_venv + 当前代码（5/5 参数，供后续根因复现用）
 
+
+## 8. prefill layersplit 最终配置（2026-08-21 事故后定版）
+
+merge v0.5.16 后 layersplit 需要三处代码修复（commit `5b15d05c64`）：configurator 老 flag
+优先接回 **CpLayerSplitKVPool**（merge 后老池入口成死代码、新池 LayerSplitDSATokenToKVPool
+在本拓扑 warmup 必死锁——GPU 100% 空转、DeepGEMM 冻结 77%）；老池 import 从废除的
+dp_attention accessor 迁移到 `get_parallel()`；cell 计价认双 flag。
+
+**prefill 启动参数定版**（相对 §3.1 的差异）：
+- `--enable-dsa-prefill-cp-layersplit`（老 flag，**不要**换成新 flag）
+- `--mem-fraction-static 0.90 --max-total-tokens 12000000`（12M 封顶必须显式带上：
+  cell 计价修复后 profiled 值会偏大，封顶回历史值 12M）
+- env `SGLANG_ENABLE_DSA_PREFILL_CP_LAYERSPLIT_UNEVEN=1`（78%8≠0 必需）
+
+**排障判据**：
+- 启动 OOM "Tried to allocate ~5-7GB"、PyTorch allocated ≈260.8GB 恒定 = 老池没接上
+  （78 层全量分配），检查 5b15d05c64 是否部署
+- warmup 冻结 DeepGEMM ~77% + GPU 100% = 新池被误建（检查是否误传新 flag
+  `--enable-dsa-cache-layer-split` 或误加别名）
+- 健康标志：`KV Cache is allocated. #tokens: 12000000, KV size: ~79GB`
