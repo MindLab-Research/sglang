@@ -105,3 +105,55 @@ RadixKey.extra_key 并在写回时保留命名空间），之后可重新启用�
 3. "干净"的验证要覆盖真实流量形态（chat 模板/流式/thinking/多轮）——只测 /generate
    短 prompt 会漏掉整类 bug
 4. 随机性好坏 = 怀疑 KV 分配位置/host 层；确定性好坏 = 怀疑代码路径
+
+## 7. 第三 bug（真根因）：prefill-CP pad 行被施加 LoRA delta → pad KV NaN 毒化真实行（2026-08-21 结案，commit `12cda1cd60`）
+
+> §1-2（f070d3d466）只修了驱逐场景；§6 禁 HiCache 后**随机乱码仍在**（filler prompt 复现率
+> 75-100%，topic 5-50% 波动）。本节是 CP×LoRA 残留乱码的完整破案链。
+
+**症状矩阵**（定位的路标）：
+- base 永远干净（0/32 × 多轮）；LoRA + **CP off** 干净（32/32）；LoRA + **CP on** 乱
+  （13-31/32）→ bug 在 CP×LoRA 组合，不在任何一方单独
+- 首 token 必乱（`output_ids[0]==0` = NaN logits greedy argmax），logprob=None
+- 随机/传染表象 = allocator 复用决定 pad 行激活是否被 delta 打成 NaN + 哪些 rank 带 pad
+
+**证据链**（全部可复现）：
+1. 逐层 dump（--debug-tensor-dump）：乱码 pass 中 layer-7 MoE gate **NaN 仅在 gather 后
+   32 行的 pad 行 [23,27,31]**（29 真实 token 对齐到 32）；**layer-8 attention 输出 4 真实
+   行全 NaN** —— NaN 经 KV pad 槽进入下层 attention 的真实 query。
+2. MLA-AUDIT 探针（forward_mla.py，SGLANG_MLA_AUDIT=1）：kv_a 单臂干净跑也有 SWA 层
+   （46-77）pad 行 NaN（128 次，无害）；kv_a+o 组合 audit 暴涨至 7821 且 hidden=NaN 从
+   layer 1 起。
+3. 模块族二分（SGLANG_LORA_FAMILY，lora_manager.py）：kv_a/qb/o/kvb 四单臂全净；两两
+   组合中 **kv_a+o = 13/32 乱**（最小犯罪组合），kv_a+qb / kv_a+kvb 净。
+4. 离线 kernel 探针（probe1-8）：csgmv / kv_b absorbed（Q/V 修正）/ VE MoE delta 在生产
+   形状下全部数值正确、canary 无 OOB —— kernel 数学清白，排除了"写坏邻居"假说。
+
+**根因**：round-robin CP 把 batch pad 到 cp_size 对齐；`_cp_shard_row_request_ids` 把
+**pad 行归属给最后一个请求** → shard 视图的 LoRA segments 对 padding 激活施加完整 adapter
+delta → pad 行 KV 槽 NaN → 下层真实 query attend 到 NaN pad key → 整个真实 shard NaN →
+logits NaN → argmax=0。base 干净（无 delta）、CP off 干净（无 padding）、单臂多为干净
+（组合决定 pad 激活数值是否越过 NaN 界）。
+
+**修复（chunked_backend.py）**：pad 行保留 -1 哨兵并映射到 **adapter slot 0（base 槽）**——
+`lora_ranks[0]==0` 使所有 LoRA kernel 对其 segments 早退 no-op，slot 0 权重恒零双保险；
+**segments 保持覆盖全行**（与验证过的结构一致）。
+⚠️ 第一版把 pad 行**排除**出 segments（permutation 短于 x）→ warmup 即 IMA（absorbed
+step kernels 未验证过该结构）→ 已回退。教训：**改 segment 结构必须保持 covered==x_rows
+不变式**。
+
+**同 commit 的伴随修复**：deepseek_mla_correction.py 的 `_get_state` 改走
+`_resolve_batch_info(x_rows)`（absorbed kv_b 修正此前拿 full 视图路由 shard 张量）；
+virtual_experts.py shrink kernel 拒绝负 offs_token + routing slack 负值钳哨兵。
+
+**验证**（1101/1100，完整 L0 + CP on + 生产 flags）：电池（12 filler + 20 topic）×3 轮
+**0/96 乱码**；MLA-AUDIT 计数 **0**（乱码时 7821）。
+
+**判据工具**：1101 `/root/exp_battery.py`（乱码签名 ids[0]==0）、`/root/analyze_divergence.py`
++ `--debug-tensor-dump-output-folder`（逐层 NaN 定位）、SGLANG_LORA_FAMILY 二分、
+SGLANG_MLA_AUDIT。
+
+**方法论**：
+1. "组合才坏"的 bug 用**运行时模块族二分**（一个 env，零 adapter 重打包）比读码快一个量级
+2. 逐层 dump 的**行级 NaN 分析**（pad 行 vs 真实行）是定位毒化传播的金标准
+3. 混沌系统里"净-净也发散"是常态——盯 **NaN/零化的质性签名**，别盯数值幅度
