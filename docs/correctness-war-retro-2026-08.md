@@ -33,6 +33,9 @@ draft 虚拟 id 域错配（`9db63a6abb`/`371a991947`）、MoL 多适配器乱�
 - **cuda graph**：将一步计算录制后整段重放，要求形状和编号固定，填错位置导致
   静默数据错乱。
 - **radix / HiCache**：前缀树缓存 + 磁盘分层缓存，复用脏数据是错误放大器。
+- **精度体系**：主模型权重 FP8（E4M3FNUZ），KV cache FP8 E4M3（group 128 逐组
+  量化），Attention Q/K/V 激活 FP8，P@KV tl.dot FP8×FP8→FP32 累加；**LoRA 权重
+  保持 BF16**（保微调精度）。这个精度差异在 §4.1 的 NaN 机制中是关键。
 
 ---
 
@@ -83,7 +86,7 @@ adapter 名字，不同租户用不同适配器发相同开头会共享 KV Cache
 修复：缓存键从根上掺入 adapter 名字。
 
 **缺陷 3：CP pad 行被施加 LoRA delta → NaN 毒化**（`12cda1cd60`）。此缺陷的定位
-过程使用了两层二分组合实验，详见 §3.2。
+过程使用了两层二分组合实验，根因分析见 §4.1。
 
 **缺陷 4：槽位逐出 churn 毒化在途长请求**（`37fae98ed7`）。逐出策略偏向"保住 LoRA、
 牺牲 base"，导致 35 万字长请求做到一半适配器被换。对照实验：4 槽配置乱 2 次、
@@ -93,14 +96,13 @@ adapter 名字，不同租户用不同适配器发相同开头会共享 KV Cache
 prefill 启动脚本缺少 `--lora-use-virtual-experts` 参数，走了未加固的 classic
 kernel 路径。**对照实验前必须逐条 diff 两边启动参数。**
 
-### 3.2 CP × LoRA：两层二分组合实验（8 月 21 日）
+### 3.2 CP × LoRA 两层二分组合实验（8 月 21 日）
 
-此段是整个排查中方法论最严谨的部分，示范了如何用两层二分组合实验将模糊的
-首 token 乱码定位到具体的两层 LoRA 计算组合。
+此段示范了如何用两层二分组合实验将模糊的首 token 乱码定位到具体的两层 LoRA
+计算组合。根因与修复见 §4.1。
 
-#### 3.2.1 第一层二分：CP × LoRA 2×2 组合
-
-将 CP 和 LoRA 两个开关做笛卡尔积，四种组合各跑一轮（相同请求、权重、温度）：
+**第一层二分：CP × LoRA 2×2 组合。** 将 CP 和 LoRA 两个开关做笛卡尔积，四种
+组合各跑一轮（相同请求、权重、温度）：
 
 | 组合 | CP | LoRA | 结果 |
 |---|---|---|---|
@@ -112,11 +114,9 @@ kernel 路径。**对照实验前必须逐条 diff 两边启动参数。**
 只有第四种乱码。此结果排除了所有单因素假设：不是 CP 本身缺陷，不是 LoRA 本身
 缺陷，而是两者的组合交互。问题出在两个子系统的接缝上。
 
-#### 3.2.2 第二层二分：LoRA 模块族组合
-
-CP×LoRA 定罪后，需进一步定位是 LoRA 的哪些模块与 CP 组合出问题。使用运行时
-模块族二分工具（`SGLANG_LORA_FAMILY` 环境变量），无需重新打包 adapter 权重，
-一个 env 切换即可选择只对哪些模块族施加 LoRA delta。
+**第二层二分：LoRA 模块族组合。** CP×LoRA 定罪后，需进一步定位是 LoRA 的哪些
+模块与 CP 组合出问题。使用运行时模块族二分工具（`SGLANG_LORA_FAMILY` 环境变量），
+无需重新打包 adapter 权重，一个 env 切换即可选择只对哪些模块族施加 LoRA delta。
 
 四组单臂（kv_a / q_b / o_proj / kv_b）各自干净。两两组合：
 
@@ -126,77 +126,9 @@ CP×LoRA 定罪后，需进一步定位是 LoRA 的哪些模块与 CP 组合出�
 | kv_a + q_b | 干净 |
 | kv_a + kv_b | 干净 |
 
-**kv_a + o_proj 是最小犯罪组合**——单独均不坏，合在一起才坏。原理：
-
-- **kv_a**（K/V 投影）写出 K、V 存入 KV Cache，包括 pad 行的 K/V 槽。若 pad 行被
-  施加 LoRA delta，delta 作用于 pad 行的垃圾激活（freed-memory 残留，量级 ~1e-9），
-  浮点运算后可能产生 NaN，写入 pad 行的 KV 槽。
-- **o_proj**（输出投影）将 attention 输出写入 hidden state。若 K/V 含 NaN（来自
-  kv_a 写的 pad 行槽），attention 输出 `softmax(Q@K^T)@V` 即为 NaN，o_proj 将 NaN
-  传播到下一层 hidden。
-- 单独 kv_a：NaN 写入 K/V 槽，但 o_proj 无 delta 时 NaN 可能被残差连接稀释，
-  不一定稳定传播。
-- 单独 o_proj：K/V 干净，attention 输出有限，o_proj delta 作用于有限值不产生 NaN。
-- **只有 kv_a + o_proj 同时有 delta**：kv_a 产生 NaN 源，o_proj 稳定传播到 hidden，
-  下一层全 NaN → logits NaN → argmax=0 → `!`+数字汤。
-
-#### 3.2.3 根因：pad 行被施加 LoRA delta → NaN 毒化真实行
-
-根因分三步：
-
-**第一步：CP 产生 pad 行。** CP round-robin 将 batch 切成 cp_size=8 段，token 数
-非整除时补齐：
-
-```
-N_real = 29,  cp_size = 8
-N_pad  = cp_size - (N_real % cp_size) = 8 - 5 = 3
-N_batch = N_real + N_pad = 32   （pad 行 = [29, 30, 31]）
-```
-
-**第二步：pad 行被归属给最后一个请求，施加完整 LoRA delta。**
-`_cp_shard_row_request_ids` 将 pad 行归属给最后一个请求（而非丢弃），shard 视图的
-LoRA segments 对 pad 行施加完整 adapter delta。pad 行激活为 freed-memory 残留
-（~1e-9），delta 作用后产生 NaN，写入 pad 行的 KV 槽：
-
-```
-delta_output = W_down @ activation(~1e-9) @ W_up  →  inf/nan
-```
-
-**第三步：NaN 经 KV 传播到真实行。** pad 行与真实行在同一 attention 的 KV 中。
-下一层真实 query 计算 `Q@K^T` 时，K 含 pad 行的 NaN：
-
-```
-scores = Q @ K^T          # K 的 pad 行为 NaN → scores 对应列 = NaN
-attn   = softmax(scores)   # NaN 传播 → attn = NaN
-output = attn @ V          # V 的 pad 行也为 NaN → output = NaN
-hidden  = hidden + o_proj(output)   # NaN 进入 hidden
-```
-
-逐层 dump 证据（`--debug-tensor-dump`）：
-
-- layer-7 MoE gate：NaN 仅在 gather 后 32 行的 pad 行 [23, 27, 31]；
-- layer-8 attention 输出：4 个真实行全 NaN——NaN 从 pad 行 KV 槽经 attention 传播
-  到所有真实行；
-- logits：全 NaN → `argmax(NaN) = 0` → token id 0 → `!`+数字汤。
-
-MLA-AUDIT 探针（`SGLANG_MLA_AUDIT=1`）确认：kv_a+o 组合下 audit 计数 7821
-（正常为 0），hidden=NaN 从 layer 1 起出现。
-
-**随机性来源**：pad 行激活为 freed-memory 残留，内容取决于分配器复用了哪块内存，
-因此同一请求重放有时 NaN 有时不 NaN，复现率 13-31/32 波动。
-
-#### 3.2.4 修复
-
-修复（`chunked_backend.py`，commit `12cda1cd60`）：pad 行保留 -1 哨兵，映射到
-adapter slot 0（base 槽，`lora_ranks[0]==0`，权重恒零）。所有 LoRA kernel 对
-rank-0 segment 早退 no-op，pad 行收到零 delta，KV 槽为 base 权重算出的有限值。
-segments 保持覆盖全行（`covered == x_rows` 不变量）。
-
-第一版尝试将 pad 行排除出 segments（permutation 短于 x），warmup 即 IMA
-（absorbed step kernels 未验证过该结构），回退为 slot-0 映射。
-
-验收（1101/1100 测试对，完整 L0 + CP on + 生产 flags）：电池测试（12 filler +
-20 topic）×3 轮 0/96 乱码，MLA-AUDIT 计数 0。
+**kv_a + o_proj 是最小犯罪组合**——单独均不坏，合在一起才坏。不是某一层 LoRA
+坏了，是 kv_a 和 o_proj 这两层 LoRA delta 同时施加在 pad 行上时才产生 NaN 并传播
+到真实行。具体机制见 §4.1。
 
 ### 3.3 draft 崩溃与 accept 断崖（8 月 19-20 日）
 
@@ -239,17 +171,145 @@ draft 线修完后崩溃停止，accept 回到健康区间，但乱码仍在。�
 （0.37MB/s）叠加取证代理强制注入 top-5 logprobs（载荷放大 3-5 倍）所致，引擎
 吞吐正常。**判断"变慢"须区分计算延迟与传输延迟。**
 
-### 3.5 DCP 双缺陷定位（8 月 22 日下午）
+### 3.5 DCP 定罪与并行调查（8 月 22 日下午）
 
 DCP 定罪后，五个并行调查 agent 分别分析注意力元数据生命周期、Triton kernel
 数学、KV 传输与页归属、索引构建链路、git 历史考古，三路独立收敛到索引器周边的
-两个缺陷。
+两个缺陷。根因分析见 §4.2-4.4。
 
 ---
 
 ## 四、根因分析
 
-### 4.1 缺陷 A：index_k 全域 owner 换算缺失（主因）
+### 4.1 CP × LoRA：pad 行 NaN 毒化（`12cda1cd60`）
+
+#### 4.1.1 触发条件：CP 产生 pad 行
+
+CP round-robin 将 batch 切成 cp_size=8 段，token 数非整除时补齐：
+
+```
+N_real = 29,  cp_size = 8
+N_pad  = cp_size - (N_real % cp_size) = 8 - 5 = 3
+N_batch = N_real + N_pad = 32   （pad 行 = [29, 30, 31]）
+```
+
+这些 pad 行是假数据，本不该参与任何计算。
+
+#### 4.1.2 pad 行被归属给最后一个请求
+
+`_cp_shard_row_request_ids` 将 pad 行归属给最后一个请求（而非丢弃），shard 视图的
+LoRA segments 对 pad 行施加完整 adapter delta。pad 行激活为 freed-memory 残留
+（量级 ~1e-9），delta 作用后产生 NaN，写入 pad 行的 KV 槽。
+
+#### 4.1.3 为什么 base 不产生 NaN，而 LoRA delta 会
+
+这是整个根因中最关键的一环，涉及精度体系的差异。
+
+**base 路径不产生 NaN，有两个原因：**
+
+1. **base 不施加 delta**——pad 行只走 base 权重路径，零额外计算，没有 delta 作用于
+   垃圾激活的环节。
+2. **base 权重是 FP8 E4M3FNUZ**——FNUZ = Finite, No NaN, Unsigned Zero，这个格式
+   **没有 NaN 编码位**，溢出直接饱和到 ±448，永远不产生 NaN。即使 base 路径吃到
+   垃圾激活，输出也是有限值（可能错，但不是 NaN）。
+
+**LoRA delta 路径会产生 NaN，因为：**
+
+LoRA delta 的计算链路（`chunked_sgmv_expand.py`）：
+
+```python
+# line 120: 累加用 FP32
+partial_sum = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+# line 134: FP32 累加 BF16 dot（LoRA 权重是 BF16）
+partial_sum += tl.dot(x_tile, w_tile)
+
+# line 141: 缩放后转回 x.dtype
+partial_sum = partial_sum.to(x.dtype.element_ty)
+
+# line 149: delta 加到 base_output 上（in-place）
+partial_sum += tl.load(output_ptr, ...)     # base_output + delta
+```
+
+| 路径 | 权重 dtype | 累加精度 | 能否产生 NaN |
+|---|---|---|---|
+| base | FP8 E4M3FNUZ | FP32→饱和到 FP8 FNUZ | **否**（FNUZ 无 NaN 位，溢出饱和） |
+| LoRA delta | BF16 | FP32→转回 x.dtype | **是**（FP32/BF16 有 NaN 位） |
+
+关键差异：**FP8 E4M3FNUZ 没有 NaN 编码位（溢出饱和），而 BF16 和 FP32 都有 NaN
+编码位。** LoRA delta 累加在 FP32（line 120），权重是 BF16，两者都能表示 NaN/inf。
+当垃圾激活包含非有限残留（freed-memory 中上一任计算的 inf/NaN），FP32 累加会
+传播它：
+
+```
+delta = W_b @ (W_a @ NaN_garbage)    # FP32 累加
+     = W_b @ NaN
+     = NaN                             # NaN 传播
+base_output + NaN = NaN                # line 149，KV 槽被污染
+```
+
+而 base 路径即使吃到同样的 NaN 残留，FP8 E4M3FNUZ 会把 NaN **饱和成有限值**
+（FNUZ 无 NaN 编码），所以 base 的 KV 槽不会变 NaN。
+
+**注意**：~1e-9 本身（小有限值）在 BF16/FP32 matmul 里不会产生 NaN（`1e-9 × weight`
+是小有限值）。NaN 的真正来源是 freed-memory 残留中的**非有限值**（上一任计算留下
+的 inf/NaN），BF16/FP32 保留它，FP8 FNUZ 饱和它。~1e-9 是典型量级，但实际内容
+取决于分配器复用了哪块内存。
+
+#### 4.1.4 为什么最小犯罪组合是 kv_a + o_proj
+
+模块族二分（§3.2）发现 kv_a + o_proj 是最小犯罪组合，单独均不坏。原理：
+
+- **kv_a**（K/V 投影）写出 K、V 存入 KV Cache，包括 pad 行的 K/V 槽。若 pad 行被
+  施加 LoRA delta，delta 作用于 pad 行的垃圾激活，产生 NaN 写入 pad 行的 KV 槽。
+- **o_proj**（输出投影）将 attention 输出写入 hidden state。若 K/V 含 NaN（来自
+  kv_a 写的 pad 行槽），attention 输出 `softmax(Q@K^T)@V` 即为 NaN，o_proj 将 NaN
+  传播到下一层 hidden。
+- 单独 kv_a：NaN 写入 K/V 槽，但 o_proj 无 delta 时 NaN 可能被残差连接稀释，
+  不一定稳定传播。
+- 单独 o_proj：K/V 干净，attention 输出有限，o_proj delta 作用于有限值不产生 NaN。
+- **只有 kv_a + o_proj 同时有 delta**：kv_a 产生 NaN 源（pad 行 K/V），o_proj 稳定
+  传播到 hidden，下一层全 NaN → logits NaN → argmax=0 → `!`+数字汤。
+
+#### 4.1.5 NaN 传播链与逐层 dump 证据
+
+pad 行与真实行在同一 attention 的 KV 中。下一层真实 query 计算 `Q@K^T` 时，K 含
+pad 行的 NaN：
+
+```
+scores = Q @ K^T          # K 的 pad 行为 NaN → scores 对应列 = NaN
+attn   = softmax(scores)   # NaN 传播 → attn = NaN
+output = attn @ V          # V 的 pad 行也为 NaN → output = NaN
+hidden  = hidden + o_proj(output)   # NaN 进入 hidden
+```
+
+逐层 dump 证据（`--debug-tensor-dump`）：
+
+- layer-7 MoE gate：NaN 仅在 gather 后 32 行的 pad 行 [23, 27, 31]；
+- layer-8 attention 输出：4 个真实行全 NaN——NaN 从 pad 行 KV 槽经 attention 传播
+  到所有真实行；
+- logits：全 NaN → `argmax(NaN) = 0` → token id 0 → `!`+数字汤。
+
+MLA-AUDIT 探针（`SGLANG_MLA_AUDIT=1`）确认：kv_a+o 组合下 audit 计数 7821
+（正常为 0），hidden=NaN 从 layer 1 起出现。
+
+**随机性来源**：pad 行激活为 freed-memory 残留，内容取决于分配器复用了哪块内存，
+因此同一请求重放有时 NaN 有时不 NaN，复现率 13-31/32 波动。
+
+#### 4.1.6 修复
+
+修复（`chunked_backend.py`，commit `12cda1cd60`）：pad 行保留 -1 哨兵，映射到
+adapter slot 0（base 槽，`lora_ranks[0]==0`，权重恒零）。所有 LoRA kernel 对
+rank-0 segment 早退 no-op，pad 行收到零 delta，KV 槽为 base 权重算出的有限值。
+segments 保持覆盖全行（`covered == x_rows` 不变量）。
+
+第一版尝试将 pad 行排除出 segments（permutation 短于 x），warmup 即 IMA
+（absorbed step kernels 未验证过该结构），回退为 slot-0 映射。
+
+验收（1101/1100 测试对，完整 L0 + CP on + 生产 flags）：电池测试（12 filler +
+20 topic）×3 轮 0/96 乱码，MLA-AUDIT 计数 0。
+
+### 4.2 DCP index_k 全域 owner 换算缺失（主因）
 
 DSA 索引器为笔记每一页计算一张"索引卡片"（index_k），存入池中供打分挑页。
 DCP=4 时每张卡的存放位置须做虚拟号到本组物理槽位的换算。旧代码有一个优化判断：
@@ -272,7 +332,7 @@ DCP=4 时每张卡的存放位置须做虚拟号到本组物理槽位的换算�
 修复（`5974a4fc56`）：去掉优化判断，所有编号无条件做完整换算，与主 KV 写入路径
 用同一套公式。诊断计数器移到修复动作之前（原计数器在修复之后，恒为零）。
 
-### 4.2 缺陷 B：topk -1 空位钳到 slot 0（次因）
+### 4.3 DCP topk -1 空位钳到 slot 0（次因）
 
 索引器每行交出 2048 个页号。DCP=4 时每张卡只有四分之一的页可挑，上下文短于
 约 52 万 token 的请求本组页数不足 2048，清单留空位（值 -1）。正确处理是让注意力
@@ -286,7 +346,7 @@ DCP=4 时每张卡的存放位置须做虚拟号到本组物理槽位的换算�
 修复：空位不再钳 0，改指向本行第一个有效页（打分最高的页），多算几次自己的
 头名种子，数学上仅权重略偏，不引入外部内容。
 
-### 4.3 两个缺陷的协同
+### 4.4 两个 DCP 缺陷的协同
 
 缺陷 A 导致索引卡片存错格子（低水位窗口），缺陷 B 导致空位读无关 KV（短上下文
 请求）。两者叠加：低水位 + 短上下文的请求同时命中两个缺陷，乱码率最高。修复后
@@ -297,12 +357,12 @@ DCP=4 时每张卡的存放位置须做虚拟号到本组物理槽位的换算�
 
 ## 五、修复与验证
 
-### 5.1 终局修复
+### 5.1 修复明细
 
 | 缺陷 | commit | 修复内容 |
 |---|---|---|
 | DCP index_k 全域换算缺失 | `5974a4fc56` | 去掉低水位直通分支，所有编号无条件完整换算 |
-| topk -1 空位钳 slot 0 | `5974a4fc56` | 空位指向本行第一个有效页 |
+| DCP topk -1 空位钳 slot 0 | `5974a4fc56` | 空位指向本行第一个有效页 |
 | CP×LoRA pad 行 NaN | `12cda1cd60` | pad 行映射 base 槽（零 delta） |
 | draft 虚拟 id 域 | `9db63a6abb`/`371a991947` | 虚拟号全程保留，碰物理池时换算 |
 | MoL 四层 | `f070d3d466`/`d56db6bea5`/`12cda1cd60`/`37fae98ed7` | 见 §3.1 |
@@ -345,11 +405,15 @@ DCP=4 时每张卡的存放位置须做虚拟号到本组物理槽位的换算�
 6. **逐层 dump 行级 NaN 分析**是定位毒化传播的金标准：pad 行 NaN → 真实行 NaN
    的传播链一眼看出毒化方向。
 
-7. **对照实验前先 diff 启动参数**：单机测试全过、PD 集群崩溃，追查 20 小时后发现
+7. **精度体系差异是 NaN 的隐藏推手**：FP8 E4M3FNUZ（base 权重/KV）无 NaN 编码位
+   （溢出饱和），BF16/FP32（LoRA delta 累加）有 NaN 编码位。同样的垃圾激活，base
+   路径饱和为有限值，LoRA delta 路径保留 NaN。排查 NaN 问题时须关注 dtype 链路。
+
+8. **对照实验前先 diff 启动参数**：单机测试全过、PD 集群崩溃，追查 20 小时后发现
    是生产脚本缺少 `--lora-use-virtual-experts`。"同代码"假设在本案为假，一个 flag
    切换了整条 kernel 路径。
 
-8. **判断"变慢"须区分计算延迟与传输延迟**：公网劣化 + logprobs 载荷放大制造了
+9. **判断"变慢"须区分计算延迟与传输延迟**：公网劣化 + logprobs 载荷放大制造了
    假的"性能断崖"，引擎吞吐实际正常。
 
 ---
