@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use super::ConfigResult;
 use crate::core::ConnectionMode;
 
-pub const DEFAULT_POOL_IDLE_TIMEOUT_SECS: u64 = 50;
+pub const DEFAULT_POOL_IDLE_TIMEOUT_SECS: u64 = 4;
 pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 pub const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 500;
 pub const DEFAULT_TCP_KEEPALIVE_SECS: u64 = 30;

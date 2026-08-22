@@ -466,6 +466,8 @@ pub async fn spawn_metrics_collector(
     tokio::spawn(async move {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
+            // Below engine uvicorn keep-alive (5s) — avoid stale pooled conns.
+            .pool_idle_timeout(Duration::from_secs(4))
             .build()
             .expect("metrics collector client");
         let mut ticker = time::interval(Duration::from_secs(interval_secs.max(1)));
@@ -602,6 +604,8 @@ pub async fn get_models(
     let children = state.list_children();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
+        // Below engine uvicorn keep-alive (5s) — avoid stale pooled conns.
+        .pool_idle_timeout(Duration::from_secs(4))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
 
@@ -735,7 +739,11 @@ pub async fn get_units(
     State(state): State<Arc<ControlPlaneState>>,
 ) -> Json<SubtreeView> {
     let children = state.list_children();
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        // Below engine uvicorn keep-alive (5s) — avoid stale pooled conns.
+        .pool_idle_timeout(Duration::from_secs(4))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
     let mut units = Vec::new();
 
     for c in &children {

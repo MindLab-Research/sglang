@@ -54,6 +54,8 @@ const LOAD_TIMEOUT_SECS: u64 = 2100;
 fn client() -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(3600))
+        // Below engine uvicorn keep-alive (5s default) — see jobs.rs note.
+        .pool_idle_timeout(Duration::from_secs(4))
         .build()
         .expect("deploy client")
 }
@@ -159,6 +161,8 @@ async fn unload_on_endpoint(
 fn unload_client() -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
+        // Below engine uvicorn keep-alive (5s default) — see jobs.rs note.
+        .pool_idle_timeout(Duration::from_secs(4))
         .build()
         .expect("unload client")
 }

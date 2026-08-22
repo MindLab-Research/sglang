@@ -184,10 +184,13 @@ impl JobManager {
         max_concurrency: usize,
         request_timeout_secs: u64,
     ) -> Arc<Self> {
-        // Keep pool idle timeout comfortably above any upstream keep-alive so
-        // pooled connections never outlive the server side.
+        // Pool idle timeout MUST stay below the engine's uvicorn keep-alive
+        // (SGLANG_TIMEOUT_KEEP_ALIVE, default 5s): a pooled connection idle
+        // longer than the server-side keep-alive is dead on the server but
+        // still "usable" in our pool — reusing it kills the stream mid-body
+        // ("error decoding response body"). 4s < 5s makes that impossible.
         let client = reqwest::Client::builder()
-            .pool_idle_timeout(Duration::from_secs(300))
+            .pool_idle_timeout(Duration::from_secs(4))
             .connect_timeout(Duration::from_secs(15))
             .build()
             .expect("failed to build jobs http client");
