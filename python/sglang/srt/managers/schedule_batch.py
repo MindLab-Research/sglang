@@ -2235,6 +2235,40 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     req.set_extend_range(min_plen, req.extend_range.end)
                     prefix_lens[i] = min_plen
 
+        # [EXTEND-ACCOUNTING-INVARIANT 2026-08-22] input_ids, seq_lens
+        # (=extend_range.end) and prefix_lens come from three independently
+        # maintained sources. Any mutation between scheduling and here (async
+        # HiCache loadback adjusting prefix_indices, in-place fill_ids
+        # rewrites — the Req contract explicitly warns these corrupt fill
+        # accounting, or the CP-consensus truncation above) can make them
+        # disagree. A batch whose declared seq_lens exceed its actual input
+        # tokens then drives alloc_paged_token_slots_extend's page-count
+        # check (ceil(seq/page)-ceil(prefix/page)) with the inflated seq and
+        # fails the WHOLE TP group with "Prefill out of memory" while
+        # evictable pages remain (2026-08-22 crash: extend=16384 reported,
+        # >=413 pages implied, 412 available, 1.6M evictable — mathematically
+        # impossible for a consistent batch). The actual input_ids are the
+        # single source of truth: clamp seq_lens and the extend range to
+        # them so allocation, req_to_token writes and attention all consume
+        # one consistent view.
+        for i, req in enumerate(reqs):
+            actual_extend = len(input_ids[i])
+            declared_extend = seq_lens[i] - prefix_lens[i]
+            if actual_extend != declared_extend:
+                logger.error(
+                    "[EXTEND-ACCOUNTING-DIVERGENCE] rid=%s declared_extend=%d"
+                    " actual=%d end=%d prefix=%d fill_len=%d — clamping to"
+                    " actual input tokens",
+                    req.rid,
+                    declared_extend,
+                    actual_extend,
+                    seq_lens[i],
+                    prefix_lens[i],
+                    len(req.full_untruncated_fill_ids),
+                )
+                seq_lens[i] = prefix_lens[i] + actual_extend
+                req.set_extend_range(prefix_lens[i], prefix_lens[i] + actual_extend)
+
         extend_lens = [r.extend_range.length for r in reqs]
         extend_logprob_start_lens = [
             compute_extend_logprob_start_len(

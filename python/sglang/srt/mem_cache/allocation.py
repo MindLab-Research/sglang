@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
+    get_num_new_pages,
     is_cpu,
     is_cuda,
     is_hip,
@@ -205,6 +206,36 @@ def alloc_paged_token_slots_extend(
     num_tokens = extend_num_tokens + len(seq_lens_cpu) * allocator.page_size
     evict_from_tree_cache(tree_cache, num_tokens)
 
+    # [ALLOC-EVICT UNIFIED PAGE VIEW 2026-08-22] The gate above uses
+    # available_size() = (free+release)*page_size (token domain) while
+    # alloc_extend fails on num_new_pages > len(free_pages) (page domain,
+    # free-list only). merge_and_sort_free (triggered by alloc_extend's
+    # pre-check) reconciles free_pages to free+release, so the correct
+    # pre-allocation comparison is need_pages vs (free+release) pages —
+    # exactly the arithmetic the allocator itself will apply. Evict the page
+    # deficit (+ slack) so the two views can never disagree their way into a
+    # fail-loud crash while evictable pages remain (2026-08-22 incident:
+    # 412 available pages vs >=413 implied need, 1.6M evictable unused).
+    try:
+        _page = allocator.page_size
+        _need_pages = get_num_new_pages(
+            seq_lens=seq_lens_cpu, page_size=_page, prefix_lens=prefix_lens_cpu
+        )
+        _fp = getattr(allocator, "free_pages", None)
+        _rp = getattr(allocator, "release_pages", None)
+        _avail_pages = (0 if _fp is None else len(_fp)) + (
+            0 if _rp is None else len(_rp)
+        )
+    except Exception:
+        _need_pages = 0
+        _avail_pages = 0
+    if _need_pages > _avail_pages:
+        evict_from_tree_cache(
+            tree_cache,
+            (_need_pages - _avail_pages + 8) * allocator.page_size
+            + len(seq_lens_cpu) * allocator.page_size,
+        )
+
     state = None
     if backup_state:
         state = allocator.backup_state()
@@ -238,6 +269,56 @@ def alloc_paged_token_slots_extend(
         out_cache_loc = out
 
     if out_cache_loc is None:
+        # [PREFILL-ALLOC-FORENSICS 2026-08-22] Pure diagnostics, no behavior
+        # change. The evict gate uses available_size() = (free+release)*page
+        # while alloc_extend's failure check uses len(free_pages) only; with
+        # well-formed inputs (prefix<=seq, extend==sum(seq-prefix), no dup
+        # pages) this failure is provably impossible, so any occurrence means
+        # malformed inputs or duplicate pages — log everything needed to tell
+        # them apart before raising.
+        try:
+            _alloc = tree_cache.token_to_kv_pool_allocator
+            _free = getattr(_alloc, "free_pages", None)
+            _rel = getattr(_alloc, "release_pages", None)
+            _np = get_num_new_pages(
+                seq_lens=seq_lens_cpu,
+                page_size=_alloc.page_size,
+                prefix_lens=prefix_lens_cpu,
+            )
+            _extend_actual = (
+                (seq_lens_cpu - prefix_lens_cpu).sum().item()
+                if seq_lens_cpu is not None and prefix_lens_cpu is not None
+                else -1
+            )
+            _free_dup = (
+                -1
+                if _free is None
+                else int(_free.numel() - torch.unique(_free).numel())
+            )
+            _rel_dup = (
+                -1
+                if _rel is None
+                else int(_rel.numel() - torch.unique(_rel).numel())
+            )
+            logger.error(
+                "[PREFILL-ALLOC-FORENSICS] bs=%d extend_arg=%d extend_actual=%d "
+                "num_new_pages=%d free_pages=%d release_pages=%d "
+                "free_dup=%d release_dup=%d prefix_lens=%s seq_lens=%s "
+                "inverted=%s",
+                len(seq_lens_cpu),
+                extend_num_tokens,
+                _extend_actual,
+                _np,
+                -1 if _free is None else _free.numel(),
+                -1 if _rel is None else _rel.numel(),
+                _free_dup,
+                _rel_dup,
+                prefix_lens_cpu.tolist()[:8],
+                seq_lens_cpu.tolist()[:8],
+                bool((seq_lens_cpu < prefix_lens_cpu).any().item()),
+            )
+        except Exception as _e:  # never mask the original error
+            logger.error("[PREFILL-ALLOC-FORENSICS] failed: %s", _e)
         error_msg = (
             f"Prefill out of memory. Try to lower your batch size.\n"
             f"Try to allocate {extend_num_tokens} tokens.\n"
