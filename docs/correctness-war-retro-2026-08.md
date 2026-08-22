@@ -104,8 +104,9 @@ L1 拿去用了，直接精神分裂。修复：缓存键从根上掺进 adapter
 
 **Bug 3：凑数的假行挨了真刀。** CP 把文章撕成八段时，行数除不尽要补几行假数据。
 这些假行本不该有任何计算，但 LoRA 的分段逻辑没把它们认出来，真给假行施加了
-LoRA 增量，还溅到了旁边的真行。修复：假行打上 -1 哨兵标记，LoRA 见到就跳过
-（`12cda1cd60`）。
+完整 adapter delta，假行的 KV 槽被打成 NaN，下一层真实 query attend 到 NaN key
+后整个真实 shard 全 NaN，输出从第一个 token 就是 `!0,0,0,0,1,0,1,` 这种数字汤。
+这个 bug 的定位过程用了两层二分组合实验，值得单独展开，见 §四（`12cda1cd60`）。
 
 **Bug 4：技能包中途被换人。** 槽位不够时逐出的策略偏向"保住 LoRA、牺牲 base"，
 结果一个跑了 35 万字的长请求，做到一半背上的技能包被换了——后半段的笔记全是
@@ -121,154 +122,188 @@ LoRA 增量，还溅到了旁边的真行。修复：假行打上 -1 哨兵标�
 
 ---
 
-## 四、CP × LoRA：二分组合实验定位两层错配（8 月 18-19 日）
+## 四、CP × LoRA：从首 token 乱码到 pad 行 NaN 毒化（8 月 21 日）
 
-这是整个排查里方法论上最干净的一段，值得展开讲。因为它示范了"怎么用组合实验
-把一个模糊的崩溃钉死到具体的两层计算"。
+这是整个排查里方法论上最干净的一段。它示范了怎么用**两层二分组合实验**，
+把一个"从第一个字就烂"的乱码，一步步钉死到具体的两层 LoRA 计算组合。
 
-### 4.1 问题初现：只有"CP + LoRA"同时开才崩
+### 4.1 症状：从第一个字就烂
 
-8 月 18 日通宵，集群上出现一个确定性崩溃：只要发带 `lora_path` 的请求，prefill
-进程必崩（8 个 rank 连崩），堆栈指向 MLA attention 的 `torch.bmm`。但诡异的是，
-单机测试同样的 LoRA 请求完全正常。这种"单机过、集群崩"的形态最折磨人——你不知道
-是集群多出来的哪个环节（PD 分离、CP、HiCache、cuda graph……）引入了问题。
+8 月 21 日，在前面几层 LoRA bug 修完之后，残留的乱码收敛成了一个很确定的签名：
+**请求结果从第一个 token 开始就是乱码**，输出形如 `!0,0,0,0,1,0,1,`——一个感叹号
+打头，后面跟着一串数字和标点。这不是"输出到一半变烂"，是**从第一个字就彻底烂**。
 
-### 4.2 二分组合实验：2×2 矩阵
+几个关键特征：
 
-我们做了一个最朴素的二分：把可能相关的两个开关（CP 和 LoRA）做笛卡尔积，
-四种组合各跑一轮，每轮同样的请求、同样的权重、同样的温度。这就是"二分组合
-实验"——不是二分查找，是把嫌疑因素两两组合，看哪个组合出问题。
+1. **首 token 恒为 id 0**。`output_ids[0] == 0`，logprob 返回 None。这说明不是采样
+   抽到了烂签，是 logits 本身就是 NaN——`argmax(NaN) = 0`，模型"自信地"选了 0 号
+   token（在词表里是 `!`）。
+2. **filler prompt 复现率极高**：12 个 filler prompt + 20 个 topic prompt 的电池
+   测试，乱码率 13-31/32（40%~97%），几乎必现。
+3. **base 模型永远干净**（0/32 × 多轮）。
+4. **乱码后状态持续**（"污染扩散"），不是偶发一次就好。
+
+这个"首 token NaN"的签名和之前那些"输出到一半变烂"的乱码完全不同——后者是读到
+错位置的旧记忆，前者是**前向计算本身算出了 NaN**。方向完全不同。
+
+### 4.2 第一层二分：CP × LoRA 2×2 组合
+
+第一个直觉：又是 LoRA。但 base 干净。那就把可能相关的两个开关（CP 和 LoRA）做
+笛卡尔积，四种组合各跑一轮，每轮同样的请求、同样的权重、同样的温度：
 
 | 组合 | CP | LoRA | 结果 |
 |---|---|---|---|
-| ① base | 关 | 关 | 正常 |
-| ② 纯 LoRA | 关 | 开 | 正常 |
-| ③ 纯 CP | 开 | 关 | 正常 |
-| ④ CP + LoRA | 开 | 开 | **必崩** |
+| ① base | 关 | 关 | 干净（0/32） |
+| ② 纯 LoRA | 关 | 开 | 干净（32/32） |
+| ③ 纯 CP | 开 | 关 | 干净 |
+| ④ CP + LoRA | 开 | 开 | **乱（13-31/32）** |
 
-四种里只有第四种崩。这个结果极其关键，它一刀切掉了所有单因素假设：
+四种里只有第四种乱。一刀切掉了所有单因素假设：不是 CP 本身坏（③ 干净），不是
+LoRA 本身坏（② 干净），是 **CP 和 LoRA 的组合**——两个子系统单独都正确，叠在一起
+才出问题。这种 bug 最难查，因为每个子系统的维护者都会说"我这边单测过的好好的"，
+而他们没说错，问题出在两个子系统的**接缝**上。
 
-- 不是 CP 本身坏（③ 正常）；
-- 不是 LoRA 本身坏（② 正常）；
-- 是 **CP 和 LoRA 的组合**——两个子系统单独都正确，叠在一起才崩。
+### 4.3 第二层二分：LoRA 模块族组合
 
-这种 bug 最难查，因为每个子系统的维护者都会说"我这边单测过的好好的"，而他们
-没说错。问题出在两个子系统的**接缝**上。
+CP×LoRA 定罪后，下一个问题：LoRA 有几十层（attention 的 q_a/q_b/kv_a/kv_b/o_proj
++ MoE 的 gate/up/down），是哪几层和 CP 组合出的问题？总不能一层层试。
 
-### 4.3 第一层错配：MoE 层的 gathered 尺寸
+我们用了一个运行时模块族二分工具（`SGLANG_LORA_FAMILY` 环境变量，`lora_manager.py`
+里加的），**不需要重新打包 adapter 权重**，一个 env 切换就能选择只给哪些模块族
+施加 LoRA delta。四组单臂（kv_a / q_b / o_proj / kv_b）先各自跑：
 
-组合定罪后，下一步是定位崩在模型的哪一层。用 `CUDA_LAUNCH_BLOCKING=1` 抓第一
-现场，崩点稳定指向 MoE 专家层的 LoRA delta 计算。但这里有个陷阱：sticky IMA
-（非法地址访问）会"粘"在第一个碰到的 kernel 上，崩点会漂移，不能只看一个崩点。
-我们写了独立复现脚本（`mini_repro.py`），绕过 6 分钟一轮的服务器循环，30 秒就能
-注入各类垃圾值验证单个 kernel。
+| 单臂 | 结果 |
+|---|---|
+| kv_a only | 干净 |
+| q_b only | 干净 |
+| o_proj only | 干净 |
+| kv_b only | 干净 |
 
-第一层问题出在 MoE 的 gathered token 尺寸计算。原理是这样的：
+四个单臂全干净。然后两两组合：
 
-CP 把文章撕成 8 段，每张卡只看自己那段（比如本 rank 6 个 token）。但 MoE 专家层
-有个特殊机制——它要把所有 CP rank 的 token **gather 到一起**再算（因为专家是
-全局路由的，一张卡看不到别的卡该路由给哪个专家）。所以 MoE 实际处理的 token 数
-是所有 rank 的总和：
+| 组合 | 结果 |
+|---|---|
+| **kv_a + o_proj** | **乱（13/32）** ← 最小犯罪组合 |
+| kv_a + q_b | 干净 |
+| kv_a + kv_b | 干净 |
 
-```
-N_gathered = Σ_{r=0}^{cp_size-1} n_r    （8 张卡各 6 个 = 48）
-```
+**kv_a + o_proj 是最小犯罪组合**——单独都不坏，合在一起就坏。这就是"两层计算
+组合有问题"的精确含义：不是某一层 LoRA 坏了，是 kv_a 和 o_proj 这两层 LoRA delta
+**同时施加在 pad 行上**时，才产生 NaN 并传播到真实行。
 
-但代码里 `global_num_tokens_cpu` 这个变量**只存了本 rank 的值**（6），没求和。
-于是下游分配 LoRA mapping 数组时按 6 分配，而 kernel 按 48 索引：
+为什么是这两层？原理是这样的：
 
-```
-分配：lora_mapping = zeros(N_local = 6)
-索引：for i in range(N_gathered = 48): x[lora_mapping[i]]  → i ∈ [6, 48) 越界
-```
+- **kv_a** 是 attention 的 K/V 投影。它写出的 K、V 会存进 KV cache，**包括 pad 行
+  的 K/V 槽**。如果 pad 行被施加了 LoRA delta，delta 作用在 pad 行的垃圾激活上
+  （freed-memory 残留，量级 ~1e-9），浮点运算后可能产生 NaN——这些 NaN 就写进了
+  pad 行的 KV 槽。
+- **o_proj** 是 attention 的输出投影。attention 的输出 = softmax(Q@K^T) @ V，如果
+  K/V 里有 NaN（来自 kv_a 写的 pad 行槽），整个 attention 输出就是 NaN。o_proj
+  再把这个 NaN 输出写进 hidden state，**NaN 就从 attention 层传播到了下一层**。
+- 单独 kv_a：NaN 写进了 K/V 槽，但如果 o_proj 没有 delta，attention 输出经过
+  o_proj 的 base 权重（无 delta）后，NaN 可能被残差连接稀释或被后续层吸收
+  （取决于具体数值路径），不一定稳定传播。
+- 单独 o_proj：o_proj 有 delta 但 K/V 是干净的（kv_a 无 delta），attention 输出
+  有限，o_proj delta 作用在有限值上不会产生 NaN。
+- **只有 kv_a + o_proj 同时有 delta**：kv_a 产生 NaN 源（pad 行 K/V），o_proj 把
+  NaN 稳定传播到 hidden → 下一层全 NaN → logits NaN → argmax=0 → `!`+数字汤。
 
-插桩实测：`nt=6 moe_nt=8`（错，应该是 48），修复后 `moe_nt=64` ✓。修复是
-`get_gathered_moe_num_tokens` v2 正确求和（`base_backend.py`，commit `16a7a569df`）。
+这个"最小犯罪组合"的发现非常关键，它把排查范围从"几十层 LoRA"缩小到了"这两层
+的 delta 同时作用在 pad 行上"这个精确场景。
 
-**为什么单机不崩**：单机没有 CP，`N_gathered = N_local`，两者天然相等，越界区间
-为空。只有 CP 把它们拉开（48 vs 6）才暴露。
+### 4.4 根因：pad 行被施加 LoRA delta → NaN 毒化真实行
 
-### 4.4 第二层错配：dense/attn 层的行数错配（真凶）
+有了"kv_a + o_proj + CP"这个三角定罪，根因就清楚了。原理分三步：
 
-第一层修完，MoE 层不崩了，但换了个地方崩——dense MLP 层的 csgmv kernel。这次
-才是 CP×LoRA 组合的真正根因，原理更深一层。
-
-LoRA 的 dense/attn 层走 csgmv backend。csgmv 的工作方式是：拿一个 permutation
-（排列数组）告诉 kernel"第 i 个 token 对应输入矩阵的第几行"，然后 kernel 执行
-`x[perm[i]]`。问题出在 permutation 是**什么时候、按什么视角构建的**：
-
-```
-prepare_lora_batch()  ← 在 forward 之前调用，此时看到的是全量 token（CP 切分前）
-  构建 permutation，长度 = N_full（比如 18）
-  构建 segments，覆盖全量
-
-  ↓ forward 内部
-  CP 把 batch 切成 per-rank shard
-  x.shape[0] = N_shard（比如 3，= 18 / 8 取整后本 rank 分到的）
-
-  ↓ csgmv kernel
-  for i in range(N_full = 18): x[perm[i]]   ← x 只有 3 行，perm[17] 越界
-```
-
-插桩铁证（`CSGMV-DIAG`）：
+**第一步：CP 产生 pad 行。** CP round-robin 把 batch 撕成 cp_size=8 段，如果 token
+数除不尽（比如 29 个 token），要补到 32（8 的倍数）：
 
 ```
-M=3 base_M=3 nseg=2 seg_last=18 perm_len=18 perm_max=17
+N_real = 29,  cp_size = 8
+N_pad  = cp_size - (N_real % cp_size) = 8 - (29 % 8) = 8 - 5 = 3
+N_batch = N_real + N_pad = 32   （pad 行 = [29, 30, 31]）
 ```
 
-`M=3` 是 CP 切分后本 rank 的 shard 行数，`perm_len=18` 是切分前全量。kernel 拿
-长度 18 的 perm 去索引只有 3 行的 x，`x[17]` 直接越界。还看到 `perm_max=1043512920`
-——permutation 数组未初始化的段是垃圾值，更坐实了"视角错配"。
+这些 pad 行是假数据，本不该参与任何计算。
 
-**为什么单机不崩 / 为什么只有 CP×LoRA 崩**：
-- 无 CP：`N_full = N_shard`（不切分），perm 长度 = x 行数，天然相等，不越界；
-- 无 LoRA：不走 csgmv 路径，没有 permutation 索引这回事；
-- 只有 CP + LoRA 同时存在，permutation（全量视角）和 x（shard 视角）才会错配。
+**第二步：pad 行被归属给最后一个请求，施加了完整 LoRA delta。** `_cp_shard_row_request_ids`
+把 pad 行归属给最后一个请求（不是丢弃），于是 shard 视图的 LoRA segments 把 pad 行
+当成真实行，对它们施加了完整的 adapter delta。pad 行的激活是 freed-memory 残留
+（量级 ~1e-9），LoRA delta 作用上去后：
 
-这完美解释了 2×2 矩阵里只有第四种崩。
-
-**一个隐蔽的陷阱**：第一版修复试图用 `attn_cp_metadata`（CP 的元数据对象）来判断
-当前是不是 CP 模式、该取哪些行。但 round-robin 模式下这个对象是**空的**
-（`ContextParallelMetadata()`，`split_list=None`）——keying on 一个空对象，代码
-静默走错分支，0 warning 但照崩。第二版修复（`c1946917cb`）绕开 metadata，直接从
-parallel runtime 和 CPU seq_lens 算本 rank 的行序：
-
-```python
-# round-robin: 第 r 个 rank 取第 r, r+cp_size, r+2*cp_size, ... 行
-shard_rows = full_rows[r::cp_size]   # 不依赖 metadata，metadata 在 round-robin 下是空的
+```
+delta_output = W_down @ activation(~1e-9) @ W_up
 ```
 
-`_resolve_batch_info` 再按 `x.shape[0]` 精确匹配 shard/full 视图，残余 mismatch
-时 clamp + 响亮日志（永不 OOB）。验收：10/10 混合请求（base/L0/L1/L2 轮换）+ 长文本
-L3 全过，0 shape-mismatch warning。
+这个运算在浮点下可能产生 inf/nan（取决于具体路径），结果就是 **pad 行的 KV 槽
+被写成了 NaN**。
 
-### 4.5 第三层：pad 行污染（后来证明是冤案）
+**第三步：NaN 经 KV 传播到真实行。** 这是毒化的关键——pad 行和真实行在同一个
+attention 的 KV 里。下一层的真实 query 做 `Q @ K^T` 时，K 里有 pad 行的 NaN：
 
-CP 把文章撕成 8 段时，如果行数除不尽（比如 54 行 / 8 = 6 余 6），要补 2 行假数据
-凑到 56 行整除。这些 pad 行本不该参与任何计算。但 LoRA 的 segment 路径没完全
-守卫，pad 行被施加了 LoRA delta，还溅到旁边的真行。症状是"+1~2 个输入字符乱码
-就消失"——因为多一个字符可能就整除了，没有 pad 行了。
+```
+scores = Q @ K^T          # K 的 pad 行是 NaN → scores 对应列 = NaN
+attn   = softmax(scores)   # NaN 传播 → attn = NaN
+output = attn @ V          # V 的 pad 行也是 NaN → output = NaN
+hidden  = hidden + o_proj(output)   # NaN 进 hidden
+```
 
-当时加了 gate（`seq_len % cp_size == 0`，非整除批次跳过 CP 分片），28 连发零乱码，
-以为结案了。**但这是撞上了另一个 bug 的静默期**——后面会讲，真正的根因是 DCP，
-CP 关掉乱码依旧。这个 gate 后来被 revert 了。教训：概率性 bug 的"修完 N 连发干净"
-不能下结论，可能只是撞进了静默窗口。
+逐层 dump 证据（`--debug-tensor-dump`）铁证如山：
+
+- **layer-7 MoE gate**：NaN **仅在 gather 后 32 行的 pad 行 [23, 27, 31]**（29 真实
+  token 对齐到 32，pad 行是最后那几个）；
+- **layer-8 attention 输出**：**4 个真实行全 NaN**——NaN 从 pad 行的 KV 槽经 attention
+  传播到了所有真实行；
+- **logits**：全 NaN → `argmax(NaN) = 0` → token id 0 → `!` + 数字汤。
+
+MLA-AUDIT 探针（`SGLANG_MLA_AUDIT=1`，`forward_mla.py`）进一步确认：kv_a+o 组合下
+audit 计数暴涨到 **7821**（正常为 0），且 hidden=NaN 从 layer 1 起就出现。
+
+**为什么 base 干净 / CP-off 干净**：
+- base 模型不施加任何 LoRA delta，pad 行的 KV 是 base 权重算出的有限值，不产生 NaN；
+- CP 关掉就没有 padding（N_batch = N_real，没有 pad 行），没有 NaN 源头；
+- 只有 CP + LoRA 同时存在，pad 行才会被 delta 打成 NaN，再经 KV 传播毒化真实行。
+
+**随机性来源**：pad 行的激活是 freed-memory 残留，内容取决于分配器复用了哪块内存
+（~1e-9 量级的垃圾值），所以同一个请求重放有时 NaN 有时不 NaN（取决于那块内存
+上次被谁用过、哪些 rank 带 pad）。这解释了 13-31/32 的波动复现率。
+
+### 4.5 修复：pad 行映射到 base 槽（零 delta）
+
+修复（`chunked_backend.py`，commit `12cda1cd60`）的核心思路：pad 行保留 -1 哨兵，
+映射到 **adapter slot 0（base 槽）**。`lora_ranks[0] == 0` 意味着 base 权重，所有
+LoRA kernel 对 rank-0 segment 早退 no-op——pad 行收到零 delta，KV 槽是 base 权重
+算出的有限值，不产生 NaN。同时 segments 保持覆盖全行（与验证过的结构一致）。
+
+```
+pad 行 → lora_rank = 0 (base) → LoRA kernel early-return → delta = 0 → KV 有限值 ✓
+真实行 → lora_rank = adapter_id → 正常施加 delta → KV 正常 ✓
+```
+
+第一版尝试把 pad 行**排除**出 segments（permutation 短于 x），结果 warmup 即 IMA
+（absorbed step kernels 未验证过 permutation < x_rows 的结构）→ 回退，改用 slot-0
+映射。教训：**改 segment 结构必须保持 `covered == x_rows` 不变量**。
+
+同 commit 的伴随修复：`deepseek_mla_correction.py` 的 `_get_state` 改走
+`_resolve_batch_info(x_rows)`（absorbed kv_b 修正此前拿 full 视图路由 shard 张量）；
+`virtual_experts.py` shrink kernel 拒绝负 offs_token（freed-memory 垃圾在 align slack
+里越界写）。
+
+验收（1101/1100 测试对，完整 L0 + CP on + 生产 flags）：电池（12 filler + 20 topic）
+×3 轮 **0/96 乱码**；MLA-AUDIT 计数 **0**（乱码时 7821）。
 
 ### 4.6 这段排查的方法论小结
 
-CP×LoRA 这段是整个排查里组合实验用得最充分的一段，值得记下方法论：
-
-1. **2×2 笛卡尔积定罪**：两个嫌疑开关做四种组合，只有一种崩 → 钉死组合交互，
-   排除所有单因素假设。比"逐个关掉看哪个不崩"信息量大得多。
-2. **独立 kernel 复现**：绕过 6 分钟一轮的服务器循环，30 秒直接调 kernel 注入
-   垃圾值，把"是不是这个 kernel"的验证从分钟级降到秒级。
-3. **sticky IMA 会漂移**：崩点不能只看一个，要反复抓取稳定的第一现场；漂移的
-   崩点都是同一个根因的随机浮出。
-4. **空对象陷阱**：metadata 是空对象 ≠ 没进 CP 模式，keying on 空对象会静默
-   走错分支，0 warning 照崩。
-5. **视角错配是组合 bug 的本质**：两个子系统各自视角正确（LoRA 看全量、CP 看
-   shard），接缝处一个用全量索引一个给 shard 数据，就越界。
-
+1. **两层二分组合**：第一层 CP×LoRA 2×2 矩阵定罪"组合才坏"，第二层 LoRA 模块族
+   二分（kv_a+o 最小犯罪组合）定罪"哪两层计算组合坏"。比逐层读码快一个量级。
+2. **运行时模块族二分**（`SGLANG_LORA_FAMILY`）：一个 env 切换就能选哪些模块族施加
+   delta，零 adapter 重打包，把"几十层 LoRA 哪层坏"的验证从小时级降到分钟级。
+3. **逐层 dump 的行级 NaN 分析**是定位毒化传播的金标准：pad 行 NaN → 真实行 NaN
+   的传播链，一眼看出毒化方向。
+4. **"首 token NaN"和"中途乱码"是不同 bug**：前者是前向计算本身算出 NaN（pad 行
+   毒化），后者是读到错位置的旧记忆（索引错位）。方向完全不同，不能混为一谈。
+5. **混沌系统里盯质性签名**：pad 行激活是 freed-memory 垃圾，复现率天然波动
+   （13-31/32），盯数值幅度没意义，盯 **NaN/零化的质性签名**才稳。
 ---
 
 ## 五、draft 崩溃与 accept 断崖（8 月 19-20 日）
