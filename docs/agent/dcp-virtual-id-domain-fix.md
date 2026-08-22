@@ -168,3 +168,50 @@ PagedTokenToKVPoolAllocator(
   （DCP=4：7,421,696 vs 1,855,424）。**draft 行 #tokens == target 行 = multiplier 又丢了**（merge/重构回归的签名）
 - `grep -c 'DRAFT-LOC-OOB\|DSA-SLOT-OOB' decode.log` → 0；>0 = 有 id 越界（查 pool 尺寸）
 - accept len 健康带 2.2-3.2；<1.5 = draft 域错；>5 = 疑似死循环（查输出重复）
+
+## 7. 2026-08-22 终局：DCP decode 概率性乱码双根因（commit `5974a4fc56`）
+
+**现象学**（GLM-5.2 1P2D/2P3D 长期 MoL"乱码"家族的真身）：模型"自信地"输出错 token
+（logprob rank-0 ≈100%）、正确/错误内容混合、中途开始尾部常自愈、逐请求概率性
+（~37-50%）、抄自己上下文更早内容。**A/B 判定链**：prefill CP 关→仍乱（CP 排除）；
+EAGLE 关→仍乱（排除）；base 模型→仍乱（LoRA-only 排除）；DCP=1→干净（**根因在 DCP>1**）。
+
+### Bug A（主因）：index_k in-pool 直通错位 — `dsa_indexer.py::_localize_index_k_cache_locs`
+
+- 旧代码 `virtual = loc >= pool.size` 门控：假设 in-pool id 已是本地槽。该假设只对
+  EAGLE draft 池（size×dcp）成立；**target 池是 per-rank size（1.85M），而分配器虚拟 id
+  从低位顺序发放** → 前几个大请求（水位 < size）的 index_k 全部未换算写错槽
+  （应写 `(x//256)*64 + x%64`，实际写到 `x`，越界内静默错位）。
+- 后果：indexer 用错位 index_k 打分 → 稀疏 top-k 选错页 → attention 读"真实但错误"的页。
+- **解释全部症状**：水位越过 size 后自愈（= "重启 decode 减轻"+"尾部自愈"+概率性）。
+- 修复：去门控，全域 owner 判定换算（镜像 `_write_mla_kv_buffer` 的 DCP 分支），
+  非 owner → scratch slot（与 MLA 写路径一致）。
+
+### Bug B：topk -1 补齐 lane → slot 0 污染 — `dsa_backend.py`（trtllm 直通路径）
+
+- DCP 下每 rank 从自己的 ~1/4 页选 top-2048（GLM-5.2 `index_topk=2048`）；上下文
+  <524K token 的请求 local 页数 <2048 → v2 输出大量 `-1` 补齐 lane。
+- 非 DCP 路径的 `transform_index_page_table_decode` 会 mask -1；**DCP 直通路径不 mask**，
+  `clamp_(min=0)` 把每条 -1 lane 重定向到 slot 0 = **无关 token 的 KV**。
+- 定罪证据：空 rank（seq=0）trtllm 返回 `lse=0` 而非 -inf → **kernel 对每条 lane 真实
+  attend，无 per-lane mask**。最多 3/4 lane 指向同一外部 token。
+- 修复：-1 lane 重定向到本行 lane-0（自己的 top-1 页）；空行保持 -1（下游 lse=-inf
+  掩码）。同时把 `SGLANG_DSA_SLOT_OOB_DIAG` 计数移到 clamp **前**（原位置 post-clamp
+  恒 0，永远测不到污染）。
+
+### 验证与部署
+
+- 测试对（1102）：DCP=4+EAGLE，L2 迭代 agent 流量从 ~37-50% 乱码 → 修复后持续干净。
+- 生产 1P2D（1100/1103）2026-08-22 部署，公网 18777 base+L2 验证通过。
+- 排除项记录：LSE log2/ln 域（恒偏置≠概率性，非主因，留探针）；7cc8b4b64 的
+  target_verify indexer 因果性语义（EAGLE-only 路径，次生嫌疑）。
+
+### 7.1 生产部署同日的两个运维坑
+
+- **双 decode 同时"自杀"（17:10:48，新进程跑 8.5min 后双双 multiprocessing 干净退出）**：
+  auth 日志零外部会话、无 OOM、无 cron、KillUserProcesses=no → 进程自退出；traceback
+  被后续重启的 `> decode.log` 截断丢失。怀疑 SIGKILL 式重启（mooncake/bootstrap 会话
+  残留）触发双端 fatal 路径。**重启 decode 前 log 先备份**（cp decode.log decode.log.bak）。
+- **stack 脚本 kill_exact 在 1101 上匹配不到端口**（ss 输出格式）→ proxy 杀不死 → 新
+  proxy "Address already in use" 启动失败。老 proxy 一直健康，公网 18777 = 云 NAT →
+  proxy:31000（本机 curl 127.0.0.1:18777 永远空，必须打 `8.222.11.182:18777`）。
