@@ -838,6 +838,10 @@ pub fn build_app(
             get(crate::control_plane::jobs::get_task_result),
         )
         .with_state(jobs_state);
+    // Content negotiation: gzip + zstd (per Accept-Encoding). Job results are
+    // large JSON blobs (~32MB → ~6.6MB gzip); compression only on these
+    // control-plane routes — inference streaming paths are untouched.
+    let jobs_routes = jobs_routes.layer(tower_http::compression::CompressionLayer::new());
     let jobs_routes = apply_control_plane_auth(jobs_routes);
 
     // HA management routes

@@ -253,6 +253,18 @@ output_top_logprobs[i]      top-k logprob 详情（请求 top-k>1 时非 null）
 
 ---
 
+### 5.5 压缩传输（推荐，2026-08-22 起）
+
+result 端点支持按 `Accept-Encoding` 自动协商压缩（仅 jobs 控制面路由，推理路径不受影响）：
+
+| Accept-Encoding | 响应 Content-Encoding | 32.7MB result 实测 |
+|---|---|---|
+| `gzip` | `gzip` | ~6.6MB（20.3%，降 5 倍） |
+| `zstd` | `zstd` | 更小（~17%） |
+| 不发 | 不压缩（原始） | 32.7MB |
+
+Python `requests` / curl 默认自动带 gzip（`requests` 发 `Accept-Encoding: gzip, deflate`，自动解压；curl 加 `--compressed`）。**弱网/跨境链路下务必让 driver 带上压缩**（曾出现 32.7MB 原始传输在 18KB/s 链路上滴流 30 分钟）。
+
 ## 6. 完整调用流程示例（Python）
 
 ```python
