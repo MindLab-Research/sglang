@@ -720,7 +720,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         is_head = (not self.pending_reqs) or (
             decode_req is self.pending_reqs[0]
         )
-        ok = free >= w and (is_head or free - w >= W)  # watermark φ = W
+        # Watermark φ=W reserves a full window for the queue head — but only
+        # in windowed mode. In legacy mode W == pool.size, so "free - w >= W"
+        # would demand more rows than the pool holds and every non-head
+        # request parks forever (2026-08-23 case50 stall: U=1 request parked
+        # indefinitely with free=393215/393216).
+        watermark = (
+            W if (self._pd_hidden_window and self._pd_hidden_window > 0) else 0
+        )
+        ok = free >= w and (is_head or free - w >= watermark)
         if ok:
             reserved = pool.alloc(w)
             # K1: local available >= accounting free >= w, so this cannot be
@@ -1596,6 +1604,35 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 prefix_len,
                 total_prefix_len,
             )
+            if dst_kv_indices is None:
+                # Pre-allocation lost the race for KV pages (concurrent
+                # long-context decodes exhaust the SWA pool; the pre-evict
+                # frees the wrong pool domain). Fail this request fast
+                # instead of crashing the scheduler — mirrors the hidden
+                # invariant abort above.
+                message = (
+                    "Decode KV pool exhausted during PD pre-allocation; "
+                    "retry the request later. "
+                    f"(rid={decode_req.req.rid})"
+                )
+                logger.error(message)
+                if prefix_len > 0:
+                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                prepare_abort(
+                    decode_req.req,
+                    message,
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+                self.scheduler.output_streamer.stream_output(
+                    [decode_req.req], decode_req.req.return_logprob
+                )
+                if decode_req.kv_receiver is not None:
+                    decode_req.kv_receiver.abort()
+                    decode_req.kv_receiver = None
+                self._release_pd_hidden_rows(decode_req)
+                failed_reqs.append(decode_req)
+                indices_to_remove.add(i)
+                continue
             decode_req.pd_hidden_dst_indices = pd_hidden_dst_indices
             decode_req.pd_hidden_dst_indices_by_pp = pd_hidden_dst_indices_by_pp
             decode_req.pd_hidden_pp_slices = pd_hidden_pp_slices
@@ -2191,16 +2228,25 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 uses_swa_tail=uses_swa_tail,
                 swa_tail_len=swa_tail_len,
             )
-        assert kv_loc is not None, (
-            f"KV cache is full! Bug in memory estimation. "
-            f"available={self.token_to_kv_pool_allocator.available_size()}, "
-            f"evictable={self.tree_cache.evictable_size()}, "
-            f"protected={self.tree_cache.protected_size()}, "
-            f"required_alloc={required_alloc_tokens}, delta={delta_len}, "
-            f"fill={fill_len}, prefix={prefix_len}, total_prefix={total_prefix_len}, "
-            f"page_size={self.token_to_kv_pool_allocator.page_size}, "
-            f"req={req.rid}"
-        )
+        if kv_loc is None:
+            # 2026-08-23 case50 incident: several 300K+ context requests
+            # decoding concurrently can exhaust the SWA pool; the decode-radix
+            # evict above frees the wrong pool domain (available stays flat),
+            # so allocation legitimately fails. Abort the request gracefully
+            # (caller turns this into a 503 + cleanup) instead of crashing
+            # the whole scheduler.
+            logger.error(
+                "[PD-PREALLOC-KV-FULL] KV pool exhausted at pre-alloc: "
+                f"available={self.token_to_kv_pool_allocator.available_size()}, "
+                f"evictable={self.tree_cache.evictable_size()}, "
+                f"protected={self.tree_cache.protected_size()}, "
+                f"required_alloc={required_alloc_tokens}, delta={delta_len}, "
+                f"fill={fill_len}, prefix={prefix_len}, "
+                f"total_prefix={total_prefix_len}, "
+                f"page_size={self.token_to_kv_pool_allocator.page_size}, "
+                f"req={req.rid}"
+            )
+            return None
 
         kv_loc = _guard_kv_indices(
             kv_loc, self.token_to_kv_pool_allocator.size, "pre_alloc.kv_loc"
