@@ -115,11 +115,22 @@ def can_dsa_prefill_cp_round_robin_split(forward_batch: "ForwardBatch"):
     # ranks under HiCache local-only prefetch — causing NCCL collective order
     # mismatch (some ranks enter CP, others don't) → watchdog SIGABRT.
     seq_len = forward_batch.extend_num_tokens
+    # PAD-ROW AVOIDANCE (garble fix 2026-08-22): round-robin split pads the
+    # batch to cp_size alignment; the pad rows then flow through the LoRA
+    # segment path where they corrupt real rows (subtle wrong-token output,
+    # reproduced ~1/3 on concurrent mixed-length extends; +1-2 input chars
+    # shifts alignment and hides it — see chunked_backend.py -1 sentinel
+    # history). Non-divisible batches skip CP split entirely: no padding,
+    # no bug. extend_num_tokens is rank-invariant (see comment above), so
+    # this gate cannot diverge across ranks (deadlock family safe). Perf
+    # impact limited to odd-sized tail extends; the 16K chunked-prefill
+    # chunks stay divisible and keep the CP fast path.
     return (
         is_dsa_prefill_cp_round_robin_split()
         and seq_len is not None
         and seq_len > 0
         and seq_len >= cp_size
+        and seq_len % cp_size == 0
         and cp_size > 1
     )
 
