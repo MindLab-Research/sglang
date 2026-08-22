@@ -454,6 +454,15 @@ class DeepseekSparseAttnBackend(
             if _DSA_SLOT_OOB_DIAG
             else None
         )
+        # 2026-08-22: split buckets — neg (<0: -1 padding lanes + fill lanes)
+        # vs oob (>= cap: true domain leaks). Steady-state short-ctx traffic
+        # legitimately produces millions of -1 padding lanes per window; only
+        # the oob bucket indicates a real producer leak.
+        self._oob_counter_neg = (
+            torch.zeros(1, dtype=torch.int64, device=model_runner.device)
+            if _DSA_SLOT_OOB_DIAG
+            else None
+        )
         self._oob_last_read = _time.time()
         assert isinstance(model_runner.page_size, int)
         self.real_page_size = model_runner.page_size
@@ -1620,14 +1629,28 @@ class DeepseekSparseAttnBackend(
             if now - self._oob_last_read > 30.0:
                 self._oob_last_read = now
                 n = int(self._oob_counter.item())
+                nneg = (
+                    int(self._oob_counter_neg.item())
+                    if self._oob_counter_neg is not None
+                    else -1
+                )
                 if n:
                     logger.warning(
-                        "DSA-SLOT-OOB window_slots=%d — upstream (indexer topk "
-                        "lanes / transfer metadata) leaked out-of-range KV "
-                        "slots; clamp kept trtllm in-bounds",
+                        "DSA-SLOT-OOB window_oob=%d window_neg_padding=%d — oob "
+                        "bucket (>= cap) = real producer domain leak; neg bucket "
+                        "= legitimate -1 padding lanes for short-ctx rows",
                         n,
+                        nneg,
+                    )
+                elif nneg > 0:
+                    logger.info(
+                        "DSA-SLOT-OOB window_oob=0 window_neg_padding=%d (padding "
+                        "only, no domain leak)",
+                        nneg,
                     )
                 self._oob_counter.zero_()
+                if self._oob_counter_neg is not None:
+                    self._oob_counter_neg.zero_()
         if bs not in self.decode_cuda_graph_metadata:
             self._build_forward_metadata_cuda_graph(
                 bs,
@@ -3334,9 +3357,9 @@ class DeepseekSparseAttnBackend(
             # never see.
             try:
                 _cap = kv.shape[0] * self.real_page_size
-                self._oob_counter.add_(
-                    ((page_table_1 < 0) | (page_table_1 >= _cap)).sum()
-                )
+                self._oob_counter.add_((page_table_1 >= _cap).sum())
+                if self._oob_counter_neg is not None:
+                    self._oob_counter_neg.add_((page_table_1 < 0).sum())
             except Exception:
                 pass
         # [DCP -1-LANE FIX 2026-08-22] The DCP direct-pass hands the raw v2
@@ -3413,6 +3436,24 @@ class DeepseekSparseAttnBackend(
         _dcp_max_seq_len = metadata.max_seq_len_k
         if dcp_enabled():
             _dcp_max_seq_len = _sparse_topk * self.real_page_size
+
+        # [2026-08-22 WEDGE FIX — MUST precede the trtllm call] The kernel
+        # contract requires seq_lens <= max_seq_len <= block_tables lane
+        # capacity (topk lanes x page_size tokens). The decode path passed the
+        # RAW localized cache_seqlens: the first request whose global ctx
+        # crossed 524,288 (= 2048 pages x 64 x dcp4) had local lens 148,480 >
+        # 131,072 lane capacity — the cubin's split-KV completion accounting
+        # desyncs and its reduce phase spins forever: GPU wedged busy, zero
+        # progress, no Xid, torch.cuda.synchronize never returns (prod hang
+        # 2026-08-22, 594K-token HiCache-hit request, deterministic for every
+        # attempt). Clamping to the lane capacity is semantically exact — the
+        # sparse path can never attend beyond its selected top-k pages — and
+        # a no-op for all ctx <= 524,288 requests. Graph-safe: pure
+        # torch.minimum, allocated from the graph pool during capture.
+        if dcp_enabled():
+            seq_lens = torch.minimum(
+                seq_lens, torch.full_like(seq_lens, _dcp_max_seq_len)
+            )
 
         if dcp_enabled() and dcp_debug_enabled() and not torch.cuda.is_current_stream_capturing():
             _bt = block_tables.squeeze(1)

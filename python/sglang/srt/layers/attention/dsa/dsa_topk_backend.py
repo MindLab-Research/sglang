@@ -286,7 +286,25 @@ def _topk_transform_v2_paged(
 
     page_table = attn_metadata.real_page_table
     assert page_table.dtype == torch.int32
-    lengths_i32 = lengths.to(torch.int32)
+    # [2026-08-22 WEDGE STOPGAP] The transform kernel reads lengths[row] as its
+    # scan bound and indexes page_table[pos // page_size] directly
+    # (topk_v2.cuh:100,141). Any lens×table domain mismatch (e.g. GLOBAL lens
+    # paired with a LOCALIZED page table when a precompute path skips DCP
+    # localize) makes 3/4 of positions index beyond the table: 4x scan work
+    # (16x step with the indexer's own 4x) + OOB page-table reads + ~4e9-scale
+    # uint32 loops when negative — GPU wedged busy with zero progress and no
+    # Xid (2026-08-22 prod hang, 594K-token HiCache-hit request, 5/5 retry
+    # timeouts). Clamping lens to the table's own token capacity is a NO-OP
+    # for every correctly-paired path (draft: full virtual table, lens ==
+    # global; target: localized table, lens == local) and turns any residual
+    # mismatch into a correct truncation. clone(): .to() returns SELF when
+    # dtype already matches — in-place clamp would corrupt the shared
+    # metadata tensor other consumers read.
+    _len_cap = int(page_table.shape[1]) * int(
+        get_token_to_kv_pool().page_size
+    )
+    lengths_i32 = lengths.detach().to(torch.int32).clone()
+    lengths_i32.clamp_(min=0, max=_len_cap)
 
     # The plan is preprocessed once per forward (DSAMetadata.topk_v2_plan,
     # refreshed in-place under CUDA graph) and reused across layers. A missing or
