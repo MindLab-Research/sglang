@@ -316,6 +316,7 @@ rsync -avz --exclude='__pycache__' --exclude='*.pyc' "$SRC" root@<node>:"$DEST"
 | 文件 | 内容 |
 |---|---|
 | `docs/agent/cp-lora-crash-investigation.md` | **CP×LoRA / PD LoRA 崩溃调查全记录（2026-08-18/19）**：kernel 三层加固（VE 双界钳制/CP gathered 尺寸/SEG-CLAMP 消毒，commit `16a7a569df`）、load_stream 竞态 sync-load 修复、**PD 崩溃最终结案 = prefill 脚本缺 `--lora-use-virtual-experts`（classic 路径无加固）**、单机 CP×VE 残余（另案）、方法论教训（对照实验先 diff flags） |
+| `docs/agent/cp-pad-row-garble.md` | **CP round-robin split pad 行 LoRA 乱码结案（2026-08-22，`f1421f2241`）**：非整除 extend 被 pad 后进 CP 分片 → pad 行经 LoRA segment 路径污染真实行（有限值错误 token：参数路径损坏/模板 token 循环）；+1-2 字符消失、全缓存命中也乱、并发混合批次 ~30%、base 免疫；修复=gate 加 `seq_len % cp_size == 0`；含录制代理 + 并发对撞复现方法论与乱码检测启发式 |
 | `docs/agent/v4-pro-deploy.md` | V4 Pro 0813 部署全流程：集群拓扑、重打包 checkpoint 识别（HTTP Range 验证法）、官方权重下载/验证/替换、DSpark/FP4 配置、容量与 bench 数据 |
 | `docs/agent/b300-compile-fixes.md` | 三个编译层修复：DeepGEMM sm_103a nvcc wrapper、tilelang flock 跨进程锁、tilelang CCCL include |
 | `docs/agent/dspark-pd-deadlocks.md` | DSPARK PD 五个死锁修复链（专用 gloo group / 异常安全 poll / prefill 空分支补偿 / spec_info DSPARK 分支 / hidden materialize），py-spy 死锁形态识别方法 |
