@@ -3322,13 +3322,16 @@ class DeepseekSparseAttnBackend(
                     page_table_1,
                 ),
             )
-        page_table_1.clamp_(min=0, max=kv.shape[0] * self.real_page_size - 1)
         if _DSA_SLOT_OOB_DIAG and self._oob_counter is not None:
             # In-graph accumulation: this whole block is captured (allocations
             # during capture land in the graph pool), so it re-executes on
             # every replay and increments the persistent counter. The eager
             # reader lives in _apply_cuda_graph_metadata (runs every step,
             # outside the graph) — .item() sync is graph-illegal here.
+            # (2026-08-22) Count BEFORE the clamp AND before the -1-lane
+            # redirect below: this measures the real pollution volume (padded
+            # -1 lanes + foreign/OOB values), which post-clamp counting could
+            # never see.
             try:
                 _cap = kv.shape[0] * self.real_page_size
                 self._oob_counter.add_(
@@ -3336,6 +3339,27 @@ class DeepseekSparseAttnBackend(
                 )
             except Exception:
                 pass
+        # [DCP -1-LANE FIX 2026-08-22] The DCP direct-pass hands the raw v2
+        # top-k output to trtllm: rows whose local page count < dsa_index_topk
+        # keep -1 padding lanes (v2 pads with -1, dsa_topk_backend), and the
+        # clamp below redirected EVERY one of them to slot 0 — an unrelated
+        # token's KV that trtllm-gen attends for real (empty-rank rows return
+        # lse=0, proving there is no per-lane masking in the kernel). Under
+        # dcp>1, up to 3/4 of the lane budget could point at one foreign
+        # token — a probabilistic confident-wrong garbling source (dcp=1
+        # contexts >= topk pages carry no padding lanes, which is why DCP-off
+        # was clean). Redirect -1 lanes to the row's lane-0 slot instead:
+        # always the query's own top-scoring selected page, so the extra
+        # weight never reads foreign content. Rows with zero valid lanes keep
+        # -1 (clamped below; lse-masked as empty ranks downstream). Graph
+        # safe: pure torch.where, captured like the repair above.
+        _lane0 = page_table_1[:, :1]
+        page_table_1 = torch.where(
+            (page_table_1 < 0) & (_lane0 >= 0),
+            _lane0,
+            page_table_1,
+        )
+        page_table_1.clamp_(min=0, max=kv.shape[0] * self.real_page_size - 1)
         block_tables = page_table_1.unsqueeze(1)
         seq_lens = metadata.cache_seqlens_int32 if seq_lens is None else seq_lens
 

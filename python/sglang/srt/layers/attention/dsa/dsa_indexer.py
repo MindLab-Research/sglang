@@ -371,14 +371,28 @@ class Indexer(MultiPlatformOp):
     def _localize_index_k_cache_locs(
         self, out_cache_loc: torch.Tensor
     ) -> torch.Tensor:
-        """Map virtual slots above the physical bound to this rank's local pool.
+        """Map full-domain virtual slots to this rank's local pool slots.
 
-        (2026-08-20) Only ids >= the physical pool size are virtual-space ids
-        needing mapping; in-pool ids are already local physical slots (the
-        round-robin virtual space coincides numerically below the physical
-        bound — this is the root reason the bug is intermittent). With the
-        allocator capacity fix (virtual pages == physical pages) this is a
-        no-op guard; it stays as defense for stray ids.
+        (2026-08-22 root-cause fix) The previous ``virtual = loc >= local_size``
+        gate assumed in-pool ids were already local physical slots — that only
+        holds when the pool spans the whole virtual space (EAGLE draft pool,
+        size*dcp). The TARGET pool is per-rank ``size`` while the allocator
+        hands out virtual ids x = 256*v + t sequentially from the bottom, so
+        every id below ``size`` (the first ~size/256 virtual pages — the first
+        few large requests after boot / after pool reset) sailed through
+        UNCONVERTED: index_k landed at slot x instead of its local slot
+        (x//256)*64 + x%64 — silent in-bounds misplacement. The indexer then
+        scored pages against stale/misplaced index_k and the sparse top-k
+        selected wrong pages: probabilistic confident-wrong garbling that
+        self-heals once the allocation watermark crosses ``size`` (ids then
+        took the conversion branch). dcp=1 early-returns below, which is why
+        DCP-off was clean.
+
+        Fix: convert unconditionally, mirroring ``_write_mla_kv_buffer``'s DCP
+        branch (memory_pool.py): owner check on the global 64-token page;
+        valid non-owner lanes go to the scratch slot ``local_size`` exactly
+        like the MLA write path; negative ids pass through unchanged (masked
+        by the store kernels).
         """
         if not dcp_enabled():
             return out_cache_loc
@@ -389,17 +403,16 @@ class Indexer(MultiPlatformOp):
         page_size = pool.page_size
         local_size = int(pool.size)
         valid = out_cache_loc >= 0
-        virtual = out_cache_loc >= local_size
         global_page = out_cache_loc // page_size
         owner = (global_page % dcp_size == dcp_rank) & valid
         local_slot = (
             (global_page // dcp_size) * page_size + out_cache_loc % page_size
         )
         return torch.where(
-            virtual & owner,
+            owner,
             local_slot,
             torch.where(
-                virtual & ~owner,
+                valid,
                 torch.full_like(out_cache_loc, local_size),
                 out_cache_loc,
             ),
