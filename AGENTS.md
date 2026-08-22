@@ -15,7 +15,7 @@ MoL（Mixture-of-LoRA）虚拟专家**，以及一系列分布式死锁修复。
 |---|---|
 | 分支 | `b300-glm52` |
 | 上游 base | `release/v0.5.15`，cherry-pick 到 `0b3bb0cbe`（GLM-5.2 MTP IndexShare） |
-| 本地 HEAD | `5974a4fc56`（2026-08-22，见 §3 commit 清单） |
+| 本地 HEAD | `21b00129fe`（2026-08-22，见 §3 commit 清单） |
 | 模型 | GLM-5.2-FP8（`n_routed_experts=256`，`num_experts_per_tok=8`，`num_hidden_layers=78`，`hidden_size=6144`，FP8 E4M3FNUZ） |
 | 推理架构 | PD 分离（prefill/decode 异机）+ DCP（Data/Context Parallel）+ HiCache + DSA + EAGLE |
 | 部署 | 1P1D（8.213.215.2）+ 2P3D（8.222.11.182）两个集群，见 §5 |
@@ -92,6 +92,10 @@ MoL（Mixture-of-LoRA）虚拟专家**，以及一系列分布式死锁修复。
 | `b5a571970` | perf(dcp)：预编译 topk_v2 JIT kernel（`_jit_topk_v2_module()` 移到 backend init，省首请求 tvm_ffi 编译） | dsa_backend.py |
 | `7cc8b4b64` | perf(dcp)：Triton `expand_lens_2d`（替代 view+expand+contiguous，省 schedule 中间拷贝） | dcp/kernels.py, dsa_backend.py |
 | `107716a18` | **perf(eagle)：移植上游 #30947/#30948**——topk1 draft postprocess 融合 Triton kernel（argmax+positions advance+token store 合一，绕过 `select_top_k_tokens`/per-step list/torch.cat，打 2P3D 的 ~42ms step_time base）+ TP vocab-parallel embedding 融合 kernel（`SGLANG_OPT_USE_TRITON_VOCAB_PARALLEL_EMBEDDING=0` 可关）；顺带清理 EAGLE-DIAG/POS-DIAG/DCP-TV 诊断日志。**本地无 kernels/ KernelSpec 注册表（v0.5.15 基），kernel 放在 `srt/*/triton_ops/`，未做 namespace 迁移** | eagle_worker_v2.py、speculative/triton_ops/topk1.py、layers/vocab_parallel_embedding.py、layers/triton_ops/vocab_parallel_embedding.py、environ.py |
+| `5974a4fc56` | **fix(dcp)：decode 概率性乱码双根因终局**——index_k 全域 owner 换算（低水位 target 池写错槽）+ topk `-1` 补齐 lane 重定向本行 lane-0（trtllm 无 mask 真实 attend 无关 KV）。判据 `SGLANG_DSA_SLOT_OOB_DIAG` | dsa_indexer.py、dsa_backend.py |
+| `d11d2b5179` | **fix(dsa)：>524K-ctx GPU 楔死**——draft 路径未截断 local seq_lens 超 trtllm max_seq_len clamp 与 lane 表容量（2048×64）→ split-KV completion 失步 → reduce 相位永久自旋（无 Xid）。修复=clamp 到 `_sparse_topk×page_size` + v2 topk 扫描 lens 界定页表宽 | dsa_backend.py、dsa/dsa_topk_backend.py |
+| `6504ba9b71` | **fix(prefill)："OOM" 记账分裂**——extend_range.end vs fill_ids vs prefix_indices 三源撕裂 + evict(token域)/alloc(page域) 口径不一 → 按虚高 seq 杀全组。修复=`prepare_for_extend` 不变量强制（`EXTEND-ACCOUNTING-DIVERGENCE` 响亮日志）+ 统一页视角 alloc/evict | managers/schedule_batch.py、mem_cache/allocation.py |
+| `21b00129fe` | docs：prefill OOM 记账分裂 postmortem（6504ba9b71 配套，`docs/agent/prefill-oom-accounting.md`）；同族 `04bf47a24e`（DCP 乱码 postmortem）、`0a13d7a435`（正确性战争人类可读复盘）、`23e9666289`（CP 洗冤更正+远程 LoRA 下载文档） | docs/ |
 
 ### 死锁修复演化（读懂这一串 = 理解本分支）
 ```
