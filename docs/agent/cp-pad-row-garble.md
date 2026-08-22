@@ -1,5 +1,19 @@
 # CP Round-Robin Split Pad-Row Garbling（2026-08-22 结案）
 
+> ⚠️ 2026-08-22 03:27 UTC：gate 修复 `f1421f2241` 已被 commit `08deb10807` **revert**
+> （当前 HEAD `ff525bd0dd` 的 `can_dsa_prefill_cp_round_robin_split` 已无
+> `seq_len % cp_size == 0` 检查，见 `srt/layers/attention/dsa/utils.py:109-124`）。
+> 下文"修复后 28 连发 0 乱码"对应的是 revert 前的状态；bug 面已重新打开，正在重新
+> 深挖 -1 哨兵体系下残余的未守卫消费点（embedding kernel、MoE-LoRA stamp、
+> control 路径负索引回绕等）。
+>
+> ✅ **终局结论（2026-08-22 17:5x UTC）**：根因不在 CP。当日 A/B 消融链定罪
+> **DCP decode 双 bug**（`5974a4fc56`：index_k 低水位直通错位 + topk -1 lane →
+> slot 0 污染，见 `dcp-virtual-id-domain-fix.md` §7）——CP 关掉乱码依旧，DCP 关掉
+> 才干净。本文件描述的 pad-row 现象是 DCP bug 在 LoRA+CP 组合下的显影之一，
+> gate 修复 f1421f2241 的"28 连发 0 乱码"实为撞上了 DCP bug 的低水位窗口
+> （重启后水位重置）。此文件保留作现象记录，**结论以 §7 为准**。
+
 ## 症状
 
 MoL 线上 L2（及任意 LoRA）请求间歇性输出乱码，两种签名并存：
@@ -22,11 +36,16 @@ round-robin 分片，pad 行流入 LoRA segment 路径（chunked_backend.py 的 
 后在某条未完全守卫的路径上污染真实行——输出是**有限值的错误 token**（非 12cda1cd60
 的 NaN→'!' 汤，是同族不同枝）。54 token extend → 2 个 pad 行就够触发。
 
-## 修复（commit f1421f2241）
+## 修复（commit f1421f2241）— ⚠️ 已被 revert（08deb10807，2026-08-22 03:27）
 
 gate 增加 `seq_len % cp_size == 0`：非整除批次整体跳过 CP 分片（无 padding 即无 bug）。
 `extend_num_tokens` 是 batch-prep 期计算的 rank-invariant 值（d4d23041d 死锁家族安全）。
 性能损失仅限尾部小块/混合奇数批次；16K chunked-prefill 主路径本身整除，保留 CP 加速。
+
+> ⚠️ **状态更正（2026-08-22 05:5x）**：`08deb10807` 已 revert 本修复——当前 HEAD 的
+> `can_dsa_prefill_cp_round_robin_split`（dsa/utils.py:109-124）**没有整除性检查**，
+> pad 行类分歧（embedding/MLP 层 `covered != x_rows` → `_resolve_batch_info` clamp 分支）
+> 重新激活。此文件描述的"修复后 28 连发 0 乱码"验证的是已 revert 的代码。
 
 ## 验证（1102/1104 测试对，v15 镜像树 + 修复文件）
 
