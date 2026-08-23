@@ -4,6 +4,7 @@ import logging
 from array import array
 
 from sglang.srt.environ import envs
+from sglang.srt.disaggregation.hidden_state import peek_pd_hidden_req_state
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
 from sglang.srt.utils import get_bool_env_var
 
@@ -134,6 +135,47 @@ def match_prefix_for_req(
             f"[SWA-CAP] reprefill_tail={reprefill_tail} key_len={len(token_ids)} "
             f"key_limit={key_limit} tree={type(tree_cache).__name__}"
         )
+
+    # PD-hidden radix clamp (2026-08-23, giant-context hidden corruption):
+    # a PD-hidden request (DSpark hidden transfer) must NOT reuse a cached
+    # radix prefix beyond the hidden plan's hidden_start (= the decode-side
+    # radix match at bootstrap). Tokens in [hidden_start, prompt) MUST run
+    # through this request's forward pass so their target hidden states get
+    # captured and streamed — DSpark hidden states cannot be cached or
+    # derived from KV. A radix hit past hidden_start (e.g. a concurrent
+    # request inserted the same long system prompt while this one waited for
+    # its decode-side hidden reservation) skips those tokens' forward pass,
+    # their hidden never exists, and decode — which reserved pool rows for
+    # [hidden_start, prompt) — fails with "PD streaming hidden chunk arrived
+    # out of order" (observed with two concurrent 300K+ requests sharing a
+    # system prompt: the second request's first hidden chunk started at the
+    # other's cached boundary instead of 0).
+    _pd_state = peek_pd_hidden_req_state(req)
+    if _pd_state is not None and _pd_state.meta:
+        try:
+            _pd_hidden_start = int(_pd_state.meta.get("hidden_start", 0) or 0)
+        except (TypeError, ValueError):
+            _pd_hidden_start = None
+        if _pd_hidden_start is not None:
+            _pd_limit = (
+                _pd_hidden_start
+                if key_limit is None
+                else min(key_limit, _pd_hidden_start)
+            )
+            if _pd_limit < len(token_ids):
+                key_limit = _pd_limit
+                if getattr(match_prefix_for_req, "_pdh_clamp_logged", 0) < 20:
+                    match_prefix_for_req._pdh_clamp_logged = (
+                        getattr(match_prefix_for_req, "_pdh_clamp_logged", 0) + 1
+                    )
+                    logger.info(
+                        "[PDH-RADIX-CLAMP] rid=%s hidden_start=%s clamped radix "
+                        "match limit to %s (key_len=%s)",
+                        getattr(req, "rid", "?"),
+                        _pd_hidden_start,
+                        key_limit,
+                        len(token_ids),
+                    )
 
     match_result = tree_cache.match_prefix(
         MatchPrefixParams(

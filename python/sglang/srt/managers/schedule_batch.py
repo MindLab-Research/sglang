@@ -1258,12 +1258,33 @@ class Req(ReqDllmMixin):
             )
             if _is_dspark:
                 _decode_prefix_len = getattr(self, "disagg_decode_prefix_len", None)
+                if envs.SGLANG_DEBUG_DIAG.get():
+                    logger.info(
+                        "[PDH-CLAMP-CHECK] rid=%s _is_dspark=%s decode_prefix_len=%r "
+                        "key_limit_before=%r input_len=%d",
+                        getattr(self, "rid", "?"),
+                        _is_dspark,
+                        _decode_prefix_len,
+                        key_limit,
+                        input_len,
+                    )
                 if isinstance(_decode_prefix_len, int) and _decode_prefix_len >= 0:
                     key_limit = (
                         _decode_prefix_len
                         if key_limit is None
                         else min(key_limit, _decode_prefix_len)
                     )
+                else:
+                    # 2026-08-23: an UNFINALIZED DSpark req (bootstrap still
+                    # pending — e.g. optimistically admitted before the
+                    # decode-side hidden plan resolved) has no
+                    # decode_prefix_len yet. Its hidden states cannot be
+                    # radix-backed, so it must reuse NOTHING. Without this,
+                    # a concurrent request's cached prefix is matched
+                    # (observed: pre_len=8192 gap on the second giant), the
+                    # skipped tokens' hidden never exists, and decode fails
+                    # with "PD streaming hidden chunk arrived out of order".
+                    key_limit = 0
             match_result = tree_cache.match_prefix(
                 MatchPrefixParams(
                     key=RadixKey(

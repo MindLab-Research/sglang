@@ -32,6 +32,12 @@ def get_pd_hidden_req_state(req: "Req") -> PDHiddenReqState:
     return state
 
 
+def peek_pd_hidden_req_state(req: "Req") -> Optional["PDHiddenReqState"]:
+    """Non-creating lookup: returns None if the req has no PD hidden state yet
+    (safe to call from generic admission paths for every request)."""
+    return _pd_hidden_req_states.get(req)
+
+
 def get_pd_hidden_capture_layer_ids(reqs: List["Req"]) -> Optional[List[int]]:
     """Return the per-batch PD hidden capture layers requested by any req."""
     for req in reqs:

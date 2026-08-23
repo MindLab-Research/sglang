@@ -1461,6 +1461,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     indices_to_remove.add(i)
                     continue
 
+                # 2026-08-23: streaming hidden transfer is the ONLY correct
+                # path for long prompts (window-capped rolling transfer; a
+                # full-length pool would need hidden_len rows on both sides —
+                # impossible for 1M contexts). The chunk-loss bug that forced
+                # a temporary legacy fallback is fixed at the SOURCE in
+                # prefill.py (_write_pd_hidden_rows_for_batch flush overwrite)
+                # — streaming is unconditionally enabled again.
                 pd_hidden_streaming = (
                     self.kv_manager.supports_pd_hidden_streaming()
                     and hasattr(self.scheduler.draft_worker, "inject_pd_hidden_chunk")
@@ -2816,6 +2823,17 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 "PD streaming hidden requires draft_worker.inject_pd_hidden_chunk."
             )
         sorted_chunks = sorted(chunks, key=lambda item: int(item["hidden_start"]))
+        if envs.SGLANG_DEBUG_DIAG.get():
+            logger.info(
+                "[PDH-RECV] rid=%s room=%s next_start=%s popped=%s",
+                decode_req.req.rid,
+                getattr(hidden_state, "room", "?"),
+                hidden_state.next_start,
+                [
+                    (int(c["hidden_start"]), int(c.get("row_len", 0)))
+                    for c in sorted_chunks
+                ],
+            )
         for chunk in sorted_chunks:
             hidden_chunk = PDHiddenChunk(
                 room=int(chunk["room"]),

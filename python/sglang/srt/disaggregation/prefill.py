@@ -343,6 +343,24 @@ class PrefillBootstrapQueue:
     def create_sender(self, req: Req, num_kv_heads: int) -> bool:
         """Create a KV sender for the request without enqueuing it.
         Returns False if the request exceeds KV capacity."""
+        # 2026-08-23: resurrect the dead DSpark marker. The 2026-08-20 radix
+        # clamp in Req.prepare_for_extend reads req.disagg_spec_algorithm /
+        # req.is_dspark_transfer, but no code ever assigned them (the setter
+        # was lost in a merge) — the clamp was dead code. Concurrent 300K+
+        # requests sharing a system prompt then radix-matched each other's
+        # cached prefixes (observed: pre_len=8192 gap), the skipped tokens'
+        # DSpark hidden states never existed, and decode failed with "PD
+        # streaming hidden chunk arrived out of order".
+        req.disagg_spec_algorithm = (
+            self.scheduler.server_args.speculative_algorithm or ""
+        )
+        # The speculative flag is decode-side only (the prefill never carries
+        # --speculative-algorithm), so the authoritative deployment-level
+        # signal here is the PD_HIDDEN state registration: when the hidden
+        # transport is armed, requests on this prefill are DSpark PD reqs and
+        # the radix clamp in prepare_for_extend must be live.
+        if StateType.PD_HIDDEN in self.kv_manager.kv_args.state_types:
+            req.is_dspark_transfer = True
         if self._check_if_req_exceed_kv_capacity(req):
             return False
 
@@ -395,6 +413,29 @@ class PrefillBootstrapQueue:
             decode_prefix_len = req.disagg_kv_sender.pop_decode_prefix_len()
             req.disagg_decode_prefix_len = decode_prefix_len
         dspark_meta = self.kv_manager.req_to_pd_hidden_meta.get(req.bootstrap_room)
+        if (
+            dspark_meta is None
+            and req.bootstrap_room is not None
+            and getattr(req, "bootstrap_host", None) != FAKE_BOOTSTRAP_HOST
+            and self._requires_pd_hidden_transfer(req)
+        ):
+            # 2026-08-23 root fix (giant-context hidden corruption, final
+            # piece): in a PD-hidden deployment the dspark metadata can
+            # arrive AFTER the KV bootstrap completes. Finalizing now would
+            # admit the request with NO hidden plan: no capture layers are
+            # armed (its forward pass captures nothing), and the radix
+            # admission match is unclamped — a concurrent request that
+            # inserted the same prefix makes this one skip tokens whose
+            # hidden states can then never exist. Decode — which reserved
+            # pool rows for the full hidden range — fails with "PD streaming
+            # hidden chunk arrived out of order" (observed: second giant's
+            # first hidden write started at the first giant's cached
+            # boundary instead of 0). Hold the bootstrap (non-terminal) until
+            # the hidden metadata arrives; every roomed request in a
+            # PD-hidden deployment eventually receives it. The FAKE bootstrap
+            # warmup requests are exempt (they have no decode counterpart
+            # that would ever register dspark metadata).
+            return False
         if dspark_meta and not self._finalize_pd_hidden_bootstrap(
             req, dspark_meta, decode_prefix_len
         ):
@@ -1031,11 +1072,47 @@ class SchedulerDisaggregationPrefillMixin:
 
         self.resolve_waiting_queue_bootstrap()
 
+        # ROOT FIX (2026-08-23, giant-context hidden corruption): a PD-hidden
+        # request must NEVER enter a prefill batch before its hidden capture is
+        # armed (bootstrap finalized -> capture_layer_ids set). Forwarding
+        # while capture_layer_ids is None silently drops those tokens' hidden
+        # states (the layer hooks never capture them), the radix cache then
+        # makes the loss permanent on resume, and decode — which reserved pool
+        # rows for the full hidden range — fails with "PD streaming hidden
+        # chunk arrived out of order" once later chunks arrive. The bootstrap
+        # window is milliseconds for an uncontended request (single-giant
+        # tests pass) but stretches to MINUTES when the decode-side hidden
+        # reservation parks behind concurrent giants — which is exactly when
+        # 300K+ requests corrupt (observed: first chunk missing, or 43 middle
+        # chunks missing with both endpoints delivered). Hold still-pending
+        # hidden reqs out of batch construction; they are re-inserted below
+        # and admitted the moment their bootstrap finalizes.
+        _pd_hidden_hold = []
+        _rest = []
+        for _rq in self.waiting_queue:
+            if (
+                _rq.pending_bootstrap
+                and not is_aborted(_rq)
+                and self.disagg_prefill_bootstrap_queue._requires_pd_hidden_transfer(
+                    _rq
+                )
+            ):
+                _pd_hidden_hold.append(_rq)
+            else:
+                _rest.append(_rq)
+        if _pd_hidden_hold:
+            self.waiting_queue = _rest
+
         self.process_prefill_chunk(last_batch=last_batch, running_batch=running_batch)
 
         prefill_plan = self.get_new_batch_prefill(running_batch)
         batch = prefill_plan.batch_to_run
         running_batch = prefill_plan.running_batch
+        if _pd_hidden_hold:
+            # Re-insert at the front: still visible to the bootstrap resolver
+            # (resolve_waiting_queue_bootstrap) each iteration, admitted as
+            # soon as capture is armed.
+            self.waiting_queue[:0] = _pd_hidden_hold
         batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
 
         if batch:
@@ -1194,7 +1271,9 @@ class SchedulerDisaggregationPrefillMixin:
                 state_indices.append(None)
         return state_indices
 
-    def _send_pd_hidden_only_chunk(self: Scheduler, req: Req) -> bool:
+    def _send_pd_hidden_only_chunk(
+        self: Scheduler, req: Req, mark_owner_direct: bool = True
+    ) -> bool:
         current_indices = pd_hidden_state(req).current_src_indices
         current_start = pd_hidden_state(req).current_start
         current_rows = int(pd_hidden_state(req).current_row_len or 0)
@@ -1220,13 +1299,22 @@ class SchedulerDisaggregationPrefillMixin:
             )
 
         req.disagg_kv_sender.send(np.asarray([], dtype=np.int32), state_indices)
+        if envs.SGLANG_DEBUG_DIAG.get():
+            logger.info(
+                "[PDH-DIRECT] rid=%s start=%s rows=%s is_last=%s",
+                req.rid,
+                current_start,
+                current_rows,
+                pd_hidden_state(req).current_is_last,
+            )
         if streaming_hidden:
             pd_hidden_state(req).src_indices = None
         pd_hidden_state(req).current_src_indices = None
         pd_hidden_state(req).current_start = None
         pd_hidden_state(req).current_row_len = 0
         pd_hidden_state(req).current_is_last = False
-        pd_hidden_state(req).owner_direct_sent = True
+        if mark_owner_direct:
+            pd_hidden_state(req).owner_direct_sent = True
         return True
 
     def _write_pd_hidden_rows_for_batch(
@@ -1273,6 +1361,7 @@ class SchedulerDisaggregationPrefillMixin:
         if pool is None or hidden_states is None or batch.extend_lens is None:
             return
 
+        page_size = self.token_to_kv_pool_allocator.page_size
         if batch.seq_lens_cpu is not None:
             chunk_ends = [int(x) for x in batch.seq_lens_cpu.tolist()]
         else:
@@ -1359,11 +1448,45 @@ class SchedulerDisaggregationPrefillMixin:
                         f"old_rows={prev_current_row_len}, new_start={write_start}, "
                         f"new_rows={rows}"
                     )
-                self.send_kv_chunk(
-                    req,
-                    last_chunk=False,
-                    end_idx=int(prev_current_start) + prev_current_row_len,
+                # 2026-08-23 root fix (giant-context transfer corruption):
+                # the piggyback flush below is SILENTLY SKIPPED by
+                # send_kv_chunk when the KV send cursor has already advanced
+                # past this hidden range (page-aligned end_idx < start_idx ->
+                # `return True` without sending). Overwriting current_* right
+                # after permanently DROPPED that hidden chunk: its source rows
+                # leaked in the prefill pool (streaming rows are freed only on
+                # the chunk ACK), and decode failed with "PD streaming hidden
+                # chunk arrived out of order" once the following chunks
+                # arrived (observed with 2 concurrent 300K+ giants:
+                # expected_start=0 chunk_start=8192, and expected_start=8192
+                # chunk_start=360448 — 43 middle chunks lost). When the
+                # piggyback would skip, send the hidden chunk directly
+                # instead — the hidden-only transport is independent of the
+                # KV page cursor.
+                prev_end = int(prev_current_start) + prev_current_row_len
+                aligned_prev_end = prev_end - prev_end % page_size
+                _flush_mode = (
+                    "piggyback"
+                    if aligned_prev_end >= req.start_send_idx
+                    else "direct"
                 )
+                if envs.SGLANG_DEBUG_DIAG.get():
+                    logger.info(
+                        "[PDH-FLUSH] rid=%s prev=[%s,%s) mode=%s start_send_idx=%s",
+                        req.rid,
+                        prev_current_start,
+                        prev_end,
+                        _flush_mode,
+                        req.start_send_idx,
+                    )
+                if _flush_mode == "piggyback":
+                    self.send_kv_chunk(
+                        req,
+                        last_chunk=False,
+                        end_idx=prev_end,
+                    )
+                else:
+                    self._send_pd_hidden_only_chunk(req, mark_owner_direct=False)
             if streaming_hidden:
                 write_indices = pool.alloc(rows)
                 if write_indices is None:
@@ -1384,6 +1507,16 @@ class SchedulerDisaggregationPrefillMixin:
             pd_hidden_state(req).current_row_len = rows
             pd_hidden_state(req).current_src_indices = write_indices
             pd_hidden_state(req).current_is_last = write_end >= hidden_start + hidden_len
+            if envs.SGLANG_DEBUG_DIAG.get():
+                logger.info(
+                    "[PDH-WRITE] rid=%s write=[%s,%s) rows=%s is_last=%s streaming=%s",
+                    req.rid,
+                    write_start,
+                    write_end,
+                    rows,
+                    pd_hidden_state(req).current_is_last,
+                    streaming_hidden,
+                )
             written = pd_hidden_state(req).written
             if written is not None:
                 written[local_start:local_end] = [True] * rows
