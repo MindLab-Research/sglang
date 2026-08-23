@@ -78,10 +78,19 @@ class SchedulerRequestReceiver:
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.step()
 
-        if self.recv_skipper is not None:
-            if not self.recv_skipper.handle(self.get_last_batch()):
-                return []
-
+        # 2026-08-23 deadlock fix (1104 collective wedge, R5/R6 case50):
+        # the recv_skipper's early return made the request broadcast
+        # CONDITIONAL per rank. When the skip decision diverged (any local
+        # state drift), one rank entered the broadcast while others flowed
+        # into the iteration barrier / poll all_reduce — all on the shared
+        # tp_cpu_group — and the gloo FIFO cross-matched the heterogeneous
+        # collectives into a permanent engine-wide deadlock (observed twice:
+        # ranks scattered across broadcast @ recv_requests:198 / barrier @
+        # decode.py:3181 / poll @ pop_transferred:2924, GPU 0%, zero
+        # progress). The broadcast is now UNCONDITIONAL on every rank. The
+        # skipper saved ~100-500µs of scheduler CPU per skipped iteration
+        # (<1% of wall time — the loop is GPU-bound); a broken-optimization
+        # removal, not a performance trade-off.
         recv_reqs = self._pull_raw_reqs()
 
         if self.input_blocker is not None:

@@ -56,15 +56,20 @@ class SchedulerRecvSkipper:
         return last_batch.forward_mode
 
     def handle(self, last_batch: Optional[ScheduleBatch]) -> bool:
-        should_recv = False
-
-        last_weight = self._weight_of_forward_mode.get(
-            self._pick_mode(last_batch), self._default_weight
-        )
-        self._counter += last_weight
-
+        # 2026-08-23 deadlock fix (1104 collective wedge, R5 case50):
+        # the recv decision MUST be identical on every rank. The previous
+        # weighted counter accumulated per-rank last_batch weights — when
+        # local batch state diverges transiently the counters drift, one
+        # rank skips the request broadcast while another enters it, and the
+        # collective sequence on the shared tp_cpu_group desyncs (observed:
+        # TP0 stuck in broadcast, 6 ranks stuck in pop_transferred's
+        # all_reduce, engine idle-deadlocked with GPU 0%). The invocation
+        # count is lockstep-identical across ranks by construction — every
+        # rank calls recv_requests exactly once per loop iteration and the
+        # iterations are barrier-synchronized — so this decision is
+        # rank-invariant regardless of local batch state.
+        self._counter += 1
         if self._counter >= self._threshold:
             self._counter = 0
-            should_recv = True
-
-        return should_recv
+            return True
+        return False
