@@ -2160,7 +2160,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if prefix_len > 0:
             prefix_indices = _guard_kv_indices(
                 prefix_indices,
-                self.token_to_kv_pool_allocator.size,
+                self.token_to_kv_pool_allocator.size_full,
                 "pre_alloc.prefix_indices",
             )
             self.req_to_token_pool.write(
@@ -2256,7 +2256,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             return None
 
         kv_loc = _guard_kv_indices(
-            kv_loc, self.token_to_kv_pool_allocator.size, "pre_alloc.kv_loc"
+            kv_loc, self.token_to_kv_pool_allocator.size_full, "pre_alloc.kv_loc"
         )
         self.req_to_token_pool.write(
             (
@@ -2335,6 +2335,18 @@ def _guard_kv_indices(
     producer: uninit -1 / 4e9-scale / cap+n each point elsewhere) and
     contain in-range so corruption cannot propagate. Called once per request
     on the prealloc path (NOT per decode step), so the sync is acceptable.
+
+    ⚠️ ``cap`` MUST be the FULL-pool virtual-id capacity
+    (``allocator.size_full``), NOT ``allocator.size``: on hybrid-SWA models
+    the composite ``SWATokenToKVPoolAllocator.size == min(full, swa)`` — the
+    SWA size. Using it as the cap for full-pool token ids silently rewrites
+    every id ≥ swa_size to 0 (the shared padding-sink page) once the
+    allocation watermark crosses the SWA size — empirically 2026-08-23:
+    [KV-PRODUCER-OOB] 369491/400211 "bad" slots all starting exactly at
+    1438464 (= swa size); every high-watermark request's KV transfer then
+    targeted page 0 → cross-request KV read/write collisions →
+    deterministic content contamination under 14+ concurrent long-context
+    requests.
     """
     if t is None or t.numel() == 0:
         return t
@@ -2402,7 +2414,7 @@ def alloc_for_decode_prealloc(
                 last_loc=last_loc,
                 extend_num_tokens=delta_len,
             )
-    return _guard_kv_indices(kv_loc, allocator.size, "prealloc.kv_loc")
+    return _guard_kv_indices(kv_loc, allocator.size_full, "prealloc.kv_loc")
 
 
 class DecodeTransferQueue(DecodeHiCacheTransferMixin):
@@ -2582,6 +2594,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         for chunk in pop_acked_chunks(decode_req.req.bootstrap_room):
             if chunk.get("is_last_hidden_chunk"):
                 decode_req.pd_hidden_state.mark_hidden_done()
+                # NOTE 2026-08-23 (REVERTED): an earlier experiment released the
+                # receive-window rows here (transfer-complete). It caused live
+                # cross-request KV contamination on user traffic ("你好" returned
+                # unrelated conversations' content; nonce'd prompts too — not a
+                # radix-match issue). Evidence: /root/decode_v4.log.contam_evidence
+                # on 1104. Rows are held until request end (original semantics).
 
     def _inplace_shard_dcp_kv(self, decode_req: DecodeRequest) -> None:
         """Per-request reshard (kept for fallback). Use batch_shard_all for batch."""
