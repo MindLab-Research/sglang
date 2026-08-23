@@ -176,6 +176,24 @@ def _padded_all_reduce_min(polls: list, gloo_group):
     """
     global _PADDED_CALL_COUNT
     _PADDED_CALL_COUNT += 1
+    if envs.SGLANG_DEBUG_DIAG.get():
+        # Collective-count forensics (2026-08-24 windowed-mode abort-storm
+        # wedge): every rank must execute the SAME NUMBER of calls in the
+        # SAME order. Any per-rank count divergence = FIFO offset = wedge.
+        # Log every entry so a post-mortem diff across ranks pinpoints the
+        # diverging call site immediately. (The log line's TP<n> prefix
+        # already identifies the rank; do NOT format ProcessGroup.rank —
+        # it is a method on this torch version and %d formatting raised a
+        # logging error on every call.)
+        import sys as _sys
+        _caller = _sys._getframe(1)
+        logger.info(
+            "[PADDED-AR] count=%d len=%d site=%s:%d",
+            _PADDED_CALL_COUNT,
+            len(polls),
+            _caller.f_code.co_filename.rsplit("/", 1)[-1],
+            _caller.f_lineno,
+        )
     local_len = torch.tensor(len(polls), dtype=torch.int, device="cpu")
     try:
         dist.all_reduce(local_len, op=dist.ReduceOp.MAX, group=gloo_group)

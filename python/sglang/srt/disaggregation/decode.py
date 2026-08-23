@@ -127,6 +127,13 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 _PD_HIDDEN_ROW_CHARGE: Dict[str, int] = {}
 
+# How long the decode drain tolerates a hidden-chunk GAP (a lost READY
+# notify on the lossy control channel) while the sender's re-notify loop
+# (hidden_events.park_chunk_for_ack) retransmits. Must stay well below the
+# sender's 300s ACK-park timeout so a genuinely unhealable gap fails loudly
+# on the decode side first.
+PDH_GAP_TIMEOUT_S = 60.0
+
 
 def _pd_hidden_charge_set(rid: str, rows: int) -> None:
     _PD_HIDDEN_ROW_CHARGE[rid] = int(rows)
@@ -2852,7 +2859,17 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     for c in sorted_chunks
                 ],
             )
-        for chunk in sorted_chunks:
+        submit_ack = getattr(
+            self.kv_manager, "submit_pd_hidden_chunk_ack", None
+        )
+        if submit_ack is None:
+            raise RuntimeError(
+                "PD streaming hidden backend is missing ACK completion API."
+            )
+        push_back = getattr(
+            self.kv_manager, "push_back_pd_hidden_ready_chunks", None
+        )
+        for idx, chunk in enumerate(sorted_chunks):
             hidden_chunk = PDHiddenChunk(
                 room=int(chunk["room"]),
                 prefill_rank=int(chunk["prefill_rank"]),
@@ -2871,18 +2888,74 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     f"rid={decode_req.req.rid}, row_len={hidden_chunk.row_len}, "
                     f"dst_indices={len(hidden_chunk.dst_indices)}"
                 )
+            chunk_end = hidden_chunk.hidden_start + hidden_chunk.row_len
+            if chunk_end <= hidden_state.next_start:
+                # Duplicate retransmission: this chunk was already injected.
+                # The original READY notify — or its ACK — was dropped by the
+                # lossy control channel (zmq PUSH LINGER=0 rotation,
+                # common/conn.py::_connect), and the sender's re-notify loop
+                # re-sent it. Re-ACK (event=None -> immediate success) so the
+                # sender's parked chunk can complete, then drop silently.
+                if hidden_chunk.ack_host is not None and hidden_chunk.ack_port is not None:
+                    submit_ack(
+                        event=None,
+                        remote=hidden_chunk.ack_host,
+                        dst_port=int(hidden_chunk.ack_port),
+                        room=int(hidden_chunk.room),
+                        prefill_rank=int(hidden_chunk.prefill_rank),
+                        hidden_start=int(hidden_chunk.hidden_start),
+                        is_last_hidden_chunk=hidden_chunk.is_last_hidden_chunk,
+                    )
+                else:
+                    logger.error(
+                        "[PDH-DUP-NOACK] rid=%s start=%s — duplicate without "
+                        "ACK endpoint; sender 300s timeout will fail it",
+                        decode_req.req.rid,
+                        hidden_chunk.hidden_start,
+                    )
+                continue
+            if hidden_chunk.hidden_start != hidden_state.next_start:
+                # Gap: the missing chunk's READY notify was lost in flight.
+                # Do NOT hard-fail (the old behavior turned a single dropped
+                # control message into a request abort + a 300s room wedge):
+                # defer this chunk and everything after it, and wait for the
+                # sender's re-notify (<=3s cadence). Loud failure only if the
+                # gap persists past PDH_GAP_TIMEOUT_S (true loss).
+                if push_back is not None:
+                    push_back(
+                        int(decode_req.req.bootstrap_room),
+                        sorted_chunks[idx:],
+                    )
+                else:
+                    raise RuntimeError(
+                        "PD streaming hidden backend is missing push-back API."
+                    )
+                now = time.monotonic()
+                if hidden_state.gap_since == 0.0:
+                    hidden_state.gap_since = now
+                    logger.info(
+                        "[PDH-GAP] rid=%s room=%s next_start=%s got_start=%s "
+                        "— waiting for re-notify",
+                        decode_req.req.rid,
+                        decode_req.req.bootstrap_room,
+                        hidden_state.next_start,
+                        hidden_chunk.hidden_start,
+                    )
+                elif now - hidden_state.gap_since > PDH_GAP_TIMEOUT_S:
+                    raise RuntimeError(
+                        "PD streaming hidden chunk gap did not heal after "
+                        f"{PDH_GAP_TIMEOUT_S}s (lost READY notify): "
+                        f"rid={decode_req.req.rid}, "
+                        f"expected_start={hidden_state.next_start}, "
+                        f"chunk_start={hidden_chunk.hidden_start}, "
+                        f"row_len={hidden_chunk.row_len}"
+                    )
+                return
+            hidden_state.gap_since = 0.0
             # This branch's PDHiddenRequestState has no accept_chunk(); enforce
             # the sequential streaming contract inline (mirrors upstream's
             # accept_chunk(defer_hidden_done=True) where both "future" and
             # "stale" chunk positions raise).
-            if hidden_chunk.hidden_start != hidden_state.next_start:
-                raise RuntimeError(
-                    "PD streaming hidden chunk arrived out of order: "
-                    f"rid={decode_req.req.rid}, "
-                    f"expected_start={hidden_state.next_start}, "
-                    f"chunk_start={hidden_chunk.hidden_start}, "
-                    f"row_len={hidden_chunk.row_len}"
-                )
             hidden_state.next_start = (
                 hidden_chunk.hidden_start + hidden_chunk.row_len
             )
@@ -2895,13 +2968,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 hidden,
                 hidden_chunk.hidden_start,
             )
-            submit_ack = getattr(
-                self.kv_manager, "submit_pd_hidden_chunk_ack", None
-            )
-            if submit_ack is None:
-                raise RuntimeError(
-                    "PD streaming hidden backend is missing ACK completion API."
-                )
             if hidden_chunk.ack_host is None or hidden_chunk.ack_port is None:
                 raise RuntimeError(
                     "PD streaming hidden chunk is missing ACK endpoint: "

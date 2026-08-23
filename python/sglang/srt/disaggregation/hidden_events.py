@@ -141,6 +141,21 @@ class PDHiddenEventManager:
             kv_chunk.pd_hidden_ack_expected_count = expected_count
             self.ack_waiters[key] = (transfer_queue, kv_chunk)
 
+        # Notify retransmission: the chunk-READY control message travels on a
+        # lossy zmq PUSH socket (LINGER=0 rotation on any disconnect event —
+        # common/conn.py::_connect), so the FIRST notify can be silently
+        # dropped while later messages on the fresh socket go through
+        # (observed 2026-08-24 windowed mode: chunk [17920,34304) notify lost
+        # on exactly one rank pair; decode then hard-failed on the NEXT
+        # chunk's out-of-order arrival, and the un-ACKed chunk parked here
+        # held the room's single-in-flight slot for the full 300s ACK
+        # timeout). Re-send the notify every few seconds until the ACK
+        # arrives; decode dedups duplicates (re-ACKs them), so this is
+        # idempotent and self-terminating.
+        renotify_args = getattr(kv_chunk, "pd_hidden_renotify_args", None)
+        if renotify_args is not None:
+            self._start_renotify_loop(key, renotify_args)
+
         def on_timeout() -> None:
             with self.chunk_ack_cv:
                 waiter = self.ack_waiters.pop(key, None)
@@ -162,6 +177,37 @@ class PDHiddenEventManager:
         timer.start()
         return True
 
+    # Re-notify cadence: healthy chunks ACK in well under a second, so the
+    # loop only ever fires for notifies that were actually lost.
+    RENOTIFY_INTERVAL_S = 3.0
+
+    def _start_renotify_loop(self, key, renotify_args: dict) -> None:
+        def tick() -> None:
+            with self.chunk_ack_cv:
+                alive = key in self.ack_waiters
+            if alive:
+                try:
+                    self.owner.notify_pd_hidden_chunk_ready(**renotify_args)
+                except Exception:
+                    # Transient zmq error on a rotated socket; the next tick
+                    # retries on a fresh connection.
+                    logger.debug(
+                        "PD hidden re-notify send failed (will retry): "
+                        "room=%s hidden_start=%s",
+                        key[0],
+                        key[2],
+                    )
+            if alive:
+                timer = threading.Timer(
+                    self.RENOTIFY_INTERVAL_S, tick
+                )
+                timer.daemon = True
+                timer.start()
+
+        first = threading.Timer(self.RENOTIFY_INTERVAL_S, tick)
+        first.daemon = True
+        first.start()
+
     def wake_ack_waiters(self, room: int) -> None:
         room = int(room)
         with self.chunk_ack_cv:
@@ -176,11 +222,42 @@ class PDHiddenEventManager:
         for transfer_queue, kv_chunk in room_waiters:
             transfer_queue.put(kv_chunk)
 
+    # -- inflight bookkeeping (guarded by chunk_ack_cv, shared with the
+    # room_waiters/park machinery so park-and-check can be atomic) --
+
+    def get_inflight_chunk(self, room: int):
+        with self.chunk_ack_cv:
+            return self.inflight_chunks.get(int(room))
+
+    def set_inflight_chunk(self, room: int, key) -> None:
+        with self.chunk_ack_cv:
+            self.inflight_chunks[int(room)] = key
+
+    def pop_inflight_chunk(self, room: int, match=None) -> None:
+        with self.chunk_ack_cv:
+            room = int(room)
+            if match is None or self.inflight_chunks.get(room) == match:
+                self.inflight_chunks.pop(room, None)
+
     def park_chunk_behind_room(
         self, transfer_queue: FastQueue, kv_chunk: TransferKVChunk
-    ) -> None:
+    ) -> bool:
+        """Atomically park the chunk behind the room's inflight chunk.
+
+        Returns True when parked. False means the inflight chunk finished in
+        the race window between the caller's inflight read and this park —
+        the classic missed-wakeup: ``finish_streaming_chunk`` popped the
+        inflight and its ``wake_next_room_waiter`` fired while
+        ``room_waiters`` was still empty, so parking now would orphan this
+        chunk forever (its notify is never sent -> decode-side out-of-order
+        raise). The caller must proceed with the chunk instead.
+        """
+        room = int(kv_chunk.room)
         with self.chunk_ack_cv:
-            self.room_waiters[int(kv_chunk.room)].append((transfer_queue, kv_chunk))
+            if room not in self.inflight_chunks:
+                return False
+            self.room_waiters[room].append((transfer_queue, kv_chunk))
+            return True
 
     def wake_next_room_waiter(self, room: int) -> None:
         with self.chunk_ack_cv:
@@ -429,11 +506,29 @@ class PDHiddenEventManager:
         hidden_inflight_key: Optional[Tuple[int, int]],
     ) -> None:
         self.free_chunk_rows(kv_chunk)
-        if hidden_inflight_key is not None:
-            with self.inflight_lock:
-                if self.inflight_chunks.get(kv_chunk.room) == hidden_inflight_key:
-                    self.inflight_chunks.pop(kv_chunk.room, None)
-            self.wake_next_room_waiter(kv_chunk.room)
+        # Pop the inflight marker AND wake the next room waiter in ONE
+        # critical section: park_chunk_behind_room checks-and-appends under
+        # the same lock, so a chunk either (a) observes the inflight marker
+        # and is guaranteed to be in room_waiters before this wake runs, or
+        # (b) observes no marker and proceeds — the missed-wakeup orphan race
+        # (2026-08-23 windowed-mode out-of-order: notify for chunk
+        # [14592,30976) never sent while [30976,...) overtook it) is closed.
+        with self.chunk_ack_cv:
+            room = int(kv_chunk.room)
+            if (
+                hidden_inflight_key is not None
+                and self.inflight_chunks.get(room) == hidden_inflight_key
+            ):
+                self.inflight_chunks.pop(room, None)
+            room_waiters = self.room_waiters.get(room)
+            if room_waiters:
+                transfer_queue, waiter_chunk = room_waiters.popleft()
+                if not room_waiters:
+                    self.room_waiters.pop(room, None)
+            else:
+                transfer_queue = waiter_chunk = None
+        if waiter_chunk is not None:
+            transfer_queue.put(waiter_chunk)
 
     def mark_session_failed_and_sync(
         self,

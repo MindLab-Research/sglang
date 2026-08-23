@@ -341,11 +341,6 @@ class MooncakeKVManager(CommonKVManager):
     def _wake_pd_hidden_ack_waiters(self, room: int) -> None:
         self.pd_hidden_events.wake_ack_waiters(room)
 
-    def _park_pd_hidden_chunk_behind_room(
-        self, transfer_queue: FastQueue, kv_chunk: TransferKVChunk
-    ) -> None:
-        self.pd_hidden_events.park_chunk_behind_room(transfer_queue, kv_chunk)
-
     def _wake_next_pd_hidden_room_waiter(self, room: int) -> None:
         self.pd_hidden_events.wake_next_room_waiter(room)
 
@@ -362,6 +357,13 @@ class MooncakeKVManager(CommonKVManager):
 
     def pop_pd_hidden_ready_chunks(self, room: int) -> List[dict]:
         return self.pd_hidden_events.pop_ready_chunks(room)
+
+    def push_back_pd_hidden_ready_chunks(self, room: int, chunks: List[dict]) -> None:
+        """Return deferred (gap-ahead) chunks to the ready store; the drain
+        retries them on a later tick once the missing re-notified chunk
+        arrives."""
+        for chunk in chunks:
+            self.pd_hidden_events.append_ready_chunk(int(room), chunk)
 
     def submit_pd_hidden_chunk_ack(
         self,
@@ -1759,10 +1761,7 @@ class MooncakeKVManager(CommonKVManager):
                             f"Skipping chunk for room {kv_chunk.room} because it has already failed or been aborted"
                         )
                     if kv_chunk.pd_hidden_start is not None:
-                        with self.pd_hidden_events.inflight_lock:
-                            self.pd_hidden_events.inflight_chunks.pop(
-                                kv_chunk.room, None
-                            )
+                        self.pd_hidden_events.pop_inflight_chunk(kv_chunk.room)
                     if (
                         not kv_chunk.pd_hidden_sent
                         and self._has_pd_hidden_state(kv_chunk.state_indices)
@@ -1835,15 +1834,22 @@ class MooncakeKVManager(CommonKVManager):
                         hidden_inflight_key is not None
                         and not kv_chunk.pd_hidden_ready_sent
                     ):
-                        with self.pd_hidden_events.inflight_lock:
-                            inflight_key = self.pd_hidden_events.inflight_chunks.get(
-                                kv_chunk.room
-                            )
+                        inflight_key = self.pd_hidden_events.get_inflight_chunk(
+                            kv_chunk.room
+                        )
                         if inflight_key is not None and inflight_key != hidden_inflight_key:
-                            self._park_pd_hidden_chunk_behind_room(
+                            if self.pd_hidden_events.park_chunk_behind_room(
                                 queue, kv_chunk
-                            )
-                            continue
+                            ):
+                                continue
+                            # Missed-wake race closed (atomic check-and-park):
+                            # the inflight chunk finished between the read above
+                            # and the park, so its wake fired before this chunk
+                            # entered room_waiters. Proceed now — parking would
+                            # orphan this chunk forever (notify never sent ->
+                            # decode out-of-order). Observed 2026-08-23
+                            # windowed-mode L4: chunk [14592,30976) lost on one
+                            # rank while [30976,...) overtook it.
                     ack_ready = False
                     if waiting_for_ack:
                         ack_ready = kv_chunk.pd_hidden_ack_ready
@@ -1933,10 +1939,9 @@ class MooncakeKVManager(CommonKVManager):
                                     ),
                                 )
                                 if kv_chunk.pd_hidden_start is not None:
-                                    with self.pd_hidden_events.inflight_lock:
-                                        self.pd_hidden_events.inflight_chunks.pop(
-                                            kv_chunk.room, None
-                                        )
+                                    self.pd_hidden_events.pop_inflight_chunk(
+                                        kv_chunk.room
+                                    )
                                 self._release_or_mark_pd_hidden_done(kv_chunk)
                                 pd_hidden_failed = True
                                 break
@@ -1957,7 +1962,7 @@ class MooncakeKVManager(CommonKVManager):
                                 chunk_dst_indices = [
                                     int(x) for x in dst_indices[:row_len]
                                 ]
-                                self.notify_pd_hidden_chunk_ready(
+                                notify_kwargs = dict(
                                     remote=req.endpoint,
                                     dst_port=req.dst_port,
                                     room=req.room,
@@ -1969,6 +1974,14 @@ class MooncakeKVManager(CommonKVManager):
                                     ),
                                     dst_indices=chunk_dst_indices,
                                 )
+                                self.notify_pd_hidden_chunk_ready(
+                                    **notify_kwargs
+                                )
+                                # Retransmission payload: the control socket is
+                                # lossy (LINGER=0 rotation); park_chunk_for_ack
+                                # re-sends these args until the chunk ACK
+                                # arrives and decode dedups duplicates.
+                                kv_chunk.pd_hidden_renotify_args = notify_kwargs
                                 continue
                             pd_hidden_done_count += 1
 
@@ -1984,10 +1997,9 @@ class MooncakeKVManager(CommonKVManager):
                         and not kv_chunk.pd_hidden_ready_sent
                     ):
                         if hidden_inflight_key is not None:
-                            with self.pd_hidden_events.inflight_lock:
-                                self.pd_hidden_events.inflight_chunks[
-                                    kv_chunk.room
-                                ] = hidden_inflight_key
+                            self.pd_hidden_events.set_inflight_chunk(
+                                kv_chunk.room, hidden_inflight_key
+                            )
                         kv_chunk.pd_hidden_ready_sent = True
                         if self.park_pd_hidden_chunk_for_ack(
                             transfer_queue=queue,

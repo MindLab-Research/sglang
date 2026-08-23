@@ -4,6 +4,7 @@ import asyncio
 import concurrent.futures
 import dataclasses
 import logging
+import struct
 import threading
 import time
 from collections import defaultdict
@@ -773,13 +774,25 @@ class CommonKVManager(BaseKVManager):
                 monitor = self._monitor_cache.get(endpoint)
                 disconnected = False
                 if monitor is not None:
+                    # Drain ALL pending monitor events and judge by the LAST
+                    # one (subscribed to CONNECTED|DISCONNECTED): a socket
+                    # that dropped and already re-connected must NOT be
+                    # rotated — rotation closes it with LINGER=0 and drops
+                    # every message still queued for the peer.
+                    last_event = None
                     try:
-                        monitor.recv_multipart(zmq.NOBLOCK)
-                        disconnected = True
+                        while True:
+                            parts = monitor.recv_multipart(zmq.NOBLOCK)
+                            if parts and len(parts[0]) >= 2:
+                                (last_event,) = struct.unpack_from(
+                                    "<H", parts[0], 0
+                                )
                     except zmq.Again:
                         pass
                     except zmq.ZMQError:
                         disconnected = True
+                    if last_event is not None:
+                        disconnected = last_event == zmq.EVENT_DISCONNECTED
                 if not disconnected:
                     return sock
                 sock.close(linger=0)
@@ -791,7 +804,19 @@ class CommonKVManager(BaseKVManager):
             sock = self._zmq_ctx.socket(zmq.PUSH)
             if is_ipv6:
                 sock.setsockopt(zmq.IPV6, 1)
-            sock.setsockopt(zmq.RECONNECT_IVL, -1)
+            # 2026-08-24: RECONNECT_IVL was -1 (never reconnect). Combined
+            # with the DISCONNECTED-only monitor below, a socket whose
+            # post-rotation connect() lost the race stayed dead FOREVER: no
+            # reconnect attempts, no DISCONNECTED event (it was never
+            # connected), so the monitor never rotated it — a silent black
+            # hole that swallowed every PD-hidden READY notify on that rank
+            # pair (observed: 5/8 pairs dead under 42-way L4; each request
+            # then hard-failed on the 60s gap timeout and the held windows
+            # cascaded into a full admission wedge). Auto-reconnect at 100ms
+            # heals transient drops in place (queued messages deliver on
+            # reconnect); the app-level re-notify/dedup loop covers the
+            # residual LINGER=0 rotation drops.
+            sock.setsockopt(zmq.RECONNECT_IVL, 100)
             sock.setsockopt(zmq.SNDTIMEO, 30000)
             sock.setsockopt(zmq.LINGER, 0)
             sock.setsockopt(zmq.TCP_KEEPALIVE, 1)
@@ -801,7 +826,7 @@ class CommonKVManager(BaseKVManager):
             sock.connect(endpoint)
             self._socket_cache[endpoint] = sock
             self._monitor_cache[endpoint] = sock.get_monitor_socket(
-                zmq.EVENT_DISCONNECTED
+                zmq.EVENT_CONNECTED | zmq.EVENT_DISCONNECTED
             )
             return sock
 

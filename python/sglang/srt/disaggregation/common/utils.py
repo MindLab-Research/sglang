@@ -40,6 +40,13 @@ class TransferKVChunk:
     pd_hidden_row_len: int = 0
     pd_hidden_is_last_chunk: bool = False
     pd_hidden_release_indices: Optional[List[int]] = None
+    # Notify-retransmission payload (see hidden_events.park_chunk_for_ack):
+    # the control-channel zmq PUSH sockets are lossy by design (LINGER=0
+    # rotation on any disconnect event, common/conn.py::_connect), so a
+    # PD-hidden chunk-READY notify can be silently dropped in flight. The
+    # sender re-sends these args every few seconds until the chunk ACK
+    # arrives; decode dedups (re-ACKs) duplicates.
+    pd_hidden_renotify_args: Optional[dict] = None
     enqueue_time: float = 0.0
     source_event: Optional[Any] = None
 
@@ -69,6 +76,11 @@ class PDHiddenRequestState:
     end: int = 0
     hidden_done: bool = True
     kv_done: bool = False
+    # Monotonic timestamp of the first observed chunk GAP (a lost READY
+    # notify). While a gap is pending, the drain defers the out-of-order
+    # chunks and waits for the sender's re-notify; if the gap persists past
+    # PDH_GAP_TIMEOUT_S the request fails loudly (true loss, not a blip).
+    gap_since: float = 0.0
 
     @classmethod
     def disabled(cls) -> "PDHiddenRequestState":
@@ -104,6 +116,7 @@ class PDHiddenRequestState:
         self.end = 0
         self.hidden_done = True
         self.kv_done = False
+        self.gap_since = 0.0
 
     def mark_kv_done(self) -> None:
         self.kv_done = True

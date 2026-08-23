@@ -124,9 +124,13 @@ decode 报 `hidden chunk arrived out of order` → 请求挂死。修复：flush
 实测：68 万 token 大请求 20s 完成；并发小请求零饿死；`PDH-PARK` 只短暂出现后即
 `PDH-ADMIT`。
 
-**工程边界（如实声明）**：窗口硬约束 `W ≥ prefill --chunked-prefill-size`（sender 按
-整块 chunk 发包要求 src/dst 等长）；窗口 streaming 模式存在一个跨请求 chunk 乱序
-的已知 bug 未修，**生产部署默认 legacy 模式**（窗口算法作为可选项保留，env 一键切换）。
+**工程边界（2026-08-24 更新：窗口模式已彻底修复并通过全量验收）**：窗口硬约束 `W ≥ prefill --chunked-prefill-size`（sender 按
+整块 chunk 发包要求 src/dst 等长）。原"窗口 streaming 有跨请求 chunk 乱序未修 bug"结论经四层根因
+挖掘被推翻——R1 事故实为：①启动脚本 export 误置于 launch 后（窗口模式从未真正生效）；②控制面
+zmq socket 永久黑洞（RECONNECT_IVL=-1 + monitor 只订 DISCONNECTED）；③notify 丢失无自愈；④
+park-behind 唤醒竞态。修复后（自愈重连 + 重发/去重/缺口等待协议 + 原子 park），窗口模式通过
+ladder×3（冷/热树）20/20、case50×4 轮全绿、**21 请求同时强制中止风暴存活**、523,099 次集体调用
+×8 rank 位点序列完美奇偶的验证矩阵。legacy 模式仍为 env 一键可回退项（`SGLANG_PD_HIDDEN_RECV_WINDOW=0`）。
 
 ### 2.4 死锁免疫与优雅降级
 
@@ -242,13 +246,15 @@ page_indices 零页数/首零位置/真实页区间。19 条请求的表格让�
 性能基线（64 并发 bench）：TPOT p50 8.4ms、峰值 1707 tok/s；630K 等同请求 radix
 命中 21.8s → 1.7s；200K 冷前缀 CP=8 加速 3.5×。
 
-## 5. 残余项与边界（如实声明）
+## 5. 残余项与边界（2026-08-24 更新）
 
 - **DFlash 不支持 grammar-constrained**：strict tools/response_format 请求 400 快速
   失败（case50 中 8 例确定性失败，非部署缺陷，属上游能力边界）。
 - **4×300K+ 巨型并发 + radix OFF 全量重算**时 DSpark draft 路径有
   `cudaErrorIllegalAddress`（radix ON 缓存命中降低有效 KV 可规避，40/50 后未复现）。
-- **窗口 streaming 模式**的跨请求 chunk 乱序 bug 未修——生产默认 legacy 模式。
+- **~~窗口 streaming 模式的跨请求 chunk 乱序 bug 未修~~** → 已于 2026-08-24 彻底
+  修复并全量验收（见 §2.3 更新）：四层根因（脚本 env 位置 / socket 黑洞 / notify
+  丢失 / park 竞态）全部结案，21-abort 风暴存活 + 523K 集体调用奇偶校验通过。
 - **kernel 级数值非确定**：同输入 greedy 4 连发可有 3-4 种干净变体（GPU atomics），
   属硬件栈特性，与缓存系统无关（FORCE_MISS 实验定音）。
 
