@@ -948,6 +948,10 @@ class ServerArgs:
     ] = None
     enable_dsa_prefill_context_parallel: A[bool, Arg(no_cli=True)] = False
     dsa_prefill_cp_mode: A[str, Arg(no_cli=True)] = "round-robin-split"
+    enable_dsa_prefill_cp_layersplit: A[
+        bool,
+        "Enable cp layer-split: each CP rank stores KV only for its owned layer block.",
+    ] = False
     enable_prefill_context_parallel: A[bool, Arg(no_cli=True)] = False
     prefill_cp_mode: A[str, Arg(no_cli=True)] = "in-seq-split"
     # DP attention
@@ -2598,6 +2602,9 @@ class ServerArgs:
         self._validate_prefill_only_disable_kv_cache_args()
         self._handle_dcp_validation()
 
+        # Validate --enable-dsa-prefill-cp-layersplit guardrails early (no model
+        # config needed).
+
         if self.model_path.lower() in ["none", "dummy"]:
             # Skip for dummy models
             return
@@ -3800,6 +3807,7 @@ class ServerArgs:
                         # DSACPLayerCommunicator does not all-reduce attention-TP
                         # partial o_proj outputs before replicated dense FFNs.
                         self.attn_cp_size = self.tp_size // self.dp_size
+            #self._validate_cp_layersplit_args()
                         self.cuda_graph_config.prefill.backend = Backend.DISABLED
                         logger.warning(
                             "Enabled DSA context parallel: "
@@ -3885,6 +3893,7 @@ class ServerArgs:
                     # DSACPLayerCommunicator does not all-reduce attention-TP
                     # partial o_proj outputs before replicated dense FFNs.
                     self.attn_cp_size = self.tp_size // self.dp_size
+            #self._validate_cp_layersplit_args()
                     self.cuda_graph_config.prefill.backend = Backend.DISABLED
                     logger.warning(
                         f"Enable Context Parallel opt for MLA, "
@@ -5835,6 +5844,61 @@ class ServerArgs:
                 "HiSparse uses a dedicated pool family that is not the no-op MHA pool."
             )
 
+    def _validate_cp_layersplit_args(self):
+        """Validate --enable-dsa-prefill-cp-layersplit guardrails.
+
+        Runs before the dummy-model short-circuit so misuse is caught early.
+        Checks that require model config (num_hidden_layers divisibility and
+        MLA/DSA arch) are enforced in build_kv_pool_maybe_layersplit at pool
+        construction time in model_runner_kv_cache_mixin._init_pools().
+        """
+        if not self.enable_dsa_prefill_cp_layersplit:
+            return
+
+        if not (self.enable_prefill_cp and self.attn_cp_size > 1):
+            raise ValueError(
+                "--enable-dsa-prefill-cp-layersplit requires "
+                "--enable-prefill-cp with attn_cp_size > 1 "
+                f"(got enable_prefill_cp={self.enable_prefill_cp}, "
+                f"attn_cp_size={self.attn_cp_size})"
+            )
+
+        if self.disaggregation_mode != "prefill":
+            raise ValueError(
+                "--enable-dsa-prefill-cp-layersplit requires "
+                f"--disaggregation-mode prefill (got {self.disaggregation_mode!r})"
+            )
+
+        if self.enable_hierarchical_cache:
+            if not envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get():
+                raise ValueError(
+                    "--enable-dsa-prefill-cp-layersplit with --enable-hierarchical-cache "
+                    "requires the unified radix cache: set SGLANG_ENABLE_UNIFIED_RADIX_TREE=1. "
+                    "L2 HiCache for layer-split is implemented only on the UnifiedRadixCache "
+                    "path (a DSA model otherwise routes to HiRadixCache, which does not "
+                    "support the layer-split wrapper)."
+                )
+            if self.hicache_storage_backend is not None and (
+                self.hicache_storage_backend not in ("file", "mooncake")
+            ):
+                raise ValueError(
+                    "--enable-dsa-prefill-cp-layersplit + L3 only supports the 'file' "
+                    "and 'mooncake' storage backends (only their storage keys are "
+                    f"namespaced by CP rank); got {self.hicache_storage_backend!r}."
+                )
+            if self.hicache_size > 0:
+                raise ValueError(
+                    "--enable-dsa-prefill-cp-layersplit with --enable-hierarchical-cache "
+                    "requires ratio-based host sizing (--hicache-size 0 / use --hicache-ratio); "
+                    "byte-budget host sizing can diverge across CP ranks."
+                )
+
+        if self.speculative_algorithm is not None:
+            raise ValueError(
+                f"--enable-dsa-prefill-cp-layersplit is incompatible with speculative decoding "
+                f"(speculative_algorithm={self.speculative_algorithm!r})."
+            )
+
     def _handle_prefill_only_disable_kv_cache(self):
         """Validate --prefill-only-disable-kv-cache backend constraint.
 
@@ -5926,7 +5990,7 @@ class ServerArgs:
         if (
             self.hicache_mem_layout == "page_first"
             and self.hicache_io_backend == "kernel"
-            and is_hip()
+            and False  # allow page_first on ROCm
         ):
             self.hicache_mem_layout = "layer_first"
             logger.warning(

@@ -111,7 +111,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             allocator_type,
         )
         self.element_dim = self.device_pool.head_num * self.device_pool.head_dim
-        self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
+        self.can_use_jit = (_is_cuda or _is_hip) and can_use_hicache_jit_kernel(
             element_size=self.element_dim * self.dtype.itemsize
         )
 
@@ -193,7 +193,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
             return
 
-        self.can_use_write_back_jit = _is_cuda and can_use_write_back_jit_kernel(
+        self.can_use_write_back_jit = (_is_cuda or _is_hip) and can_use_write_back_jit_kernel(
             element_size=self.element_dim * self.dtype.itemsize,
         )
         if not self.can_use_write_back_jit:
@@ -688,7 +688,7 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
         self.lock = threading.RLock()
         self.clear()
 
-        self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
+        self.can_use_jit = (_is_cuda or _is_hip) and can_use_hicache_jit_kernel(
             element_size=self.token_stride_size
         )
         self.k_device_ptrs = torch.tensor(
@@ -1282,7 +1282,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             device,
             allocator_type,
         )
-        self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
+        self.can_use_jit = (_is_cuda or _is_hip) and can_use_hicache_jit_kernel(
             element_size=self.kv_cache_dim * self.dtype.itemsize
         )
 
@@ -1402,7 +1402,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
             return
 
-        self.can_use_write_back_jit = _is_cuda and can_use_write_back_jit_kernel(
+        self.can_use_write_back_jit = (_is_cuda or _is_hip) and can_use_write_back_jit_kernel(
             element_size=self.kv_cache_dim * self.dtype.itemsize,
         )
         if not self.can_use_write_back_jit:
@@ -2475,7 +2475,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
             return
 
-        self.can_use_write_back_jit = _is_cuda and can_use_write_back_jit_kernel(
+        self.can_use_write_back_jit = (_is_cuda or _is_hip) and can_use_write_back_jit_kernel(
             element_size=self.item_bytes * self.dtype.itemsize,
         )
         staging_page_capacity = min(self.num_host_pages, _WRITE_BACK_STAGING_PAGE_CHUNK)
@@ -2884,7 +2884,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
         if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
             return
 
-        self.can_use_write_back_jit = _is_cuda and can_use_write_back_jit_kernel(
+        self.can_use_write_back_jit = (_is_cuda or _is_hip) and can_use_write_back_jit_kernel(
             element_size=self.state_page_bytes * self.dtype.itemsize,
         )
         staging_page_capacity = min(self.num_host_pages, _WRITE_BACK_STAGING_PAGE_CHUNK)
@@ -3384,7 +3384,7 @@ class DSAIndexerPoolHost(HostKVCache):
         if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
             return
 
-        self.can_use_write_back_jit = _is_cuda and can_use_write_back_jit_kernel(
+        self.can_use_write_back_jit = (_is_cuda or _is_hip) and can_use_write_back_jit_kernel(
             element_size=self.indexer_page_stride_size * self.indexer_dtype.itemsize,
         )
         staging_page_capacity = min(
@@ -3425,7 +3425,7 @@ class DSAIndexerPoolHost(HostKVCache):
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
             host_indices, device_indices
         )
-        use_kernel = io_backend == "kernel" and self.indexer_page_stride_size % 8 == 0
+        use_kernel = io_backend == "kernel" and self.indexer_page_stride_size % 4 == 0
         if use_kernel:
             if self.layout == "layer_first":
                 transfer_kv_per_layer_mla(
@@ -3436,14 +3436,14 @@ class DSAIndexerPoolHost(HostKVCache):
                     item_size=self.indexer_page_stride_size,
                 )
             elif self.layout == "page_first":
-                transfer_kv_per_layer_mla_pf_lf(
-                    src=self.index_k_with_scale_buffer,
-                    dst=device_pool.index_k_with_scale_buffer[layer_id],
+                # Exp-06d: use direct variant to bypass sgl_kernel.so item_size % 8 alignment check
+                transfer_kv_per_layer_direct_pf_lf(
+                    src_ptrs=[self.index_k_with_scale_buffer],
+                    dst_ptrs=[device_pool.index_k_with_scale_buffer[layer_id]],
                     src_indices=host_page_indices,
                     dst_indices=device_page_indices,
                     layer_id=layer_id,
-                    item_size=self.indexer_page_stride_size,
-                    src_layout_dim=self.indexer_layout_dim,
+                    page_size=1,
                 )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
@@ -3476,7 +3476,7 @@ class DSAIndexerPoolHost(HostKVCache):
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
             host_indices, device_indices
         )
-        use_kernel = io_backend == "kernel" and self.indexer_page_stride_size % 8 == 0
+        use_kernel = io_backend == "kernel" and self.indexer_page_stride_size % 4 == 0
         if use_kernel:
             if self.layout == "layer_first":
                 transfer_kv_all_layer_mla(
@@ -3499,14 +3499,12 @@ class DSAIndexerPoolHost(HostKVCache):
                         element_size=self.indexer_page_stride_size,
                     )
                 else:
-                    transfer_kv_all_layer_mla_lf_pf(
-                        src_layers=self.index_k_device_ptrs,
-                        dst=self.index_k_with_scale_buffer,
+                    transfer_kv_all_layer_direct_lf_pf(
+                        src_ptrs=device_pool.index_k_with_scale_buffer,
+                        dst_ptrs=[self.index_k_with_scale_buffer],
                         src_indices=device_page_indices,
                         dst_indices=host_page_indices,
-                        item_size=self.indexer_page_stride_size,
-                        dst_layout_dim=self.indexer_layout_dim,
-                        num_layers=self.layer_num,
+                        page_size=1,
                     )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")

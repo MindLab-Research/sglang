@@ -19,9 +19,9 @@ struct HicacheRelayoutParams {
 template <typename IndexType, int64_t kElementSize, bool kIsMLA>
 __global__ void hicache_relayout_kernel(const __grid_constant__ HicacheRelayoutParams params) {
   using namespace device;
-  using pack_t = uint4;
-  static_assert(kElementSize % 16 == 0, "hicache_relayout_kernel requires 16-byte aligned element size");
-  constexpr uint32_t kVecBytes = 16;
+  using pack_t = uint1;
+  static_assert(kElementSize % 4 == 0, "hicache_relayout_kernel requires 16-byte aligned element size");
+  constexpr uint32_t kVecBytes = 4;
   constexpr uint32_t kVecPerItem = kElementSize / kVecBytes;
 
   const auto& [k_cache_dst, v_cache_dst, indices_src, k_ptr_src, v_ptr_src, num_pages, num_layers, page_size] = params;
@@ -73,7 +73,7 @@ inline void launch_hicache_relayout_kernel(
   using namespace host;
 
   constexpr uint32_t kRelayoutBlockSize = 256;
-  constexpr uint32_t kVecPerItem = kElementSize / 16;
+  constexpr uint32_t kVecPerItem = kElementSize / 4;
   const auto total_vecs = static_cast<uint64_t>(num_pages) * page_size * num_layers * kVecPerItem;
   const auto kernel = use_int32 ? hicache_relayout_kernel<int32_t, kElementSize, kIsMLA>
                                 : hicache_relayout_kernel<int64_t, kElementSize, kIsMLA>;

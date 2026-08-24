@@ -438,10 +438,13 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                     .position(|w| w.url() == tenant_url)
                     .filter(|&idx| workers[idx].is_healthy())
             } else {
-                // Low cache match: use worker with minimum load
+                // Low cache match: use worker with smallest tree size
+                // (most available cache capacity), per design doc.
+                // Tree size = per-tenant char count, maintained incrementally.
+                let char_counts = tree.get_tenant_char_count();
                 healthy_indices
                     .iter()
-                    .min_by_key(|&&idx| workers[idx].load())
+                    .min_by_key(|&&idx| char_counts.get(workers[idx].url()).copied().unwrap_or(0))
                     .copied()
             };
 

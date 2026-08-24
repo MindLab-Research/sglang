@@ -137,7 +137,7 @@ def dsa_cp_round_robin_split_data(input_: Union[torch.Tensor, List]):
         if cur_len == 0:
             return input_.new_empty(0, *input_.shape[1:])
         indices = torch.arange(cp_rank, tokens, cp_size, device=input_.device)
-        return input_[indices]
+        return input_[indices].contiguous()
 
     # for torch device tensor
     return input_.view(-1, cp_size, *input_.shape[1:])[:, cp_rank].contiguous()
