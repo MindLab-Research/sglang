@@ -309,6 +309,13 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.hisparse_page_size = self.hisparse_kvcache.page_size
 
         self.logical_attn_allocator = logical_attn_allocator
+        # HiSparse keeps FULL KV resident in host (logical) pool; the device
+        # pool only holds compressed sparse top-k. The radix-tree FULL component
+        # frees device full-attention KV via allocator.full_attn_allocator — on a
+        # DSV4 HiSparse wrap this must be the logical (host) pool, since there is
+        # no separate device full pool. (2026-08-24: unblocks --enable-hisparse
+        # startup; semantics for radix/hicache host-only matching still to verify.)
+        self.full_attn_allocator = logical_attn_allocator
         self._kvcache = logical_attn_allocator._kvcache
         self.hisparse_attn_allocator = PagedTokenToKVPoolAllocator(
             self._size_hisparse,

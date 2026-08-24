@@ -1884,7 +1884,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if dcp_enabled() and is_deepseek_v4(
                 self.scheduler.model_config.hf_config
             ):
-                _pi_page_size = self.token_to_kv_pool_allocator.page_size
+                # DSV4 non-hisparse: the C4/compressed pools are item-aligned to
+                # the GLOBAL page_size (256 tokens per c4 row), so the DCP 64-token
+                # transfer page index misaligns them — use the logical page size.
+                # DSV4 hi hisparse: host locs live in the COMPRESSED domain (c4
+                # page = hisparse_page_size = 64, compress_ratio=4). Converting
+                # with the 256 logical page size shrinks page ids 4x and drops 3/4
+                # of the items -> KV written to wrong pages -> garbled decode /
+                # gateway timeout -> Aborted by AbortReq (2026-08-24, hisparse×PD).
+                # So hisparse must keep kv_transfer_page_size here.
+                if not self.scheduler.enable_hisparse:
+                    _pi_page_size = self.token_to_kv_pool_allocator.page_size
             page_indices = kv_to_page_indices(kv_indices, _pi_page_size).astype(
                 np.int32
             )
@@ -2333,7 +2343,7 @@ def alloc_for_decode_prealloc_hisparse(
             last_loc=last_loc,
             extend_num_tokens=fill_len,
         )
-    return _guard_kv_indices(kv_loc, allocator.size, "prealloc_hisparse.kv_loc")
+    return _guard_kv_indices(kv_loc, allocator.size_full, "prealloc_hisparse.kv_loc")
 
 
 def _guard_kv_indices(
