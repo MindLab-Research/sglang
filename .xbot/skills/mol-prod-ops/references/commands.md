@@ -212,7 +212,7 @@ if UPSTREAM_API_KEY:
 kill <old-proxy-pid>   # exact PID
 export PYTHONPATH=/root/Mixture-of-LoRA-Harness-alpha
 export UPSTREAM=http://127.0.0.1:31001
-export MOL_API_KEY=MOL_API_KEY_1P1D
+export MOL_API_KEY=${MOL_API_KEY_1P1D}   # 真值见仓库根 secrets.env (gitignored)
 export MOL_UPSTREAM_API_KEY=sk-glm52-pd
 export PROXY_PORT=31000
 export MOL_USE_MODEL_ROUTER=1
@@ -235,7 +235,7 @@ curl -s http://127.0.0.1:31001/readiness   # expect {"status":"ready",...}
 # end-to-end through Proxy
 curl -s -m 60 http://127.0.0.1:31000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer MOL_API_KEY_1P1D" \
+  -H "Authorization: Bearer ${MOL_API_KEY}" \
   -d '{"model":"Macaron-V1-Venti","messages":[{"role":"user","content":"1+1等于几?只回答数字"}],"max_tokens":64}'
 # expect: content "2", route L0, pure_model_route
 ```

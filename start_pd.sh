@@ -59,7 +59,7 @@ ROUTER_PORT="${ROUTER_PORT:-31000}"
 GATEWAY_PORT="${GATEWAY_PORT:-31001}"
 PROXY_PORT="${PROXY_PORT:-31000}"
 API_KEY="sk-glm52-pd"
-MOL_API_KEY="${MOL_API_KEY:-MOL_API_KEY_1P1D}"
+MOL_API_KEY="${MOL_API_KEY:-${MOL_API_KEY_1P1D:-}}"   # 真值见仓库根 secrets.env (gitignored)，部署时 source secrets.env
 
 # ================================================================
 # prefill — CP8 + L3 HiCache + LoRA, port 30100

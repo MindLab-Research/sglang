@@ -135,7 +135,7 @@ collective（NCCL/gloo）调用数或参数跨 rank 不匹配 → 死锁 → 600
 - B300-1 = SSH `1021`：prefill + router(30000) + gateway(31001) + proxy(31000)；
   Python `/root/sglang_venv/bin/python3`；代码 `/root/sglang_venv/.../sglang/srt/`
 - B300-2 = SSH `1022`：decode（**DCP=4 + EAGLE 5 steps**）；Python `/root/v15_patched/bin/python3`
-- 公网 `8.213.215.2:18888`，model `Macaron-V1-Venti`，key `MOL_API_KEY_1P1D`
+- 公网 `8.213.215.2:18888`，model `Macaron-V1-Venti`，key `$MOL_API_KEY_1P1D`（真值见仓库根 secrets.env）
 - **必须带 `thinking_mode`（reasoning_effort=max）**，否则 GLM-5.2 输出异常
 
 ### 5.1.1 1P1D 规范启动配置（2026-08-10 round30-34 二分实验验证）
@@ -242,7 +242,7 @@ expand_lens_2d 有轻微负影响（24→21），需修复或回退。⚠️ 修
 ### 5.2 2P3D（8.222.11.182，SSH 1100–1104）
 - 1100/1103/1104 decode（DCP=4 + EAGLE 5 steps），1101 prefill+router+gateway+proxy，1102 prefill
 - Python `/opt/sglang-venv/bin/python`；`sglang-router` 在 `/opt/sglang-venv/bin/`（**不在 PATH**）
-- 公网 `8.222.11.182:18777`，key `MOL_API_KEY_2P3D`
+- 公网 `8.222.11.182:18777`，key `$MOL_API_KEY_2P3D`（真值见仓库根 secrets.env）
 - 详细运维见 skill：`mol-prod-ops`（拓扑/重启/故障树）、`otel-reporting`（监控）
 
 ### 5.3 ⛔ 重启铁律（2026-08-05 确立，2026-08-06 增补）

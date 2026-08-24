@@ -18,7 +18,7 @@
 | 1102 | `ssh -p 1102` | 10.0.58.35 | 测试 prefill + 测试 router | `/root/sglang_venv` | 30100 / 30000 |
 | 1104 | `ssh -p 1104` | 10.0.58.37 | 测试 decode | `/root/sglang_venv` | 30200 |
 
-**公网入口**：`8.222.11.182:18777` → proxy(31000)。key `MOL_API_KEY_2P3D`。
+**公网入口**：`8.222.11.182:18777` → proxy(31000)。key `$MOL_API_KEY_2P3D`（真值见仓库根 secrets.env）。
 模型名分两层：**proxy 层 `Macaron-V1-Venti`**（MoL 人格路由），router/引擎层 `glm52-fp8-official`。
 
 **请求链路**：公网 18777 → proxy(31000, mol_harness) → gateway(31001, smg) → router(30000, smg)
@@ -159,7 +159,7 @@ cd /root/mol-stack && \
 PYTHONPATH=/root/mol-stack \
 UPSTREAM=http://127.0.0.1:31001 \
 MOL_UPSTREAM_RUNTIME=sglang \
-MOL_API_KEY=MOL_API_KEY_2P3D \
+MOL_API_KEY="${MOL_API_KEY_2P3D}" \
 MOL_UPSTREAM_API_KEY=sk-glm52-pd \
 PROXY_PORT=31000 \
 MOL_USE_MODEL_ROUTER=1 \

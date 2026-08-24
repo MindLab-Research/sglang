@@ -1,6 +1,6 @@
 ---
 name: mol-prod-ops
-description: MoL (Mixture-of-LoRA) production ops runbook for the 5-node hybrid sglang-PD + vllm cluster AND the separate 2P3D cluster (8.222.11.182:1100-1104). Use when asked to report production status, add or remove a worker, restart a PD pair / prefill / decode / router, restart a vllm worker, replace the Proxy, restart the gateway or proxy, or triage a worker that is down, crashed, unhealthy, returning 503, or producing garbled output. Covers gateway:30001 + Proxy:30000 on deploy-0, two sglang PD pairs (pd-router-1=deploy-2/3, pd-router-2=deploy-1/4), the deploy-0 vllm worker, and the 2P3D cluster (2 prefill + 3 decode, public entry 8.222.11.182:18777, key MOL_API_KEY_2P3D, model Macaron-V1-Venti).
+description: MoL (Mixture-of-LoRA) production ops runbook for the 5-node hybrid sglang-PD + vllm cluster AND the separate 2P3D cluster (8.222.11.182:1100-1104). Use when asked to report production status, add or remove a worker, restart a PD pair / prefill / decode / router, restart a vllm worker, replace the Proxy, restart the gateway or proxy, or triage a worker that is down, crashed, unhealthy, returning 503, or producing garbled output. Covers gateway:30001 + Proxy:30000 on deploy-0, two sglang PD pairs (pd-router-1=deploy-2/3, pd-router-2=deploy-1/4), the deploy-0 vllm worker, and the 2P3D cluster (2 prefill + 3 decode, public entry 8.222.11.182:18777, key $MOL_API_KEY_2P3D, model Macaron-V1-Venti).
 ---
 
 # MoL Production Ops
@@ -115,7 +115,7 @@ and [fault-triage.md](references/fault-triage.md) (search `2P3D`).
 
 ### 通用铁律（不变）
 
-- 公网入口 `8.222.11.182:18777`，key `MOL_API_KEY_2P3D`
+- 公网入口 `8.222.11.182:18777`，key `$MOL_API_KEY_2P3D`（真值见仓库根 secrets.env）
 - **每次重启必须同步最新代码**（rsync 本地 `python/sglang/` → 双端 venv）+ 清
   `__pycache__` + md5 抽查关键文件
 - **⛔ rsync 后必须删除 L20D triton config**（TPOT 23ms→80ms 杀手）：

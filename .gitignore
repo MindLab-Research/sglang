@@ -293,3 +293,6 @@ internal-docs/
 
 # xbot local agent config
 .xbot/
+
+# 生产 API key —— 真值放仓库根 secrets.env (gitignored)，repo 内只引用 ${MOL_API_KEY_*}
+secrets.env

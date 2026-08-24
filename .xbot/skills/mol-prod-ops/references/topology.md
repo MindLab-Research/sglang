@@ -157,7 +157,7 @@ distinct SSH ports.  Code and weights live under `/opt/sglang-venv/`.
 
 - **Public URL**: `http://8.222.11.182:18777/v1/chat/completions`
 - **Port mapping**: 18777 (public) → proxy 31000 (1101) → gateway 31001 → router 30000 → prefill/decode
-- **Proxy API key**: `MOL_API_KEY_2P3D`
+- **Proxy API key**: `$MOL_API_KEY_2P3D`（真值见仓库根 secrets.env）
 - **Router API key**: `sk-glm52-pd` (used by gateway → router)
 - **Model name**: `Macaron-V1-Venti` (proxy routes to `glm52-fp8-official` + LoRA)
 
@@ -264,7 +264,7 @@ ROUTER_BIN=/opt/sglang-venv/bin/sglang-router \
   --prefill 10.0.58.34:30100 --prefill 10.0.58.35:30100 \
   --decode 10.0.58.38:30200 --decode 10.0.58.36:30200 --decode 10.0.58.37:30200
 GATEWAY_BIN=/usr/local/bin/smg bash /root/start_pd.sh gateway
-MOL_API_KEY=MOL_API_KEY_2P3D PROXY_SRC=/root/mol-stack bash /root/start_pd.sh proxy
+MOL_API_KEY="${MOL_API_KEY_2P3D}" PROXY_SRC=/root/mol-stack bash /root/start_pd.sh proxy
 bash /root/manage_otelcol.sh start    # ⛔ 重启后必须重启 otelcol，否则看板 nodata
 
 # 7) 确认公网：curl -s -m 60 http://8.222.11.182:18777/v1/chat/completions（期望 200 + 正确输出）
@@ -283,7 +283,7 @@ ROUTER_BIN=/opt/sglang-venv/bin/sglang-router \
 GATEWAY_BIN=/usr/local/bin/smg bash /root/start_pd.sh gateway
 
 # Restart proxy (on 1101)
-MOL_API_KEY=MOL_API_KEY_2P3D PROXY_SRC=/root/mol-stack bash /root/start_pd.sh proxy
+MOL_API_KEY="${MOL_API_KEY_2P3D}" PROXY_SRC=/root/mol-stack bash /root/start_pd.sh proxy
 
 # Restart decode (on any decode node, e.g. 1100)
 PYTHON=/opt/sglang-venv/bin/python bash /root/start_pd.sh decode
