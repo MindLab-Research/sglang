@@ -59,11 +59,10 @@ class DecodeHiCachePreallocMixin:
     """HiCache hooks for ``DecodePreallocQueue``: issue prefetch + reserve tokens."""
 
     def _build_decode_prefix_match(self, req: Req, result: Any) -> DecodePrefixMatch:
-        """Convert a ``match_prefix_for_req`` result into ``DecodePrefixMatch``.
-
-        Performs the optional L3 storage hit length query when decode-side
-        HiCache is enabled and the last host node is backed up.
-        """
+        """Convert a ``match_prefix_for_req`` result into ``DecodePrefixMatch``."""
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"[L3-DBG] _build_decode_prefix_match: enter, rid={req.rid[:12]}, enable_hicache={self.scheduler.enable_decode_hicache}")
         prefix_indices = result.device_indices
         l1_prefix_len = len(prefix_indices)
         l2_host_hit_length = result.host_hit_length
@@ -72,6 +71,7 @@ class DecodeHiCachePreallocMixin:
         last_host_node = None
         if self.scheduler.enable_decode_hicache:
             last_host_node = result.last_host_node
+            logger.info(f"[L3-DBG] _build_decode_prefix_match: last_host_node={'None' if last_host_node is None else 'ok'}, backuped={getattr(last_host_node, 'backuped', 'N/A')}")
             if last_host_node.backuped or last_host_node is self.tree_cache.root_node:
                 matched_len = l1_prefix_len + l2_host_hit_length
                 suffix_tokens = req.origin_input_ids[matched_len:]
@@ -81,12 +81,14 @@ class DecodeHiCachePreallocMixin:
                     if self.tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )
+                logger.info(f"[L3-DBG] _build_decode_prefix_match: before query_storage_hit_length, suffix_len={len(suffix_tokens)}")
                 l3_storage_hit_length = self.tree_cache.query_storage_hit_length(
                     last_host_node,
                     suffix_tokens,
                     last_hash,
                     prefix_keys,
                 )
+                logger.info(f"[L3-DBG] _build_decode_prefix_match: after query_storage_hit_length, l3_hit={l3_storage_hit_length}")
 
         return DecodePrefixMatch(
             prefix_indices=prefix_indices,
@@ -156,12 +158,18 @@ class HiCacheRestoreGatedKVReceiver:
         self.decode_req = decode_req
 
     def poll(self) -> KVPoll:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"[L3-DBG] HiCacheRestoreGatedKVReceiver.poll: enter, rid={self.decode_req.req.rid[:12]}, restore_status={self.decode_req.hicache_restore_status}")
         poll = self.decode_req.kv_receiver.poll()
+        logger.info(f"[L3-DBG] HiCacheRestoreGatedKVReceiver.poll: kv_receiver.poll()={poll}, restore_status={self.decode_req.hicache_restore_status}")
         if (
             poll == KVPoll.Success
             and self.decode_req.hicache_restore_status == HiCacheRestoreResult.PENDING
         ):
+            logger.info(f"[L3-DBG] HiCacheRestoreGatedKVReceiver.poll: gating Success -> Transferring")
             return KVPoll.Transferring
+        logger.info(f"[L3-DBG] HiCacheRestoreGatedKVReceiver.poll: return {poll}")
         return poll
 
 
@@ -179,14 +187,11 @@ class DecodeHiCacheTransferMixin:
             decode_req.hicache_restored_node = None
 
     def _try_hicache_queue_load_back(self, dr: DecodeRequest) -> bool:
-        """Queue one L2->L1 load_back op for ``dr``; True iff a DMA was queued.
-
-        On success, ``dr.hicache_restored_node`` and ``hicache_restored_kv_indices``
-        are populated, and an inc_lock_ref is held until commit/abort.
-        Trivial cases (all-on-device / no needed coverage) auto-flip to READY.
-        Failback paths flip to FAILED.
-        """
+        """Queue one L2->L1 load_back op for ``dr``; True iff a DMA was queued."""
+        import logging
+        logger = logging.getLogger(__name__)
         pm = dr.prefix_match
+        logger.info(f"[L3-DBG] _try_hicache_queue_load_back: enter, rid={dr.req.rid[:12]}, l3_hit={pm.l3_storage_hit_length if pm else 'N/A'}")
 
         # Wait for L3 -> L2 prefetch to drain (skip when no L3 hit).
         if pm.l3_storage_hit_length > 0:
@@ -238,7 +243,11 @@ class DecodeHiCacheTransferMixin:
         return True
 
     def _process_hicache_local_restores(self, decode_reqs: List[DecodeRequest]) -> None:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"[L3-DBG] _process_hicache_local_restores: enter, n_reqs={len(decode_reqs)}")
         if not hasattr(self.tree_cache, "is_load_back_event_done"):
+            logger.info(f"[L3-DBG] _process_hicache_local_restores: no is_load_back_event_done, return")
             return
 
         # Filter once: keep only PENDING reqs that still need restore work;
