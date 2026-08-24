@@ -262,6 +262,20 @@ expand_lens_2d 有轻微负影响（24→21），需修复或回退。⚠️ 修
 
 ---
 
+### 5.4 DSpark PD 排障铁律（2026-08-24 确立，adm 怒令）
+
+1. **⛔ decode 端 radix 绝对不能关**：PD 分离 + DSpark **必须双端开 radix**
+   （prefill `--enable-hierarchical-cache`/radix + decode `--disaggregation-decode-enable-radix-cache`
+   + `SGLANG_DECODE_RADIX_ALLOW_SWA=1`）。双端 radix 是 DSpark PD 的**架构性前提**——
+   prefill 命中少传 KV，decode 必须命中对齐复用；关 decode radix = prefill 命中后
+   hidden/KV 覆盖缺口必炸（`hidden_start != decode_prefix_len` → 500 / out-of-order → abort），
+   等于倒退回 2026-08-15 之前的全链路事故。**任何"关 radix 试一下"都是禁止的。**
+2. **⛔ 禁止"不改代码、只改参数就重启"**：遇到 bug 必须走**代码级根因修复**
+   （读代码 → 定位 → 改代码 → 验证），不许用改启动参数 / env 开关绕过
+   （关 radix、关 `--speculative-algorithm`、关 draft graph 之类的参数级"修复"一律无效）。
+   需要二分定位时，**以 commit 切换（代码变更）为单位**，不做参数级开关实验。
+   例外：仅"恢复被误改的正确生产配置"允许参数级重启（那是纠错，不是修 bug）。
+
 ## 6. 安全与密钥铁律（2026-08-24 确立）
 
 任何 API key / access token / 密码 / 私钥 **绝不允许硬编码进 repo**（含 AGENTS.md、docs/agent/、.xbot/skills/、scripts、tools、test）。2026-08-24 已用 `git filter-repo --force` 把历史中的公网 key 整体铲除并强推。铁律：
@@ -332,6 +346,9 @@ rsync -avz --exclude='__pycache__' --exclude='*.pyc' "$SRC" root@<node>:"$DEST"
 - **⛔ V4 Pro DSV4 高水位跨请求 KV 污染 = guard 用 SWA 尺寸当 FULL 池 cap（2026-08-23 终局修复）**：`decode.py::_guard_kv_indices` 三处调用点传 `token_to_kv_pool_allocator.size`——hybrid-SWA composite `SWATokenToKVPoolAllocator.size == min(full, swa)` = **SWA 尺寸**（V4 Pro=1,438,464），而 full 池虚拟 id 域是 4,794,880。分配水位一旦越过 SWA 尺寸（≈3 个 300K giant 后），所有 `id ≥ swa_size` 的合法目的地 id 被 guard 判"garbage" **静默洗成 0**（padding sink 页）→ KV 传输写进共享页 0、请求也从页 0 读 → **跨请求互读互写 = 确定性内容污染**（probe 稳定返回别的 case50 内容、accept=1.00 draft/target 同错、[full] leak 608 次）。修复=三处 cap 改 `size_full`（composite 有该属性，基类恒等 `.size`）。**判据**：`grep KV-PRODUCER-OOB decode_v4.log` 应为 0；DCP-PD-IDX 的 page_indices 无 0（修复前 giant 1564 页里 1444 个 0、probe 整段全 0）；`samples=[1438464,1438465,...] cap=1438464`（=SWA 尺寸精确咬合）是本病的指纹。验证：ladder 4 级 20/20 clean + case50×2 @600rpm 42/50+8 grammar、两轮 5/5 clean、泄漏 0、accept 3.15-3.75。**教训：`allocator.size` 在 SWA composite 语义是 min(full,swa)，任何拿它当 full 池 id 上限的守卫都会在高水位静默腐蚀**。
 - **✅ DSpark PD 窗口模式（RECV_WINDOW）彻底修复（2026-08-24，四层根因全部结案）**：此前"窗口 streaming 有跨请求 chunk 乱序未修 bug、生产一律 legacy"的结论被推翻——R1 事故是四层叠加：①**start 脚本 export 误置于 launch 之后**（窗口模式从未真正生效，"验证过的 legacy"其实一直在跑）；②**控制面 zmq PUSH 永久黑洞**（common/conn.py `_connect`：`RECONNECT_IVL=-1` 不重连 + monitor 只订 EVENT_DISCONNECTED → 断线轮换后新 socket 连接失败时永不重试永不轮换，L4 并发下 5/8 rank 对集体黑洞，notify 全丢）→ 修复=RECONNECT_IVL=100 + monitor 双事件（CONNECTED|DISCONNECTED）按最后事件判定，已自愈的 socket 不再误轮换；③**notify 丢失无自愈**（LINGER=0 轮换本身丢在途消息）→ 协议层三件套：发送侧 park-for-ack 时 3s 重发 notify（`pd_hidden_renotify_args`+renotify loop）+ 接收侧去重补 ACK（重复 chunk=`end<=next_start` 静默重发 ACK）+ 缺口等待（gap 时 push_back 等 renotify，60s 不愈才响亮失败，不再秒崩）；④**park-behind 唤醒竞态**（inflight 读与 room_waiters 追加非原子，missed-wake 孤儿 chunk）→ `park_chunk_behind_room` 原子 check-and-park + `finish_streaming_chunk` 单锁段 pop+wake。**abort 风暴集体漂移**（6 请求同时 300s 超时中止 → `_padded_all_reduce_min` FIFO 错位楔死，py-spy 取证 `/root/deadlock_dump_win2_*.txt`）修复后未再复现：21 请求同时强制中止实测存活。**验证矩阵**：ladder×3（冷/热树）全 20/20、case50×4 轮全 42/50+8 grammar 5/5 clean、21-abort 风暴存活、**523,099 次集体调用×8 rank 位点序列完美奇偶**（PADDED-AR 插桩，`SGLANG_DEBUG_DIAG=1` 时每调用打点，生产默认关）。**判据**：`grep "PDH-GAP\|gap did not heal\|out of order" decode_v4.log`=0；`/tmp/padded_seq_diff.py` 位点序列全 rank 一致；`grep PADDED-AR` 有输出=插桩存活。**教训：R1"窗口模式有 bug"实为双实验叠加+脚本 env 位置错误的冤案；控制面 socket 的"快速死节点检测"设计（不重连+LINGER=0）本质有损，关键控制消息必须有应用层重发+幂等去重**。
 
+- **⛔ mooncake 控制通道 torn frame = 全集群楔死根因（2026-08-24 结案）**：`common/conn.py::CommonKVManager._connect` 返回**跨 transfer_worker 线程共享的缓存 PUSH socket 但 send 无锁** → 多线程并发 `send_multipart` 帧交错（libzmq 不跨线程串行化 multipart，pyzmq 帧间释 GIL）→ 3 帧通知被劈成畸形 2 帧 → decode 端只启动一次的控制线程 `decode_thread` 解包 `ValueError: expected 3, got 2` 死 → 各 rank 集体调用计数漂移 → gloo 永不完成 → **全集群楔死（health 200、零 crash）**。修复=每 endpoint 锁 + `_send_multipart`（对齐 receiver classmethod `_connect` 既有 `(sock, lock)` 契约，prefill 发送侧漏补）。此前 AGENTS 记为"畸形 2 帧来源未知"即此病。判据：`grep MOONCAKE-RECV-DROP`=0、`PADDED-AR-FAIL`=0。完整见 `docs/agent/pd-stability-fixes-2026-08-24.md` §1。
+- **⛔ DSPark decode all_gather 跨 rank batch 分歧 → NCCL 挂起崩溃（2026-08-24 防护）**：`deepseek_v4_dspark.py::_apply_step_logits_sharded` 的 `attn_tp_group.all_gather(dim=-1)` 要求所有 rank 基准 batch 维一致；decode 巨型并发偶发某 rank schedule batch 与同组其他 rank 分歧（某 rank 先完成/移除一请求）→ shape 不匹配 → NCCL collective 挂起 → `Fatal Aborted`。防护=propose 前 `_assert_batch_bs_rank_invariant`（scalar `all_reduce(MAX/MIN)` 让**所有 rank 一致 raise** `DSParkBatchDivergence`→跳过该 batch，分歧时不进 all_gather，NCCL 不挂）。⚠️ sglang `GroupCoordinator.all_reduce` 只收 `(input_)` 不收 `op=` 关键字（固定 SUM），必须用 `torch.distributed.all_reduce(..., op=MAX/MIN, group=gp.device_group)`。判据：`grep DSPARK-BATCH-DIVERGE`=0。完整见 `docs/agent/pd-stability-fixes-2026-08-24.md` §2。
+
 ## 9. 知识文件索引（docs/agent/）
 
 | 文件 | 内容 |
@@ -354,3 +371,4 @@ rsync -avz --exclude='__pycache__' --exclude='*.pyc' "$SRC" root@<node>:"$DEST"
 | `docs/correctness-war-retro-2026-08.md` | **正确性战争人类可读复盘（2026-08-18~22）**：面向全员（含非引擎同学）的完整叙事——LoRA+CP 四层、draft 崩溃/accept 断崖/虚拟 id 域、DCP 双 bug 终局，含方法论与弯路记录。新人了解系统架构（PD/KV/TP/CP/DCP/DSA/EAGLE/MoL 逐个白话解释）的入口文档 |
 | `docs/dsv4-dspark-pd-tech-report-2026-08.md` | **V4 Pro DSpark PD 技术报告（2026-08-23）**：对外展示版——hidden state 流式动态传输算法（搭车+直发回退+ACK 流控+窗口化准入含形式化证明）、双端 radix、CP=8 3.5×、bug 排查方法论（内容金丝雀/判别阶梯/数字指纹）与跨请求 KV 污染终局案例、最终验收数据与残余边界 |
 | `docs/agent/prefill-oom-accounting.md` | **Prefill "OOM" 记账分裂（2026-08-22 结案 `6504ba9b71`）**：extend_range.end vs fill_ids 长度 vs prefix_indices 三源撕裂 → alloc 按虚高 seq 算页数杀全组（数学证明+abort 理论否定记录）；evict(token域,free+release) vs alloc(page域,仅free) 口径统一；判据 EXTEND-ACCOUNTING-DIVERGENCE / PREFILL-ALLOC-FORENSICS |
+| `docs/agent/pd-stability-fixes-2026-08-24.md` | **PD 稳定性修复双根因（2026-08-24）**：①全集群楔死=mooncake `_connect` 无锁并发 send 帧交错 → torn 2 帧 → 控制线程崩 → 集体分歧（per-endpoint 锁 `_send_multipart` 修复）；②decode 偶发崩溃=DSPark all_gather 跨 NCCL rank batch 分歧（rank-invariant 检测+跳 batch 防护）；附带请求终态保障确认（既有代码，6 轮×50 压测 0 卡死/0 无进度/0 中途失败，24min 双端监控全绿）；铁律见 AGENTS §5.4 |

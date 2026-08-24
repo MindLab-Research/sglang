@@ -4,6 +4,7 @@ from dataclasses import replace
 from typing import Optional
 
 import torch
+from torch import distributed as dist
 
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
@@ -57,6 +58,19 @@ from sglang.srt.speculative.spec_utils import draft_tp_context
 from sglang.srt.utils import get_available_gpu_memory, is_cuda
 
 logger = logging.getLogger(__name__)
+
+
+class DSParkBatchDivergence(RuntimeError):
+    """Raised when decode ranks disagree on the current batch's request count.
+
+    Guards the attn_tp_group.all_gather(step_local, dim=-1) in
+    deepseek_v4_dspark._apply_step_logits_sharded from wedging NCCL: a
+    transient schedule-batch divergence (one rank carrying a different req set
+    than its group peers) makes step_local's leading dim differ across ranks ->
+    the collective blocks forever -> Fatal Python Aborted -> decode crashes
+    and the whole PD pair goes dark. Every rank raises it (decided
+    collectively) so the worker skips the batch instead of hanging the pair.
+    """
 
 
 class DSparkWorkerV2(BaseSpecWorker):
@@ -382,7 +396,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._observers.note_prefill_step()
             return self._forward_prefill(batch, on_publish)
 
-        return self._forward_decode(batch, on_publish)
+        try:
+            return self._forward_decode(batch, on_publish)
+        except DSParkBatchDivergence as e:
+            logger.error(
+                f"[DSPARK-BATCH-DIVERGE] {e}; returning empty result to skip "
+                "batch (avoid NCCL hang / decode crash)"
+            )
+            return self._decode_idle_result(on_publish=on_publish)
 
     def _forward_prefill(
         self, batch: ScheduleBatch, on_publish
@@ -510,6 +531,41 @@ class DSparkWorkerV2(BaseSpecWorker):
             new_seq_lens=next_draft_input.new_seq_lens,
         )
 
+    def _assert_batch_bs_rank_invariant(self, bs: int) -> None:
+        """Rank-invariant guard for the DSpark step-logits all_gather.
+
+        deepseek_v4_dspark._apply_step_logits_sharded does
+        attn_tp_group.all_gather(step_local, dim=-1), which requires the
+        leading (batch) dim of step_local to be IDENTICAL on every rank in the
+        group. A transient decode schedule-batch divergence (one rank carrying
+        a different req set than its group peers, e.g. a request one rank
+        already finished/removed while peers still hold it) makes that dim
+        differ -> the NCCL collective blocks forever -> Fatal Python Aborted
+        -> decode crashes and the whole PD pair goes dark. Detect rank-
+        invariantly (all ranks compute the same global max/min via scalar
+        all_reduce) and raise on ALL ranks so the batch is skipped instead of
+        wedging NCCL. Frequency: one decode step -> two tiny scalar all_reduces;
+        negligible vs the per-step TP/CP collectives already in the loop.
+        """
+        gp = get_parallel().attn_tp_group
+        if gp.world_size <= 1:
+            return
+        bmax = torch.tensor([bs], dtype=torch.int32, device=self.device)
+        bmin = torch.tensor([bs], dtype=torch.int32, device=self.device)
+        torch.distributed.all_reduce(
+            bmax, op=dist.ReduceOp.MAX, group=gp.device_group
+        )
+        torch.distributed.all_reduce(
+            bmin, op=dist.ReduceOp.MIN, group=gp.device_group
+        )
+        global_max = int(bmax.item())
+        global_min = int(bmin.item())
+        if global_max != global_min:
+            raise DSParkBatchDivergence(
+                f"decode batch_size divergence: local_bs={bs} "
+                f"group_bs=[{global_min},{global_max}]"
+            )
+
     def _forward_decode(
         self, batch: ScheduleBatch, on_publish
     ) -> GenerationBatchResult:
@@ -575,6 +631,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             torch.get_device_module(self.device).current_stream()
         )
         bs = len(batch.seq_lens)
+        self._assert_batch_bs_rank_invariant(bs)
         device = self.device
         prefix_lens = batch.seq_lens
 

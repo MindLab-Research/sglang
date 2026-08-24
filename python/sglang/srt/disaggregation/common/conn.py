@@ -201,6 +201,7 @@ class CommonKVManager(BaseKVManager):
         self.request_status: Dict[int, KVPoll] = {}
         self._socket_cache: Dict[str, zmq.Socket] = {}
         self._monitor_cache: Dict[str, zmq.Socket] = {}
+        self._socket_locks: Dict[str, threading.Lock] = {}
         self._socket_lock = threading.Lock()
         self.failure_records: Dict[int, str] = {}
         self.failure_lock = threading.Lock()
@@ -794,12 +795,13 @@ class CommonKVManager(BaseKVManager):
                     if last_event is not None:
                         disconnected = last_event == zmq.EVENT_DISCONNECTED
                 if not disconnected:
-                    return sock
+                    return sock, self._socket_locks[endpoint]
                 sock.close(linger=0)
                 if monitor is not None:
                     monitor.close()
                 self._socket_cache.pop(endpoint, None)
                 self._monitor_cache.pop(endpoint, None)
+                self._socket_locks.pop(endpoint, None)
 
             sock = self._zmq_ctx.socket(zmq.PUSH)
             if is_ipv6:
@@ -824,11 +826,31 @@ class CommonKVManager(BaseKVManager):
             sock.setsockopt(zmq.TCP_KEEPALIVE_INTVL, 5)
             sock.setsockopt(zmq.TCP_KEEPALIVE_CNT, 3)
             sock.connect(endpoint)
+            lock = threading.Lock()
             self._socket_cache[endpoint] = sock
             self._monitor_cache[endpoint] = sock.get_monitor_socket(
                 zmq.EVENT_CONNECTED | zmq.EVENT_DISCONNECTED
             )
-            return sock
+            self._socket_locks[endpoint] = lock
+            return sock, lock
+
+    def _send_multipart(
+        self, endpoint: str, is_ipv6: bool, frames: List[bytes]
+    ) -> None:
+        """Thread-safe send on a cached PUSH socket.
+
+        Multiple transfer_worker threads share the per-endpoint cached PUSH
+        socket. libzmq does NOT serialize a multi-part send across threads
+        (pyzmq releases the GIL between frames), so concurrent send_multipart
+        calls interleave frames — a 3-frame status notification can be torn
+        into [1 + 2] frames, and the stray 2-frame message crashes the
+        never-restarting decode_thread (ValueError: expected 3, got 2). Each
+        per-endpoint lock makes a multipart message atomic, matching the
+        CommonKVReceiver._connect (sock, lock) contract.
+        """
+        sock, lock = self._connect(endpoint, is_ipv6)
+        with lock:
+            sock.send_multipart(frames)
 
     def get_mha_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
