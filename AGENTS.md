@@ -262,7 +262,17 @@ expand_lens_2d 有轻微负影响（24→21），需修复或回退。⚠️ 修
 
 ---
 
-## 6. 开发流程
+## 6. 安全与密钥铁律（2026-08-24 确立）
+
+任何 API key / access token / 密码 / 私钥 **绝不允许硬编码进 repo**（含 AGENTS.md、docs/agent/、.xbot/skills/、scripts、tools、test）。2026-08-24 已用 `git filter-repo --force` 把历史中的公网 key 整体铲除并强推。铁律：
+
+1. **真值只放仓库根 `secrets.env`**（已 .gitignore，不提交）。repo 内一律用环境变量引用：`$MOL_API_KEY_1P1D`、`$MOL_API_KEY_2P3D`、`$MOL_API_KEY`。脚本用 `${VAR:?msg}` 强制 env 传入（不留硬编码默认值）；文档写"见仓库根 secrets.env"。
+2. **新增集群/密钥**：key 一律写进本机 `secrets.env`，绝不进 commit。文件要 key 才能跑就用 `source secrets.env` 或 env 传入。
+3. **commit/push 前自查**：`git grep -nE 'sk-mol-[A-Za-z0-9]{10,}|ghp_[A-Za-z0-9]{20,}|AKIA[A-Z0-9]{16}|sk-[A-Za-z0-9]{30,}' HEAD -- .` 应 0 命中；命中即回退改引用，再提交。
+4. **若已 push 泄露**（不可逆，务必先备份）：① `git bundle create /tmp/bk.bundle --all`；② `git filter-repo --force --replace-text <file>`（每行 `明文==>替换值`）；③ 重写会移除 origin remote，需 `git remote add origin ...`；④ `git push --force origin b300-glm52`；⑤ **立即轮换/吊销该 key**——历史重写不回收已泄露的凭据，公共网络/日志里可能仍在。
+5. **仓库根 remote 带 GitHub token**：`git remote -v` 会显示 `x-access-token:ghp_...`——这只是本地 `.git/config`，不进 commit 历史；但勿把它粘进任何日志/文档/命令输出。
+
+## 7. 开发流程
 
 ```bash
 # 改代码 → 本地验证 → commit（保持 b300-glm52 分支）
@@ -276,7 +286,7 @@ rsync -avz --exclude='__pycache__' --exclude='*.pyc' "$SRC" root@<node>:"$DEST"
 # 清 cache → 杀干净 → 重启 → 等 health 200 → router/gateway/proxy/otelcol → 确认公网
 ```
 
-## 7. 已知陷阱速记
+## 8. 已知陷阱速记
 
 - **移植的 Triton 融合 kernel 有 kill-switch**：`SGLANG_OPT_USE_TRITON_VOCAB_PARALLEL_EMBEDDING=0` 可关闭 TP vocab embedding 融合路径（默认开）；topk1 draft kernel 无开关（topk=1 + CUDA 自动启用，异常时走 `topk1_chain_fits` fallback）。
 - **HiCache local-only prefetch 是死锁温床**：任何依赖 per-rank 状态的 collective gate 都会出问题；判断"rank-invariant"再动。
@@ -322,7 +332,7 @@ rsync -avz --exclude='__pycache__' --exclude='*.pyc' "$SRC" root@<node>:"$DEST"
 - **⛔ V4 Pro DSV4 高水位跨请求 KV 污染 = guard 用 SWA 尺寸当 FULL 池 cap（2026-08-23 终局修复）**：`decode.py::_guard_kv_indices` 三处调用点传 `token_to_kv_pool_allocator.size`——hybrid-SWA composite `SWATokenToKVPoolAllocator.size == min(full, swa)` = **SWA 尺寸**（V4 Pro=1,438,464），而 full 池虚拟 id 域是 4,794,880。分配水位一旦越过 SWA 尺寸（≈3 个 300K giant 后），所有 `id ≥ swa_size` 的合法目的地 id 被 guard 判"garbage" **静默洗成 0**（padding sink 页）→ KV 传输写进共享页 0、请求也从页 0 读 → **跨请求互读互写 = 确定性内容污染**（probe 稳定返回别的 case50 内容、accept=1.00 draft/target 同错、[full] leak 608 次）。修复=三处 cap 改 `size_full`（composite 有该属性，基类恒等 `.size`）。**判据**：`grep KV-PRODUCER-OOB decode_v4.log` 应为 0；DCP-PD-IDX 的 page_indices 无 0（修复前 giant 1564 页里 1444 个 0、probe 整段全 0）；`samples=[1438464,1438465,...] cap=1438464`（=SWA 尺寸精确咬合）是本病的指纹。验证：ladder 4 级 20/20 clean + case50×2 @600rpm 42/50+8 grammar、两轮 5/5 clean、泄漏 0、accept 3.15-3.75。**教训：`allocator.size` 在 SWA composite 语义是 min(full,swa)，任何拿它当 full 池 id 上限的守卫都会在高水位静默腐蚀**。
 - **✅ DSpark PD 窗口模式（RECV_WINDOW）彻底修复（2026-08-24，四层根因全部结案）**：此前"窗口 streaming 有跨请求 chunk 乱序未修 bug、生产一律 legacy"的结论被推翻——R1 事故是四层叠加：①**start 脚本 export 误置于 launch 之后**（窗口模式从未真正生效，"验证过的 legacy"其实一直在跑）；②**控制面 zmq PUSH 永久黑洞**（common/conn.py `_connect`：`RECONNECT_IVL=-1` 不重连 + monitor 只订 EVENT_DISCONNECTED → 断线轮换后新 socket 连接失败时永不重试永不轮换，L4 并发下 5/8 rank 对集体黑洞，notify 全丢）→ 修复=RECONNECT_IVL=100 + monitor 双事件（CONNECTED|DISCONNECTED）按最后事件判定，已自愈的 socket 不再误轮换；③**notify 丢失无自愈**（LINGER=0 轮换本身丢在途消息）→ 协议层三件套：发送侧 park-for-ack 时 3s 重发 notify（`pd_hidden_renotify_args`+renotify loop）+ 接收侧去重补 ACK（重复 chunk=`end<=next_start` 静默重发 ACK）+ 缺口等待（gap 时 push_back 等 renotify，60s 不愈才响亮失败，不再秒崩）；④**park-behind 唤醒竞态**（inflight 读与 room_waiters 追加非原子，missed-wake 孤儿 chunk）→ `park_chunk_behind_room` 原子 check-and-park + `finish_streaming_chunk` 单锁段 pop+wake。**abort 风暴集体漂移**（6 请求同时 300s 超时中止 → `_padded_all_reduce_min` FIFO 错位楔死，py-spy 取证 `/root/deadlock_dump_win2_*.txt`）修复后未再复现：21 请求同时强制中止实测存活。**验证矩阵**：ladder×3（冷/热树）全 20/20、case50×4 轮全 42/50+8 grammar 5/5 clean、21-abort 风暴存活、**523,099 次集体调用×8 rank 位点序列完美奇偶**（PADDED-AR 插桩，`SGLANG_DEBUG_DIAG=1` 时每调用打点，生产默认关）。**判据**：`grep "PDH-GAP\|gap did not heal\|out of order" decode_v4.log`=0；`/tmp/padded_seq_diff.py` 位点序列全 rank 一致；`grep PADDED-AR` 有输出=插桩存活。**教训：R1"窗口模式有 bug"实为双实验叠加+脚本 env 位置错误的冤案；控制面 socket 的"快速死节点检测"设计（不重连+LINGER=0）本质有损，关键控制消息必须有应用层重发+幂等去重**。
 
-## 8. 知识文件索引（docs/agent/）
+## 9. 知识文件索引（docs/agent/）
 
 | 文件 | 内容 |
 |---|---|
