@@ -96,9 +96,15 @@ def validate_hisparse(server_args: ServerArgs) -> None:
         "models (e.g., DeepSeek V3.2, GLM-5) and DeepSeek V4 now. "
     )
 
-    assert (
-        server_args.disable_radix_cache
-    ), "Hierarchical sparse attention currently requires --disable-radix-cache."
+    # HiSparse keeps the FULL KV resident in host memory (the logical pool);
+    # the device pool only holds the sparse top-k swap pages. Radix cache must
+    # therefore NOT treat the device pool as a full-prefix L1 hit — the two
+    # index domains are incompatible (see deepseek_v4_backend.swap_in_selected_pages
+    # and the decode-side alloc_for_decode_prealloc_hisparse host-only path).
+    # radix/hicache now degrades to host-only matching under --enable-hisparse:
+    # the device L1 layer never matches, prefixes are served from host/storage
+    # and loaded back only as sparse top-k on demand. This lifts the old
+    # requires --disable-radix-cache constraint.
 
     # DSv4 hisparse handles its own dtype/backend pairing elsewhere; the dtype-
     # aware checks below only apply to the DSA hisparse path.

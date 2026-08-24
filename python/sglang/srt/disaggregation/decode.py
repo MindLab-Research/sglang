@@ -2206,9 +2206,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         allocator = self.token_to_kv_pool_allocator
         if self.scheduler.enable_hisparse:
-            # HiSparse is incompatible with decode-side L1 radix cache. Keep
-            # this path on the upstream full-allocation semantics.
-            assert prefix_len == 0
+            # HiSparse keeps the FULL KV resident in host memory (logical pool);
+            # the device pool only holds the sparse top-k swap pages, so a radix
+            # device-L1 hit has no meaning here. Radix/hicache degrades to host-only
+            # matching under --enable-hisparse: device L1 never matches, prefixes
+            # are served from the host logical pool. prefix_len stays 0; the
+            # direct-to-host allocation below covers the full logical extent.
 
             # Direct-to-host path: only allocate logical indices (no hisparse
             # device indices) and allocate host indices for RDMA destination.
