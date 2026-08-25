@@ -1682,26 +1682,30 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             page_size = self.token_to_kv_pool_allocator.page_size
             kv_transfer_page_size = page_size
             if self.scheduler.enable_hisparse:
-                # Direct-to-host sends host/C4 rows; keep allocator.page_size
-                # logical and use the compressed page size only for these indices.
-                kv_transfer_page_size = getattr(
-                    self.token_to_kv_pool_allocator,
-                    "hisparse_page_size",
-                    page_size,
-                )
-                kv_indices = dst_kv_indices[: origin_input_len - prefix_len]
-            if dcp_enabled():
+                # Direct-to-host: the main KV is written straight into the host
+                # pool (DRAM) by the prefill node. The transfer index domain is
+                # the HOST pool's local page space (req_to_host_pool), NOT
+                # req_to_token's virtual ids — host locs and virtual ids come
+                # from two INDEPENDENT allocators (host pool vs logical
+                # paged). index_k still ships via _dsa_payload on the device
+                # pool. Using dst_kv_indices here is the 2026-08-25 pit-B bug:
+                # virtual ids -> host page 0 collision -> garbled transfer.
+                _hcoord = self.scheduler.hisparse_coordinator
+                kv_transfer_page_size = _hcoord.mem_pool_host.page_size
+                kv_indices = _hcoord.req_to_host_pool[
+                    decode_req.req.req_pool_idx, : origin_input_len - prefix_len
+                ]
+            elif dcp_enabled():
                 # DCP: use physical page_size (64) for PD transfer, not the
                 # allocator's page_size (128 = 64*dcp). PD transfer writes full
                 # 64-token pages in contiguous layout; inplace_shard_dcp in
                 # _commit_transfer_to_req converts to DCP layout after transfer.
-                # Must run AFTER hisparse check so it takes priority.
                 kv_transfer_page_size = self.token_to_kv_pool.page_size
                 # Keep kv_indices as a torch tensor here: the merged
                 # kv_to_page_indices expects a tensor and the int32 cast for
                 # ZMQ serialization happens at page_indices below.
                 kv_indices = dst_kv_indices[: origin_input_len - prefix_len]
-            elif not self.scheduler.enable_hisparse:
+            else:
                 # Only send delta indices (beyond prefix) to prefill.
                 kv_indices = self.req_to_token_pool.req_to_token[
                     decode_req.req.req_pool_idx
