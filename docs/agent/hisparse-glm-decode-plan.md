@@ -62,9 +62,13 @@ index buffer 结构（`DSATokenToKVPool._create_index_buffers`）：每层一个
    与 foreign——本地域 id 0 是真实可分配槽。单测已绕开；若 Phase 3 集成中撞到
    slot-0 corner，把哨兵迁到 -1（mapping 尾部已有 -1 保留位）。
 
-**Phase 1 剩余（未完成）**：坑 B GLM 版（传输页表换算）、坑 C GLM 版
-（`_guard_kv_indices` cap 用 `size_full`）、EAGLE `prepare_for_draft` clamp 域
-（371a991947 教训）——dcp=1+PD+EAGLE e2e 验证在这些之后。
+**Phase 1 剩余（未完成）**：坑 B GLM 版（传输页表换算）——依赖 Phase 2 的 host
+池页域决策（host 本地页 1/dcp 分片 vs 虚拟页 64×dcp 的换算，与 mooncake DRAM
+接收/`SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER` 的 rank 映射耦合），随 Phase 2 一起定稿。
+坑 C（guard cap）已改 `size_full`；EAGLE `prepare_for_draft` clamp 经确认**天然兼容**
+——draft pool 非 hisparse 且非 sharded（`not is_draft_worker` + `_derive_pool_sizes`
+恢复 size×dcp multiplier），虚拟 id 即 draft pool 直接索引，hisparse target 的
+req_to_token 存虚拟 id 使其无缝。dcp=1+PD+EAGLE e2e 验证在 Phase 2 后统一执行。
 
 > 部署注：B300-2 site-packages 已带本 patch（原版备份 `/root/hisparse_backup_orig/`）；
 > 生产 `enable_hisparse=False` 不激活新代码路径（构造签名向后兼容 dcp_size=1），

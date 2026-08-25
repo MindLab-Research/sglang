@@ -2330,7 +2330,7 @@ def alloc_for_decode_prealloc_hisparse(
             last_loc=last_loc,
             extend_num_tokens=fill_len,
         )
-    return _guard_kv_indices(kv_loc, allocator.size, "prealloc_hisparse.kv_loc")
+    return _guard_kv_indices(kv_loc, allocator.size_full, "prealloc_hisparse.kv_loc")
 
 
 def _guard_kv_indices(
