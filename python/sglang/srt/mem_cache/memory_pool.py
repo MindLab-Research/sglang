@@ -4308,7 +4308,14 @@ class DSATokenToKVPool(MLATokenToKVPool):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         index_buf_size: Optional[int] = None,
+        indexer_types: Optional[list] = None,
     ):
+        # GLM-5.3 shared-indexer (IndexShare): config.indexer_types marks each
+        # layer as 'full' (owns an index buffer) or 'shared' (reuses the nearest
+        # preceding full layer's buffer). Allocating 78 physical buffers when only
+        # 21 are needed wastes 73% of index device memory (30GB→8GB at ratio=2),
+        # which is the root cause of the hisparse CUDA OOM.
+        self._indexer_types = indexer_types
         override_dim = (
             kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
         )
@@ -4364,20 +4371,49 @@ class DSATokenToKVPool(MLATokenToKVPool):
             if self.custom_mem_pool
             else nullcontext()
         ):
-            self.index_k_with_scale_buffer = [
-                torch.zeros(
-                    # Layout:
-                    #     ref: test_attention.py :: kv_cache_cast_to_fp8
-                    #     shape: (num_pages, page_size 64 * head_dim 128 + page_size 64 * fp32_nbytes 4)
-                    #     data: for page i,
-                    #         * buf[i, :page_size * head_dim] for fp8 data
-                    #         * buf[i, page_size * head_dim:].view(float32) for scale
-                    self._index_buffer_shape(num_pages),
-                    dtype=self.index_k_with_scale_buffer_dtype,
-                    device=self.device,
-                )
-                for _ in range(self.layer_num)
-            ]
+            if self._indexer_types is not None:
+                # GLM-5.3 shared-indexer (IndexShare): only 'full' layers own a
+                # physical buffer; 'shared' layers reference the nearest preceding
+                # full layer's tensor. The list keeps length layer_num so every
+                # existing [layer_id - start_layer] access stays valid AND routes
+                # to the owner — zero changes to get/set/move/copy paths.
+                # dsa_indexer.py:757 checks _is_layer_owned() to skip set on
+                # shared layers (they don't write their own index).
+                full_to_buf: dict[int, torch.Tensor] = {}
+                self.index_k_with_scale_buffer = []
+                for local in range(self.layer_num):
+                    gid = self.start_layer + local
+                    owner = gid
+                    while owner >= 0 and self._indexer_types[owner] != "full":
+                        owner -= 1
+                    if owner < 0:
+                        owner = 0
+                    if owner not in full_to_buf:
+                        full_to_buf[owner] = torch.zeros(
+                            self._index_buffer_shape(num_pages),
+                            dtype=self.index_k_with_scale_buffer_dtype,
+                            device=self.device,
+                        )
+                    self.index_k_with_scale_buffer.append(full_to_buf[owner])
+            else:
+                self.index_k_with_scale_buffer = [
+                    torch.zeros(
+                        self._index_buffer_shape(num_pages),
+                        dtype=self.index_k_with_scale_buffer_dtype,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+
+    def _is_layer_owned(self, layer_id: int) -> bool:
+        """True for 'full' indexer layers (they own a physical index buffer).
+        'shared' layers reuse the owner's buffer and skip set_index_k —
+        dsa_indexer.py checks this via hasattr to avoid writing shared layers.
+        """
+        if self._indexer_types is None:
+            return True
+        return self._indexer_types[layer_id] == "full"
+
 
     def _clear_buffers(self):
         super()._clear_buffers()

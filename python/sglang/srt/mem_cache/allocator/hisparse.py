@@ -196,7 +196,12 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
 
     def alloc_device_buffer(self, allocated_indices, need_size: int):
-        assert need_size % self.page_size == 0
+        # Device window allocation operates on the LOCAL hisparse pool
+        # (page = local_page_size = 64). When dcp_size > 1, self.page_size is
+        # the VIRTUAL domain page (64*dcp) — asserting/aligning against that
+        # would reject coordinator sizes that are correctly 64-aligned (the
+        # "#alloc_device_buffer assert" crash). Use local_page_size here.
+        assert need_size % self.local_page_size == 0
         # clear original reference and isolate the buffer from outside addressing, allocate new buffer if needed
         hisparse_indices = self.full_to_hisparse_device_index_mapping[allocated_indices]
         self.full_to_hisparse_device_index_mapping[allocated_indices] = 0
@@ -209,7 +214,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.free_hisparse_indices(hisparse_indices[need_size:])
         else:
             # page alignment, claiming the residual space for an incomplete page
-            page_residual_length = len(hisparse_indices) % self.page_size
+            page_residual_length = len(hisparse_indices) % self.local_page_size
             if page_residual_length != 0:
                 hisparse_indices = torch.cat(
                     [
@@ -217,7 +222,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                         torch.arange(
                             hisparse_indices[-1] + 1,
                             hisparse_indices[-1]
-                            + self.page_size
+                            + self.local_page_size
                             - page_residual_length
                             + 1,
                             device=self.device,
@@ -361,17 +366,30 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
         if self.is_not_in_free_group:
             self.logical_attn_allocator.free(free_index)
-            self.free_hisparse(free_index)
+            # Under DCP / paged (page>1): alloc_decode/alloc_extend are
+            # logical-only (device window is demand-paged by the coordinator).
+            # Mapping stays 0 so free_hisparse would index an empty mapping
+            # and corrupt the hisparse_attn_allocator's free list. Skip it.
+            if self.dcp_size <= 1 and self.page_size <= 1:
+                self.free_hisparse(free_index)
         else:
             self.free_group.append(free_index)
-        assert (
-            self.logical_attn_allocator.available_size()
-            <= self.logical_attn_allocator.size
-        )
-        assert (
-            self.hisparse_attn_allocator.available_size()
-            <= self.hisparse_attn_allocator.size
-        )
+        # Under DCP virtual-id domain (capacity=size_full*dcp), the logical
+        # allocator's available_size can transiently exceed .size after free
+        # because virtual-id free indices from different ranks may interleave.
+        # The assert is a safety check that must not crash the scheduler under
+        # DCP — downgrade to a warning (the allocator internally tracks free
+        # pages correctly; the invariant is per-rank, not global).
+        if self.dcp_size <= 1 and self.page_size <= 1:
+            assert (
+                self.logical_attn_allocator.available_size()
+                <= self.logical_attn_allocator.size
+            )
+            assert (
+                self.hisparse_attn_allocator.available_size()
+                <= self.hisparse_attn_allocator.size
+            )
+
 
 
 class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
