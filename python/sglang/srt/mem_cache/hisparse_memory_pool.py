@@ -131,13 +131,20 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
         cache_k_rope: torch.Tensor,
         forward_mode=None,
     ):
-        # loc arrives in the VIRTUAL domain; translate already performed the
-        # DCP virtual->local conversion (see translate_loc_to_hisparse_device).
-        # Disable the DCP branch for the super call, otherwise
-        # _write_mla_kv_buffer would re-apply virtual->local to ids that are
-        # already local hisparse slots — the 3c68f20891 double-conversion bug.
-        loc = self.translate_loc_to_hisparse_device(loc)
-        with _dcp_disabled():
+        if _dcp_enabled():
+            # DCP mode: decode-generated KV goes directly to the device KV buffer
+            # via the standard DCP virtual->local translate (super's path).
+            # The hisparse device mapping is only for coordinator-managed
+            # swap-in of PD-transferred KV (prefill's KV), NOT for decode's
+            # own newly-generated tokens. Skipping hisparse translate here
+            # fixes the "mapping all-zero -> write to slot 0 -> garbage -> EOS"
+            # bug that produced only 1 token then stopped.
+            super().set_mla_kv_buffer(
+                layer, loc, cache_k_nope, cache_k_rope, forward_mode
+            )
+        else:
+            # Non-DCP: hisparse translate (virtual -> hisparse device window)
+            loc = self.translate_loc_to_hisparse_device(loc)
             super().set_mla_kv_buffer(
                 layer, loc, cache_k_nope, cache_k_rope, forward_mode
             )
@@ -148,9 +155,10 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
         loc: torch.Tensor,
         dst_dtype: Optional[torch.dtype] = None,
     ):
-        loc = self.translate_loc_to_hisparse_device(loc)
-        with _dcp_disabled():
+        if _dcp_enabled():
             return super().get_mla_kv_buffer(layer, loc, dst_dtype)
+        loc = self.translate_loc_to_hisparse_device(loc)
+        return super().get_mla_kv_buffer(layer, loc, dst_dtype)
 
     def transfer_values_on_device(self, dst_indices, src_indices):
         transfer_kv_all_layer_mla(
