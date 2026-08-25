@@ -1536,6 +1536,7 @@ class KVCacheConfigurator:
                             kvcache=token_to_kv_pool,
                             need_sort=need_sort,
                             host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+                            dcp_size=self.server_args.dcp_size,
                         )
                     elif (
                         self.server_args.page_size == 1

@@ -1160,6 +1160,7 @@ class ModelRunnerKVCacheMixin:
                                 kvcache=self.token_to_kv_pool,
                                 need_sort=need_sort,
                                 host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+                                dcp_size=self.dcp_size,
                             )
                         )
                     elif self.page_size == 1 and self.dcp_size == 1:

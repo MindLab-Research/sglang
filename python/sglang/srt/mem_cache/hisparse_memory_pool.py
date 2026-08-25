@@ -5,6 +5,12 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.layers.dcp.comm import (
+    dcp_disabled as _dcp_disabled,
+    dcp_enabled as _dcp_enabled,
+    get_attention_dcp_rank as _get_attention_dcp_rank,
+    get_attention_dcp_world_size as _get_attention_dcp_world_size,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.utils import is_cuda, is_hip
@@ -71,6 +77,26 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
             # (allocator reused from target), so no mapping registered.
             # Identity fallback: device index == logical index.
             return compressed_indices
+        # DCP-aware: callers hand us VIRTUAL ids (req_to_token domain,
+        # capacity=size*dcp). Convert to the local full domain with the
+        # ownership filter first — the exact formula used by
+        # memory_pool._write_mla_kv_buffer's DCP branch (9db63a6abb). Foreign
+        # ids resolve to 0 (the unmapped sentinel) instead of leaking another
+        # request's device slot through a stale mapping entry.
+        if _dcp_enabled():
+            _dws = _get_attention_dcp_world_size()
+            _ps = self.page_size  # 64
+            _slot = (compressed_indices // (_ps * _dws)) * _ps + (
+                compressed_indices % _ps
+            )
+            _valid = compressed_indices >= 0
+            _owner = (
+                (compressed_indices // _ps) % _dws == _get_attention_dcp_rank()
+            ) & _valid
+            local = torch.where(_owner, _slot, torch.zeros_like(compressed_indices))
+            mapped = mapping[local]
+            # mapping[0] may hold a live slot; force foreign lanes to 0.
+            return torch.where(_owner, mapped, torch.zeros_like(mapped))
         return mapping[compressed_indices]
 
     def _translate_loc_to_hisparse_device(self, compressed_indices: torch.Tensor):
@@ -103,10 +129,16 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
         cache_k_rope: torch.Tensor,
         forward_mode=None,
     ):
+        # loc arrives in the VIRTUAL domain; translate already performed the
+        # DCP virtual->local conversion (see translate_loc_to_hisparse_device).
+        # Disable the DCP branch for the super call, otherwise
+        # _write_mla_kv_buffer would re-apply virtual->local to ids that are
+        # already local hisparse slots — the 3c68f20891 double-conversion bug.
         loc = self.translate_loc_to_hisparse_device(loc)
-        super().set_mla_kv_buffer(
-            layer, loc, cache_k_nope, cache_k_rope, forward_mode
-        )
+        with _dcp_disabled():
+            super().set_mla_kv_buffer(
+                layer, loc, cache_k_nope, cache_k_rope, forward_mode
+            )
 
     def get_mla_kv_buffer(
         self,
@@ -115,7 +147,8 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
         dst_dtype: Optional[torch.dtype] = None,
     ):
         loc = self.translate_loc_to_hisparse_device(loc)
-        return super().get_mla_kv_buffer(layer, loc, dst_dtype)
+        with _dcp_disabled():
+            return super().get_mla_kv_buffer(layer, loc, dst_dtype)
 
     def transfer_values_on_device(self, dst_indices, src_indices):
         transfer_kv_all_layer_mla(

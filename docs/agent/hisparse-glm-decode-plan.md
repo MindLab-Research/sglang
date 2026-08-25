@@ -33,6 +33,43 @@ index buffer 结构（`DSATokenToKVPool._create_index_buffers`）：每层一个
 
 ## 工作分解
 
+### Phase 1：池构造 × DCP 虚拟 id 域统一（最核心，2-4 天）——✅ 域映射层已完成（2026-08-25）
+
+**已完成并单测验证**（`test/hisparse/test_hisparse_dcp_allocator.py`，B300-2 上 5/5 PASS）：
+
+- allocator DCP 化：`HiSparseTokenToKVPoolAllocator(dcp_size=D)` 三域定稿
+  ——虚拟域 `Paged(size_full×D, page=64×D)`（对齐 9db63a6abb）/ 本地 full 域
+  （owner 公式 `slot=(v//(64·D))·64+v%64`，与 `_write_mla_kv_buffer` 锁步对拍
+  PASS）/ 本地 hisparse 窗口域 `Paged(size_hisparse, 64)`；mapping 虚拟域 dense 尺寸。
+- `translate_loc_to_hisparse_device` DCP 感知（虚拟→local+owner 过滤→mapping；
+  foreign→0 哨兵）；`set/get_mla_kv_buffer` 用 `dcp_disabled()` bypass 基类二次
+  转换（3c68f20891 双转 bug 修复）。
+- owner 分布单测：互斥完备，每 rank 恰 1/D。
+- alloc/free 平衡 + 预算口径单测。
+
+**三个关键发现（修正了原计划假设）**：
+
+1. **上游 alloc_decode/alloc_extend 的同步 device 分配在 page>1 下本来就坏**
+   （`PagedTokenToKVPoolAllocator.alloc()` 页对齐，bs<64 时发 0 页空 tensor；上游
+   仅 page=1 有效——其 `alloc()` 自带 NotImplementedError 佐证）。修正设计：
+   DCP/page>1 下 alloc_decode/alloc_extend 走 **logical-only**，device 窗口由
+   HiSparseCoordinator demand-paged（`alloc_device_buffer`/`swap_in_selected_pages`
+   页级写 mapping）——这才是 hisparse 架构本意（device=滑动窗口）。
+2. **预算语义修正**：demand-paged 下窗口是可循环工作集（swap-out 腾页），不是容量
+   约束——`available_size()` 在 page>1 下=logical_avail（host 容量），不再
+   `min(逻辑, 窗口×dcp)`（SWA 预算口径教训的又一实例）。
+3. **slot-0 哨兵歧义（上游遗留）**：`mapping[0]`/`>0` 过滤无法区分"local slot 0"
+   与 foreign——本地域 id 0 是真实可分配槽。单测已绕开；若 Phase 3 集成中撞到
+   slot-0 corner，把哨兵迁到 -1（mapping 尾部已有 -1 保留位）。
+
+**Phase 1 剩余（未完成）**：坑 B GLM 版（传输页表换算）、坑 C GLM 版
+（`_guard_kv_indices` cap 用 `size_full`）、EAGLE `prepare_for_draft` clamp 域
+（371a991947 教训）——dcp=1+PD+EAGLE e2e 验证在这些之后。
+
+> 部署注：B300-2 site-packages 已带本 patch（原版备份 `/root/hisparse_backup_orig/`）；
+> 生产 `enable_hisparse=False` 不激活新代码路径（构造签名向后兼容 dcp_size=1），
+> 生产 health 200 无扰验证过。
+
 ### Phase 1：池构造 × DCP 虚拟 id 域统一（最核心，2-4 天）
 1. **page_size 断言链**：`DSATokenToKVPool` 断言 `page_size == 64`（CUDA 路径）；
    GLM 生产 page_size=128、DCP=8 虚拟域 page=128×8。梳理 configurator→pool 构造

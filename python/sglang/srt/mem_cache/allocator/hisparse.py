@@ -13,6 +13,29 @@ from sglang.srt.utils.common import get_num_new_pages
 
 
 class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+    """GLM (GlmMoeDsa) decode-side hisparse allocator with DCP virtual-id domain.
+
+    Domain layout under dcp_size=D (mirrors the PagedTokenToKVPoolAllocator
+    precedent from commit 9db63a6abb — capacity=size*D, page_size=64*D):
+
+      virtual (scheduler/req_to_token/xfer page tables):
+          capacity = size_full * D tokens, page = 64 * D
+          owner(rank k) := (virtual_id // 64) % D == k   [whole 64-page round-robin]
+      local full (per-rank host-backed logical slots):
+          capacity = size_full tokens, page = 64
+          reached via  slot = (v // (64*D))*64 + v % 64   (same formula as
+          memory_pool._write_mla_kv_buffer's DCP branch)
+      hisparse device window (per-rank device pool, page=64 semantics):
+          capacity = size_hisparse tokens
+          mapping: full_to_hisparse_device_index_mapping[virtual_id] is the
+          local device slot for ids this rank owns; 0 for foreign/unmapped
+          (foreign ranks hold their own copy — never read cross-rank).
+
+    Budget consistency rule (2026-08-25 SWA lesson): every capacity check
+    funnels through available_size(); alloc paths must use the same token
+    accounting as the admission budget.
+    """
+
     def __init__(
         self,
         size: int,
@@ -22,6 +45,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         kvcache: HiSparseDSATokenToKVPool,
         need_sort: bool,
         host_to_device_ratio: int = 2,
+        dcp_size: int = 1,
     ):
         self._kvcache = kvcache
         self._size_full = size * host_to_device_ratio
@@ -29,11 +53,21 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.compress_ratio = 1
         self.dtype = dtype
         self.device = device
-        self.page_size = page_size
         self.need_sort = need_sort
+        # Local pool-page granularity for the DCP ownership formula. The
+        # DSA KV pool always uses 64-token pages internally regardless of
+        # the scheduler page size (see DSATokenToKVPool page_size assert).
+        self.local_page_size = 64
+        self.dcp_size = dcp_size
+        # Virtual-domain allocator page: 64*dcp under DCP (9db63a6abb), the
+        # scheduler page size otherwise. Upstream passed server_args.page_size
+        # unconditionally, which was already wrong for GLM DCP decode.
+        self.page_size = (
+            self.local_page_size * dcp_size if dcp_size > 1 else page_size
+        )
 
         self.logical_attn_allocator = PagedTokenToKVPoolAllocator(
-            self._size_full,
+            self._size_full * dcp_size,
             self.page_size,
             self.dtype,
             self.device,
@@ -42,7 +76,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         self.hisparse_attn_allocator = PagedTokenToKVPoolAllocator(
             self._size_hisparse,
-            self.page_size,
+            self.local_page_size,
             self.dtype,
             self.device,
             kvcache,
@@ -51,7 +85,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_to_hisparse_device_index_mapping = torch.cat(
             [
                 torch.zeros(
-                    self._size_full + self.page_size,
+                    self._size_full * dcp_size + self.page_size,
                     dtype=torch.int64,
                     device=self.device,
                 ),
@@ -70,17 +104,51 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     @property
     def size_full(self) -> int:
-        return self._size_full
+        return self._size_full * self.dcp_size
 
     @property
     def size(self) -> int:
-        return self._size_full
+        return self._size_full * self.dcp_size
 
     def available_size(self) -> int:
+        # Demand-paged design (page>1 / DCP): the hisparse device window is a
+        # RECYCLABLE working set — HiSparseCoordinator swap-outs free window
+        # pages under pressure — so it is NOT a capacity constraint. Admission
+        # capacity is the logical (host-backed virtual) domain only. Using
+        # min(logical, window*dcp) here would let the window dominate forever
+        # and stop accounting for host growth (budget-parity lesson from the
+        # 2026-08-25 SWA prealloc fix). The page==1 upstream path keeps the
+        # original min() semantics.
+        if self.dcp_size > 1 or self.page_size > 1:
+            return self.logical_attn_allocator.available_size()
         return min(
             self.logical_attn_allocator.available_size(),
             self.hisparse_attn_allocator.available_size(),
         )
+
+    def _dcp_virtual_to_local(self, loc: torch.Tensor) -> torch.Tensor:
+        """Virtual id -> local full-domain slot for ids this rank owns.
+
+        Foreign ids map to 0 (the unmapped sentinel). Same formula as
+        memory_pool._write_mla_kv_buffer's DCP branch — keep them in lockstep.
+        """
+        if self.dcp_size <= 1:
+            return loc
+        dws = self.dcp_size
+        ps = self.local_page_size
+        slot = (loc // (ps * dws)) * ps + (loc % ps)
+        owner = ((loc // ps) % dws == self.dcp_rank()) & (loc >= 0)
+        return torch.where(owner, slot, torch.zeros_like(loc))
+
+    def dcp_rank(self) -> int:
+        # Lazy import to avoid circular deps; falls back to 0 outside a
+        # distributed context (unit tests).
+        try:
+            from sglang.srt.layers.dcp.comm import get_attention_dcp_rank
+
+            return get_attention_dcp_rank()
+        except Exception:
+            return 0
 
     def get_kvcache(self):
         return self._kvcache
@@ -195,7 +263,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return None
         if (
             num_new_pages
-            > self.hisparse_attn_allocator.available_size() // self.page_size
+            > self.hisparse_attn_allocator.available_size() // self.local_page_size
         ):
             return None
 
@@ -208,6 +276,15 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             extend_num_tokens,
         )
         assert logical_indices is not None, "Logical allocation failed in alloc_extend"
+
+        if self.dcp_size > 1 or self.page_size > 1:
+            # DCP / paged (GLM): the hisparse device window is demand-paged by
+            # HiSparseCoordinator (see alloc_decode's note). The PD transfer
+            # writes KV straight into the host pool (alloc_logical_only
+            # semantics), and swap_in_selected_pages fills the device window
+            # page-granularly. Non-owner lanes keep mapping == 0 (sentinel);
+            # their owning rank fills its own copy in its own process.
+            return logical_indices
 
         hisparse_last_loc = self.get_last_loc_hisparse_device(last_loc)
         hisparse_indices = self.hisparse_attn_allocator.alloc_extend(
@@ -231,6 +308,18 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,  # last_loc for full layers
     ):
+        # Under DCP (page=64*dcp>1) the hisparse device window is NOT
+        # allocated per-token here: PagedTokenToKVPoolAllocator.alloc() is
+        # page-aligned (need_size=bs < page would hand out 0 pages — the
+        # upstream sync-alloc path is only valid for page_size=1, see the
+        # NotImplementedError in this class's alloc()). The device window is
+        # demand-paged by HiSparseCoordinator (alloc_device_buffer /
+        # swap_in_selected_pages), which owns page-granular mapping writes.
+        # Here we only advance the logical (virtual-domain) allocator.
+        if self.dcp_size > 1 or self.page_size > 1:
+            return self.logical_attn_allocator.alloc_decode(
+                seq_lens, seq_lens_cpu, last_loc
+            )
         logical_indices = self.logical_attn_allocator.alloc_decode(
             seq_lens, seq_lens_cpu, last_loc
         )
