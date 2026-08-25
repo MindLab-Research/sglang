@@ -2229,7 +2229,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 coordinator.host_token_len(fill_len),
             )
         else:
-            uses_swa_tail = self._uses_swa_tail_prealloc() and prefix_len == 0
+            uses_swa_tail = self._uses_swa_tail_prealloc()
             swa_tail_len = self._swa_tail_len(fill_len)
             kv_loc = alloc_for_decode_prealloc(
                 allocator,
@@ -2396,20 +2396,41 @@ def alloc_for_decode_prealloc(
             else torch.tensor([-1], dtype=torch.int64, device=device)
         )
         if uses_swa_tail:
-            # Tail-only SWA allocation: only valid when prefix_len == 0.
-            # When prefix_len > 0 (radix cache hit), we fall back to
-            # alloc_extend which allocates SWA at full page count; the
-            # SWA budget in that case may slightly under-estimate.
+            # SWA tail allocation: allocate SWA ONLY for the sliding-window
+            # tail (swa_tail_len), NOT the full delta length. This is valid for
+            # prefix_len > 0 (decode radix hit) too: the decode-side sliding
+            # window sits at the END of the sequence, so for a partial hit
+            # (total_prefix_len < seq_len - window, which match_prefix_for_req
+            # guarantees since it never matches past the last input token) the
+            # window falls entirely inside the newly-allocated delta range
+            # [total_prefix_len, fill_len). SWA slot mapping is device-pool
+            # independent (translate_loc_from_full_to_swa), so sharing the
+            # delta range is correct. The 2026-08-24 case50 abort
+            # (PD-PREALLOC-KV-FULL) was caused by the full-delta allocation
+            # greedily reserving SWA pages for the whole extend under a 0.3
+            # swa_full_tokens_ratio; the tail window needs only a few pages.
+            prefix_len_eff = total_prefix_len
+            extend_eff = delta_len
+            # Clamp swa_tail to the delta: a near-full prefix hit leaves
+            # delta < window (the window would overlap the re-used prefix
+            # region). The decode-side SWA payload reads the window from
+            # req_to_token out-of-band; overlapping the prefix region is read
+            # as already-resident SWA there (radix tree does not hold SWA), so
+            # the tail allocation must not overrun the delta. This preserves
+            # correctness while bounding SWA usage to what the delta supplies.
+            swa_tail_eff = max(0, min(swa_tail_len, delta_len))
             kv_loc = allocator.alloc_extend_swa_tail(
-                prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
-                prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
+                prefix_lens=torch.tensor(
+                    [prefix_len_eff], dtype=torch.int64, device=device
+                ),
+                prefix_lens_cpu=torch.tensor([prefix_len_eff], dtype=torch.int64),
                 seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
                 seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
                 last_loc=last_loc,
-                extend_num_tokens=fill_len,
-                swa_tail_len=swa_tail_len,
+                extend_num_tokens=extend_eff,
+                swa_tail_len=swa_tail_eff,
             )
-            req.kv.swa_evicted_seqlen = fill_len - swa_tail_len
+            req.kv.swa_evicted_seqlen = fill_len - swa_tail_eff
         else:
             kv_loc = allocator.alloc_extend(
                 prefix_lens=torch.tensor(
