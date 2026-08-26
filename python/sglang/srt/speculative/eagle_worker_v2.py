@@ -11,6 +11,10 @@ import os as _os
 
 _STAGE_SYNC = _os.environ.get("SGLANG_DSA_STAGE_SYNC", "").lower() in ("1", "true", "yes")
 
+# Per-step timing breakdown: log draft/verify/draft_extend wall-clock ms per decode step.
+# Set SGLANG_SPEC_STEP_TIMING=1 to enable. Zero overhead when off (branch never taken).
+_STEP_TIMING = _os.environ.get("SGLANG_SPEC_STEP_TIMING", "").lower() in ("1", "true", "yes")
+
 # Isolation kill-switch: disable ONLY the EAGLE draft cuda graph (draft() then
 # runs eager draft_forward; target decode/verify graphs are untouched so
 # throughput stays representative). Used to bisect the async-fault family
@@ -1258,11 +1262,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     capture_hidden_mode=capture_mode,
                     vocab_size=self.target_worker.model_config.vocab_size,
                 )
+            _t_draft = _t_verify = _t_ext = 0.0
             if self.speculative_num_steps == 0:
                 # Drafting disabled (high batch size). _draft_extend below still
                 # runs, keeping draft KV warm for when the batch shrinks.
                 verify_input = self._build_trivial_verify_input(batch)
             else:
+                _t0 = time.perf_counter() if _STEP_TIMING else 0
                 with (
                     self.draft_worker.draft_tp_context(
                         self.draft_worker.draft_runner.tp_group
@@ -1272,10 +1278,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     spec_stage_span("draft"),
                 ):
                     verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
+                _t1 = time.perf_counter() if _STEP_TIMING else 0
+                _t_draft = (_t1 - _t0) * 1e3 if _STEP_TIMING else 0
             _stage_sync_probe("after_draft")
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
+            _t_v0 = time.perf_counter() if _STEP_TIMING else 0
             batch_output = self.verify(batch)
+            _t_v1 = time.perf_counter() if _STEP_TIMING else 0
+            _t_verify = (_t_v1 - _t_v0) * 1e3 if _STEP_TIMING else 0
             _stage_sync_probe("after_verify")
             # Publish before draft_extend so the fence is at verify-end.
             if on_publish is not None:
@@ -1286,6 +1297,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             ):
                 self._stub_skipped_draft_extend(batch, batch_output)
             else:
+                _t_e0 = time.perf_counter() if _STEP_TIMING else 0
                 with (
                     self.draft_worker.draft_tp_context(
                         self.draft_worker.draft_runner.tp_group
@@ -1295,7 +1307,18 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     spec_stage_span("draft_extend"),
                 ):
                     self.draft_worker._draft_extend_for_decode(batch, batch_output)
+                _t_e1 = time.perf_counter() if _STEP_TIMING else 0
+                _t_ext = (_t_e1 - _t_e0) * 1e3 if _STEP_TIMING else 0
             _stage_sync_probe("after_draft_extend")
+            if _STEP_TIMING:
+                _total = _t_draft + _t_verify + _t_ext
+                _bs = batch.seq_lens.shape[0]
+                _sl = batch.seq_lens[0].item() if batch.seq_lens.numel() > 0 else -1
+                logger.info(
+                    f"[SPEC-TIMING] draft={_t_draft:.1f}ms verify={_t_verify:.1f}ms "
+                    f"draft_extend={_t_ext:.1f}ms total={_total:.1f}ms "
+                    f"bs={_bs} seq_len={_sl}"
+                )
 
             return batch_output
 
