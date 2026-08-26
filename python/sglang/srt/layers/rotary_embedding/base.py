@@ -383,7 +383,7 @@ class RotaryEmbedding(MultiPlatformOp):
             )
         else:
 
-            if fused_set_kv_buffer_arg is not None and _is_hip:
+            if fused_set_kv_buffer_arg is not None:
                 extra_args = fused_set_kv_buffer_arg
                 k_cache = fused_set_kv_buffer_arg["key_cache"]
                 # 5D SHUFFLE pool feeds raw (N, H, D/x, page, x) K cache;

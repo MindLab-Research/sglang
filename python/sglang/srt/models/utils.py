@@ -291,7 +291,7 @@ def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
     pool = get_token_to_kv_pool()
     return (
         _is_cuda
-        and pool.dtype == torch.bfloat16
+        and pool.dtype in (torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2)
         and not isinstance(pool, SWAKVPool)
         and not is_prefill_context_parallel_enabled()
         and getattr(forward_batch, "dcp_kv_mask", None) is None
@@ -315,13 +315,36 @@ def create_fused_set_kv_buffer_arg(
 
     if not _is_hip:
         # CUDA path.
-        assert layer.k_scale is None and layer.v_scale is None, "scale not supported"
-        return FusedSetKVBufferArg(
-            value=value,
-            k_buffer=k_buffer.view(k_buffer.shape[0], -1),
-            v_buffer=v_buffer.view(v_buffer.shape[0], -1),
-            cache_loc=forward_batch.out_cache_loc,
-        )
+        if layer.k_scale is None and layer.v_scale is None:
+            # bf16 KV cache: no scale needed, use the lightweight path.
+            return FusedSetKVBufferArg(
+                value=value,
+                k_buffer=k_buffer.view(k_buffer.shape[0], -1),
+                v_buffer=v_buffer.view(v_buffer.shape[0], -1),
+                cache_loc=forward_batch.out_cache_loc,
+            )
+        # fp8 KV cache: scale is needed, return a dict consumed by the
+        # triton fused_qk_rope_reshape_and_cache kernel (same shape as ROCm).
+        page_size = token_to_kv_pool.page_size
+        if k_buffer.ndim == 5:
+            key_cache = k_buffer
+            value_cache = v_buffer
+        else:
+            key_cache = k_buffer.view(
+                -1, page_size, layer.tp_k_head_num, layer.qk_head_dim
+            )
+            value_cache = v_buffer.view(
+                -1, page_size, layer.tp_v_head_num, layer.v_head_dim
+            )
+        return {
+            "v": value.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+            "k_scale": layer.k_scale,
+            "v_scale": layer.v_scale,
+            "key_cache": key_cache,
+            "value_cache": value_cache,
+            "slot_mapping": forward_batch.out_cache_loc,
+            "swa_slot_mapping": None,
+        }
     else:
         # ROCm path.
         page_size = token_to_kv_pool.page_size
