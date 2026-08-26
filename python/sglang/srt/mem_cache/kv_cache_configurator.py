@@ -1177,6 +1177,12 @@ class KVCacheConfigurator:
             )
 
         pool_kwargs = {}
+        # GLM-5.3 shared-indexer (IndexShare): pass indexer_types so
+        # DSATokenToKVPool only allocates physical index buffers for 'full'
+        # layers (21/78 for GLM-5.3), cutting index device memory 73%.
+        indexer_types = getattr(self.model_config.hf_config, "indexer_types", None)
+        if indexer_types is not None:
+            pool_kwargs["indexer_types"] = indexer_types
         if self.server_args.enable_hisparse and not self.is_draft_worker:
             PoolCls = HiSparseDSATokenToKVPool
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
