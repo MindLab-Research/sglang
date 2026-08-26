@@ -4005,8 +4005,9 @@ class MLATokenToKVPool(KVCache):
                 fp8_dtype,
             )
         elif self.dsa_kv_cache_store_fp8:
-            # 融合路径：per-block fp8 量化(k_nope) + bf16 保留(k_rope) + paged 直接写入
-            # 替代 quantize_k_cache_separate() + set_mla_kv_buffer_triton() 两步
+            # OPTIMIZATION: Fused per-block fp8 quantization of k_nope + bf16 k_rope
+            # + direct paged store, replacing the two-step
+            # quantize_k_cache_separate() + set_mla_kv_buffer_triton().
             from sglang.kernels.ops.attention.dsa.fused_dsa_quant_store import (
                 fused_dsa_quant_store,
             )
