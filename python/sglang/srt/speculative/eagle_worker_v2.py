@@ -15,6 +15,14 @@ _STAGE_SYNC = _os.environ.get("SGLANG_DSA_STAGE_SYNC", "").lower() in ("1", "tru
 # Set SGLANG_SPEC_STEP_TIMING=1 to enable. Zero overhead when off (branch never taken).
 _STEP_TIMING = _os.environ.get("SGLANG_SPEC_STEP_TIMING", "").lower() in ("1", "true", "yes")
 
+# Detailed CUDA kernel-level profile of the verify phase via torch.profiler.
+# Set SGLANG_VERIFY_PROFILE=1 to enable. Profiles N warmup + M active steps,
+# exports Chrome trace to /root/verify_profile.json, then auto-disables.
+_VERIFY_PROFILE = _os.environ.get("SGLANG_VERIFY_PROFILE", "").lower() in ("1", "true", "yes")
+_PROFILE_WARMUP = int(_os.environ.get("SGLANG_VERIFY_PROFILE_WARMUP", "3"))
+_PROFILE_ACTIVE = int(_os.environ.get("SGLANG_VERIFY_PROFILE_ACTIVE", "10"))
+_profile_state = {"prof": None, "step": 0}
+
 # Isolation kill-switch: disable ONLY the EAGLE draft cuda graph (draft() then
 # runs eager draft_forward; target decode/verify graphs are untouched so
 # throughput stays representative). Used to bisect the async-fault family
@@ -1284,9 +1292,29 @@ class EAGLEWorkerV2(BaseSpecWorker):
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
             _t_v0 = time.perf_counter() if _STEP_TIMING else 0
-            batch_output = self.verify(batch)
+            with torch.profiler.record_function("EAGLE_VERIFY"):
+                batch_output = self.verify(batch)
             _t_v1 = time.perf_counter() if _STEP_TIMING else 0
             _t_verify = (_t_v1 - _t_v0) * 1e3 if _STEP_TIMING else 0
+            if _VERIFY_PROFILE:
+                _prof = _profile_state["prof"]
+                if _prof is None:
+                    _prof = torch.profiler.profile(
+                        activities=[torch.profiler.ProfilerActivity.CUDA, torch.profiler.ProfilerActivity.CPU],
+                        schedule=torch.profiler.schedule(
+                            wait=0, warmup=_PROFILE_WARMUP, active=_PROFILE_ACTIVE, repeat=1
+                        ),
+                        on_trace_ready=lambda p: p.export_chrome_trace(f"/root/verify_profile_{_os.getpid()}.json"),
+                        record_shapes=True,
+                    )
+                    _prof.start()
+                    _profile_state["prof"] = _prof
+                _prof.step()
+                _profile_state["step"] += 1
+                if _profile_state["step"] >= _PROFILE_WARMUP + _PROFILE_ACTIVE:
+                    _prof.stop()
+                    logger.info(f"[VERIFY-PROFILE] Exported {_PROFILE_ACTIVE} active steps to /root/verify_profile_{_os.getpid()}.json")
+                    _profile_state["prof"] = None
             _stage_sync_probe("after_verify")
             # Publish before draft_extend so the fence is at verify-end.
             if on_publish is not None:
