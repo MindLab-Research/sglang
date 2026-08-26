@@ -1306,6 +1306,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         ),
                         on_trace_ready=lambda p: p.export_chrome_trace(f"/root/verify_profile_{_os.getpid()}.json"),
                         record_shapes=True,
+                        with_stack=True,
                     )
                     _prof.start()
                     _profile_state["prof"] = _prof
