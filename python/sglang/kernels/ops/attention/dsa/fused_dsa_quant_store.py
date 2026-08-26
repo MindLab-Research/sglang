@@ -1,6 +1,6 @@
 """
 DSA 专用融合 kernel：per-block fp8 量化(k_nope) + bf16 保留(k_rope) + paged buffer 直接写入
-替代 quantize_k_cache() + kv_buffer[loc] = tensor 两步
+替代 quantize_k_cache_separate() + set_mla_kv_buffer_triton() 两步
 
 混合 dtype 写入方案：传 3 个指针（fp8 nope / fp32 scale / bf16 rope），各指向同一 buffer 的不同偏移
 """
@@ -88,3 +88,21 @@ def fused_dsa_quant_store(
     # scale: view as fp32 (size, 1, 4)
     scale_buf = buf_flat[:, :, SCALE_OFFSET:SCALE_OFFSET + SCALE_BYTES].view(torch.float32)
     # rope: view as bf16 (size, 1, 64)
+    rope_buf = buf_flat[:, :, ROPE_OFFSET:ROPE_OFFSET + ROPE_BYTES].view(torch.bfloat16)
+
+    num_blocks_per_token = NUM_NOPE_BLOCKS + 1  # 5
+    FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
+
+    _fused_dsa_quant_store_kernel[(num_tokens, num_blocks_per_token)](
+        k_nope, k_rope,
+        nope_buf, scale_buf, rope_buf,
+        loc,
+        k_nope.stride(0), k_rope.stride(0),
+        nope_buf.stride(0), scale_buf.stride(0), rope_buf.stride(0),
+        GROUP_SIZE=GROUP_SIZE,
+        DIM_NOPE=DIM_NOPE,
+        DIM_ROPE=DIM_ROPE,
+        NUM_NOPE_BLOCKS=NUM_NOPE_BLOCKS,
+        FP8_MAX=FP8_MAX,
+    )
+
