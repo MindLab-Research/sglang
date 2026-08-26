@@ -106,3 +106,64 @@ def fused_dsa_quant_store(
         FP8_MAX=FP8_MAX,
     )
 
+
+def test_correctness():
+    from sglang.kernels.ops.attention.dsa.quant_k_cache import quantize_k_cache
+
+    torch.manual_seed(42)
+    num_tokens = 128
+    size = 256
+
+    k_nope = torch.randn(num_tokens, DIM_NOPE, dtype=torch.bfloat16, device="cuda")
+    k_rope = torch.randn(num_tokens, DIM_ROPE, dtype=torch.bfloat16, device="cuda")
+    loc = torch.randint(0, size, (num_tokens,), dtype=torch.int32, device="cuda")
+
+    # --- 非融合 ground truth ---
+    kv_buffer_ref = torch.zeros(size, 1, TOTAL_BYTES, dtype=torch.float8_e4m3fn, device="cuda")
+    cache_k = torch.cat([k_nope.unsqueeze(1), k_rope.unsqueeze(1)], dim=-1).unsqueeze(1)  # (128,1,1,576)
+    cache_k_quant = quantize_k_cache(cache_k).squeeze(1).squeeze(1)  # (128, 656) fp8
+    kv_buffer_ref[loc] = cache_k_quant.unsqueeze(1)
+
+    # --- 融合 ---
+    kv_buffer_fused = torch.zeros(size, 1, TOTAL_BYTES, dtype=torch.float8_e4m3fn, device="cuda")
+    fused_dsa_quant_store(k_nope, k_rope, kv_buffer_fused, loc)
+
+    # --- 对比（按字节） ---
+    ref_u8 = kv_buffer_ref.view(torch.uint8)
+    fused_u8 = kv_buffer_fused.view(torch.uint8)
+
+    ref_tokens = ref_u8[loc]
+    fused_tokens = fused_u8[loc]
+
+    nope_match = torch.equal(ref_tokens[:, :, :DIM_NOPE], fused_tokens[:, :, :DIM_NOPE])
+    scale_match = torch.equal(ref_tokens[:, :, DIM_NOPE:DIM_NOPE+SCALE_BYTES],
+                               fused_tokens[:, :, DIM_NOPE:DIM_NOPE+SCALE_BYTES])
+    rope_match = torch.equal(ref_tokens[:, :, DIM_NOPE+SCALE_BYTES:],
+                              fused_tokens[:, :, DIM_NOPE+SCALE_BYTES:])
+
+    print(f"nope fp8 量化值:  {'✅ 一致' if nope_match else '❌ 不一致'}")
+    print(f"scale (fp32):    {'✅ 一致' if scale_match else '❌ 不一致'}")
+    print(f"rope (bf16):     {'✅ 一致' if rope_match else '❌ 不一致'}")
+
+    if nope_match and scale_match and rope_match:
+        print("\n✅ 正确性验证通过：融合 kernel 输出与非融合路径完全一致（无损）")
+        return True
+    else:
+        print("\n❌ 正确性验证失败")
+        if not nope_match:
+            diff = (ref_tokens[:,:,:DIM_NOPE].view(torch.float8_e4m3fn).to(torch.float32) -
+                    fused_tokens[:,:,:DIM_NOPE].view(torch.float8_e4m3fn).to(torch.float32))
+            print(f"  nope 最大差异: {diff.abs().max():.2f}")
+        if not scale_match:
+            ref_s = ref_tokens[:,:,DIM_NOPE:DIM_NOPE+SCALE_BYTES].view(torch.float32)
+            fus_s = fused_tokens[:,:,DIM_NOPE:DIM_NOPE+SCALE_BYTES].view(torch.float32)
+            print(f"  scale 最大差异: {(ref_s-fus_s).abs().max():.6f}")
+        if not rope_match:
+            ref_r = ref_tokens[:,:,DIM_NOPE+SCALE_BYTES:].view(torch.bfloat16)
+            fus_r = fused_tokens[:,:,DIM_NOPE+SCALE_BYTES:].view(torch.bfloat16)
+            print(f"  rope 最大差异: {(ref_r.to(torch.float32)-fus_r.to(torch.float32)).abs().max():.4f}")
+        return False
+
+
+if __name__ == "__main__":
+    test_correctness()
