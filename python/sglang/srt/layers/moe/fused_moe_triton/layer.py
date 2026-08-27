@@ -1291,10 +1291,14 @@ class FusedMoE(torch.nn.Module):
         ):
             final_hidden_states = self.dispatcher.combine(combine_input=combine_input)
 
-            # TODO: should we add some conditions here?
-            final_hidden_states = final_hidden_states[
-                ..., :origin_hidden_states_dim
-            ].contiguous()
+            # Skip the slice+contiguous when the dim already matches: the
+            # unconditional view+contiguous spawns an extra copy kernel
+            # (visible as unrolled/vectorized_elementwise in the profile).
+            # Numerically identical — only skips a no-op resize + copy.
+            if final_hidden_states.shape[-1] != origin_hidden_states_dim:
+                final_hidden_states = final_hidden_states[
+                    ..., :origin_hidden_states_dim
+                ].contiguous()
 
         if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
