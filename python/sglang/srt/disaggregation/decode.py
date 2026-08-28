@@ -1007,6 +1007,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if poll == KVPoll.Bootstrapping:
                 pass
             elif poll == KVPoll.WaitingForInput:
+                if not decode_req.waiting_for_input:
+                    logger.info(
+                        "[BS-T] handshake-done rid=%s", decode_req.req.rid
+                    )
                 decode_req.waiting_for_input = True
                 decode_req.req.time_stats.set_bootstrap_done_time()
             elif poll == KVPoll.Failed:
@@ -1926,6 +1930,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
+            logger.info(
+                "[BS-T] prealloc-done rid=%s prefix_len=%s total_prefix=%s",
+                decode_req.req.rid, prefix_len, total_prefix_len,
+            )
             decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
 
         self.queue = [
@@ -2477,6 +2485,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self._pending_pd_hidden_releases: List[dict] = []
 
     def add(self, decode_req: DecodeRequest) -> None:
+        logger.info(
+            "[BS-T] prealloc.add rid=%s room=%s",
+            decode_req.req.rid,
+            getattr(decode_req.req, "bootstrap_room", None),
+        )
         self.queue.append(decode_req)
 
     def extend(self, decode_reqs: List[DecodeRequest]) -> None:
@@ -3158,6 +3171,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 else:
                     transferred_reqs.append(decode_req.req)
                     _shard_reqs.append(decode_req)
+                    logger.info("[BS-T] kv-arrived rid=%s", decode_req.req.rid)
             elif poll in [
                 KVPoll.Bootstrapping,
                 KVPoll.WaitingForInput,

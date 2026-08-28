@@ -178,8 +178,10 @@ class PDHiddenEventManager:
         return True
 
     # Re-notify cadence: healthy chunks ACK in well under a second, so the
-    # loop only ever fires for notifies that were actually lost.
-    RENOTIFY_INTERVAL_S = 3.0
+    # loop only ever fires for notifies that were actually lost. 1s keeps the
+    # worst-case notify-loss recovery (one dropped first notify) under ~1s
+    # instead of ~3s, which directly bounds the TTFT tail on the PD path.
+    RENOTIFY_INTERVAL_S = 1.0
 
     def _start_renotify_loop(self, key, renotify_args: dict) -> None:
         def tick() -> None:
