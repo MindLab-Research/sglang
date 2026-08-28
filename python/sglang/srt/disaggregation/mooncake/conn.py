@@ -2199,14 +2199,25 @@ class MooncakeKVManager(CommonKVManager):
                             if len(polls) == req.required_dst_info_num:
                                 status = KVPoll.Success if all(polls) else KVPoll.Failed
                                 self.update_status(req.room, status)
-                                for endpoint, dst_port, room in dst_ranks_infos:
-                                    self.sync_status_to_decode_endpoint(
+                                # Parallel notify: each decode rank's status
+                                # sync is an independent TCP send on its own
+                                # endpoint (per-endpoint lock keeps frames
+                                # intact); serializing them multiplies the
+                                # send->kv-arrived confirmation latency by the
+                                # dst-rank count on the PD TTFT critical path.
+                                sync_futures = [
+                                    executor.submit(
+                                        self.sync_status_to_decode_endpoint,
                                         endpoint,
                                         dst_port,
                                         room,
                                         status,
                                         prefill_unique_rank,
                                     )
+                                    for endpoint, dst_port, room in dst_ranks_infos
+                                ]
+                                for _f in sync_futures:
+                                    _f.result()
                     else:
                         # Dummy request means the decode instance is not used, so its status can be marked as success directly
                         # Dummy request does not need to sync status to decode endpoint
