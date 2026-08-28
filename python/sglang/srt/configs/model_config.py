@@ -113,6 +113,8 @@ def is_deepseek_dsa(config) -> bool:
             "PixtralForConditionalGeneration",
             "GlmMoeDsaForCausalLM",
             "GlmMoeDsaForCausalLMNextN",
+            "Glm5NextForConditionalGeneration",
+            "Glm5NextForConditionalGenerationNextN",
             "LongcatFlashForCausalLM",
             "LongcatFlashForCausalLMNextN",
         )

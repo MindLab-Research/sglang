@@ -834,3 +834,7 @@ def moe_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
 
 def attn_tp_all_gather(output_list: List[torch.Tensor], input: torch.Tensor):
     return get_attn_tp_group().all_gather(input, output_tensor_list=output_list)
+
+
+def get_local_dp_buffer_mhc(group: GroupCoordinator, n: int = 1) -> torch.Tensor:
+    return _DpGatheredBufferWrapper.get_local_dp_buffer_mhc(group=group, n=n)

@@ -439,6 +439,27 @@ def enable_moe_dense_fully_dp():
     return get_server_args().moe_dense_tp_size == 1
 
 
+def tp_reduce_scatter(
+    hidden_states: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    context: "CommunicateContext",
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Reduce-scatter ``hidden_states`` over the full TP group and slice
+    ``residual`` to this rank. Module-level so variant communicators (e.g. MHC)
+    can reuse it without holding a ``LayerCommunicator`` instance."""
+    if hidden_states.shape[0] == 0:
+        return hidden_states, hidden_states
+    assert (
+        hidden_states.shape[0] % context.tp_size == 0
+    ), f"Expected total tokens {hidden_states.shape[0]} % tp_size {context.tp_size} to be 0"
+    local_tokens = hidden_states.shape[0] // context.tp_size
+    output = hidden_states.new_empty(local_tokens, *hidden_states.shape[1:])
+    get_tp_group().reduce_scatter_tensor(output, hidden_states)
+    if residual is not None:
+        residual = residual.tensor_split(context.tp_size)[context.tp_rank]
+    return output, residual
+
+
 class LayerCommunicator:
     def __init__(
         self,
