@@ -2133,8 +2133,27 @@ class SchedulerDisaggregationPrefillMixin:
                 return kv_to_page_indices(window_kv_indices_swa, page_size)
 
             def _dsa_payload():
+                # DELTA index_k transfer (must mirror decode's _dsa_payload
+                # slice): src page list pairs 1:1 positionally with decode's
+                # dst list, so both sides must skip the same radix-hit prefix
+                # [0, decode_prefix_len). The skipped rows are already resident
+                # on decode (index_k rows share the main-KV page lifecycle).
+                # Kill-switch: SGLANG_DSA_INDEX_K_FULL_TRANSFER=1 restores the
+                # legacy full-seq transfer.
+                import os as _os
+
+                _skip = (
+                    0
+                    if _os.environ.get("SGLANG_DSA_INDEX_K_FULL_TRANSFER", "")
+                    .lower()
+                    .strip()
+                    in ("1", "true", "yes")
+                    else int(
+                        getattr(req, "disagg_decode_prefix_len", None) or 0
+                    )
+                )
                 kv_indices_full = self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, :seq_len
+                    req.req_pool_idx, _skip:seq_len
                 ]
                 return kv_to_page_indices(kv_indices_full, page_size)
 

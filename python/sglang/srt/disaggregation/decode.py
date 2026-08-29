@@ -1744,8 +1744,31 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
 
             def _dsa_payload():
+                # DELTA index_k transfer: rows for the radix-hit prefix are
+                # already resident on decode — index_k rows share the main-KV
+                # page lifecycle (radix keeps the page allocated -> the row is
+                # intact). Shipping the full-seq page list made the DSA state
+                # transfer O(ctx) (~2.3GB at 827K ctx -> ~14s over TCP), the
+                # dominant TTFT term for large-context near-full-hit requests
+                # (observed t213-607: 827K ctx, 99.8% radix hit, prefill batch
+                # 1s but KV window 14s). Mirror the main-KV delta slice
+                # (kv_indices[:origin_input_len - prefix_len]) and skip
+                # [0, total_prefix_len). MUST stay in lockstep with prefill's
+                # _dsa_payload — src/dst page lists pair 1:1 positionally.
+                # Kill-switch: SGLANG_DSA_INDEX_K_FULL_TRANSFER=1 restores the
+                # legacy full-seq transfer.
+                import os as _os
+
+                _skip = (
+                    0
+                    if _os.environ.get("SGLANG_DSA_INDEX_K_FULL_TRANSFER", "")
+                    .lower()
+                    .strip()
+                    in ("1", "true", "yes")
+                    else int(total_prefix_len)
+                )
                 kv_indices_full = self.req_to_token_pool.req_to_token[
-                    decode_req.req.req_pool_idx, :seq_len
+                    decode_req.req.req_pool_idx, _skip:seq_len
                 ]
                 # Indexer lives on device pool; always use device page_size
                 device_page_size = self.token_to_kv_pool.page_size
