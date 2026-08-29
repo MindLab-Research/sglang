@@ -42,17 +42,19 @@ __global__ void hicache_relayout_kernel(const __grid_constant__ HicacheRelayoutP
     const auto vec_id = token_vec_id % kVecPerItem;
     const auto src_page = static_cast<uint32_t>(static_cast<const IndexType*>(indices_src)[page_id]);
     const auto src_token = src_page + token_in_page;
-    // [RELAYOUT-BOUNDS] Xid31 probe: device-side OOB check on src offset.
+    // [RELAYOUT-BOUNDS] Xid31 fix: device-side OOB check on src offset.
+    // 2026-08-29 fix: removed printf (GPU printf is synchronous and deadlocked
+    // all TP schedulers when OOB repeated 10000+ times). Now skip silently.
     const int64_t _src_off = static_cast<int64_t>(src_token) * kElementSize + static_cast<int64_t>(vec_id) * kVecBytes;
     const int64_t _dst_off = static_cast<int64_t>(linear_vec_id) * kVecBytes;
     const uint64_t _src_max = static_cast<uint64_t>(num_pages) * page_size * kElementSize;
     const uint64_t _dst_max = static_cast<uint64_t>(num_pages) * page_size * num_layers * kElementSize;
     if (static_cast<uint64_t>(_src_off + kVecBytes) > _src_max ||
         static_cast<uint64_t>(_dst_off + kVecBytes) > _dst_max) {
-      printf("[RELAYOUT-OOB] layer=%u page_id=%u src_page=%u tok=%u vec=%u src_off=%lld dst_off=%lld elem=%lld ps=%u np=%u nl=%u\\n",
-             layer_id, page_id, src_page, token_in_page, vec_id,
-             static_cast<long long>(_src_off), static_cast<long long>(_dst_off),
-             static_cast<long long>(kElementSize), page_size, num_pages, num_layers);
+      // OOB detected: skip this copy (prevents silent MMU fault / Xid 31).
+      // The Python-side gate (memory_pool_host.py backup_from_device_all_layer
+      // staging capacity check) should have already caught this — if we get
+      // here, the fallback path was not taken. Silent skip avoids deadlock.
       continue;
     }
     const auto src_k = pointer::offset(

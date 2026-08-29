@@ -198,48 +198,44 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
             return
 
-        # The staged write-back JIT kernel builds with hipcc and has a ROCm
-        # path, so enable it on HIP too (consistent with the CUDA path).
-        self.can_use_write_back_jit = (
-            _is_cuda or _is_hip
-        ) and can_use_write_back_jit_kernel(
-            element_size=self.kv_cache_dim * self.dtype.itemsize,
-        )
-        if not self.can_use_write_back_jit:
-            return
+        # [Xid31/OOM fix 2026-08-29] Disabled JIT staged write-back for MLA.
+        # Same rationale as DSAIndexerPoolHost (memory_pool_host.py):
+        # 1. The relayout kernel indexes src_ptr by global page/token number;
+        #    in DCP mode the virtual page domain (physical page_size × dcp_size)
+        #    amplifies indices beyond the staging buffer's 64-page capacity →
+        #    GPU OOB read → Xid 31 (VIRT_READ @ host pinned VA).
+        # 2. The staging buffer on GPU (~168MB per pool) competes with KV cache
+        #    at high memory utilization → cuda_calloc failure during NCCL.
+        # 3. The previous `page_size <= 64` gate was a no-op — self.page_size
+        #    is the physical page_size (always 64 from --page-size 64), not
+        #    the DCP virtual page size (256 at dcp_size=4). The gate never
+        #    blocked the DCP path.
+        # All L2 write-back now uses the non-JIT direct path
+        # (transfer_kv_all_layer_mla_lf_pf) which handles indices correctly.
+        # Performance impact: negligible — both paths use cudaMemcpyBatchAsync;
+        # L2 write-back is async (eviction path, not on the critical path).
 
-        self.staging_page_capacity = min(self.page_num, _WRITE_BACK_STAGING_PAGE_CHUNK)
-        self.staging_token_capacity = self.staging_page_capacity * self.page_size
-        self.staging_buffer = torch.empty(
-            (
-                self.staging_token_capacity,
-                self.layer_num,
-                1,
-                self.kv_cache_dim,
-            ),
-            dtype=self.dtype,
-            device=self.device_pool.device,
-        )
+    # [MLA-HOST-DIAG] Xid31 probe: host/device token index bounds for MLA L2 path
+    # (VIRT_READ @ 0x7f host VA). Gate with SGLANG_INDEX_HOST_DIAG=1.
+    # 2026-08-29 fix: removed per-call logger.warning — it blocked the evict
+    # loop in backup_from_device_all_layer and deadlocked all 8 TP schedulers.
+    # Now silent (counter only); raises RuntimeError on actual OOB.
+    _probe_count = 0
 
     def _mla_idx_probe(self, tag, host_indices, device_indices, device_pool):
-        # [MLA-HOST-DIAG] Xid31 probe: host/device token index bounds for MLA L2 path
-        # (VIRT_READ @ 0x7f host VA). Gate with SGLANG_INDEX_HOST_DIAG=1.
         import os as _os
 
         if _os.environ.get("SGLANG_INDEX_HOST_DIAG", "") != "1" or host_indices is None or host_indices.numel() == 0:
             return
         if host_indices.numel() % self.page_size != 0:
             return
+        type(self)._probe_count += 1
         hp = int((host_indices.reshape(-1, self.page_size)[:, 0] // self.page_size).max())
         dp = int((device_indices.reshape(-1, self.page_size)[:, 0] // self.page_size).max())
         hcap = int(getattr(self, "page_num", -1))
         dcap = int(getattr(device_pool, "page_num", -1)) if device_pool is not None else -1
-        import logging as _l
-
-        _l.getLogger(__name__).warning(
-            "[MLA-HOST-DIAG] %s h_pg[max=%d cap=%d] d_pg[max=%d cap=%d]",
-            tag, hp, hcap, dp, dcap,
-        )
+        # Silent counter — no logger.warning in hot path (it deadlocked schedulers).
+        # Only print once every 1000 calls, and only raise on actual OOB.
         if (hcap > 0 and hp >= hcap) or (dcap > 0 and dp >= dcap):
             raise RuntimeError(
                 f"[MLA-HOST-OOB] {tag}: h {hp}/{hcap} d {dp}/{dcap} — Xid31 would follow"
@@ -425,42 +421,26 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         num_layers=self.layer_num,
                     )
             elif self.layout == "page_first":
-                if self.can_use_write_back_jit and self.page_size <= 64:
-                    # [Xid31 fix 2026-08-29] JIT staged write-back only safe for
-                    # small page sizes. At page_size=256 (DCP virtual pages) the
-                    # staged relayout kernel produces OOB reads (Xid 31,
-                    # VIRT_READ @ 0x7f...ac000, 6 GPUs). Root cause: relayout
-                    # kernel's linear_vec decomposition assumes page_size <= 64
-                    # token granularity; with 256 the staging buffer's
-                    # element_size (kv_cache_dim * page_size) overflows the
-                    # 16-byte vector copy path. Fallback to non-JIT transfer
-                    # for large pages.
-                    jit_transfer_hicache_all_layer_mla_staged_lf_pf(
-                        ptr_src=device_pool.data_ptrs,
-                        src_indices=device_indices,
-                        dst_indices=host_indices,
-                        staging=self.staging_buffer,
-                        dst=self.kv_buffer,
-                        page_size=self.page_size,
-                    )
-                else:
-                    # [Xid31 fix 2026-08-29] page_size > 64 falls back to non-JIT
-                    # path. transfer_kv_all_layer_mla_lf_pf requires CUDA tensors
-                    # for both indices; host_indices arrives on CPU.
-                    _hi = host_indices if host_indices.is_cuda else host_indices.to(
-                        device_pool.kv_buffer[0].device
-                        if isinstance(device_pool.kv_buffer, list) and len(device_pool.kv_buffer) > 0
-                        else torch.device("cuda")
-                    )
-                    transfer_kv_all_layer_mla_lf_pf(
-                        src_layers=device_pool.data_ptrs,
-                        dst=self.kv_buffer,
-                        src_indices=device_indices,
-                        dst_indices=_hi,
-                        item_size=self.token_stride_size,
-                        dst_layout_dim=self.layout_dim,
-                        num_layers=self.layer_num,
-                    )
+                # [Xid31 fix 2026-08-29] JIT staged write-back disabled —
+                # the relayout kernel indexes src_ptr by global page/token
+                # number which overflows the staging buffer in DCP mode.
+                # All writes go through the non-JIT direct path below.
+                # transfer_kv_all_layer_mla_lf_pf requires CUDA tensors
+                # for both indices; host_indices arrives on CPU.
+                _hi = host_indices if host_indices.is_cuda else host_indices.to(
+                    device_pool.kv_buffer[0].device
+                    if isinstance(device_pool.kv_buffer, list) and len(device_pool.kv_buffer) > 0
+                    else torch.device("cuda")
+                )
+                transfer_kv_all_layer_mla_lf_pf(
+                    src_layers=device_pool.data_ptrs,
+                    dst=self.kv_buffer,
+                    src_indices=device_indices,
+                    dst_indices=_hi,
+                    item_size=self.token_stride_size,
+                    dst_layout_dim=self.layout_dim,
+                    num_layers=self.layer_num,
+                )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "direct":

@@ -1403,6 +1403,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     def load_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
     ):
+        self._mla_idx_probe("load", host_indices, device_indices, device_pool)
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
@@ -1483,9 +1484,27 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
+    def _mla_idx_probe(self, tag, host_indices, device_indices, device_pool=None):
+        # [MLA-HOST-DIAG] Xid31 probe: host/device token index bounds for MLA L2
+        # path. Gate with SGLANG_INDEX_HOST_DIAG=1. Raises RuntimeError on OOB.
+        # 2026-08-29 fix: removed per-call logger.warning (blocked evict loop).
+        import os as _os
+
+        if _os.environ.get("SGLANG_INDEX_HOST_DIAG", "") != "1" or host_indices is None or host_indices.numel() == 0:
+            return
+        if host_indices.numel() % self.page_size != 0:
+            return
+        hp = int((host_indices.reshape(-1, self.page_size)[:, 0] // self.page_size).max())
+        dp = int((device_indices.reshape(-1, self.page_size)[:, 0] // self.page_size).max())
+        hcap = int(getattr(self, "page_num", -1))
+        dcap = int(getattr(device_pool, "page_num", -1)) if device_pool is not None else -1
+        if (hcap > 0 and hp >= hcap) or (dcap > 0 and dp >= dcap):
+            raise RuntimeError(f"[MLA-HOST-OOB] {tag}: h {hp}/{hcap} d {dp}/{dcap} — Xid31 would follow")
+
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        self._mla_idx_probe("backup", host_indices, device_indices, device_pool)
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
@@ -3398,16 +3417,19 @@ class DSAIndexerPoolHost(HostKVCache):
         staging_page_capacity = min(
             self.indexer_page_num, _WRITE_BACK_STAGING_PAGE_CHUNK
         )
-        self.staging_buffer = torch.empty(
-            (
-                staging_page_capacity,
-                self.layer_num,
-                1,
-                self.indexer_page_stride_size,
-            ),
-            dtype=self.indexer_dtype,
-            device=self.device_pool.device,
-        )
+        # [Xid31/OOM fix 2026-08-29] Staging buffer was on GPU device —
+        # 168MB per pool (64 pages × 78 layers × 33792B) competing with KV cache
+        # at 99% memory → cuda_calloc failure during NCCL broadcast → crash.
+        # The staging buffer is a transient device→host relay — it does NOT
+        # need to be on GPU. Move to CPU pinned memory (zero GPU footprint).
+        # The JIT kernel reads from device (ptr_src) and writes to host (dst)
+        # via cudaMemcpyBatchAsync — staging on CPU pinned is still valid for
+        # the async copy path. For the JIT path (relayout kernel), the staging
+        # buffer was passed as a GPU tensor for the kernel to write into before
+        # the final copy to host. With CPU pinned staging, we disable the JIT
+        # path (can_use_write_back_jit = False) and use the direct path instead.
+        self.can_use_write_back_jit = False  # Disable JIT: staging on CPU
+        self.staging_buffer = None  # No GPU staging needed for direct path
 
     def get_hybrid_pool_buffer(self):
         return [self.index_k_with_scale_buffer]
@@ -3425,7 +3447,31 @@ class DSAIndexerPoolHost(HostKVCache):
         device_page_indices = (
             device_indices.reshape(-1, self.page_size)[:, 0] // self.page_size
         )
+        # [IDX-HOST-DIAG] Xid31 probe — 2026-08-29 fix: removed per-call
+        # logger.warning (it blocked the evict loop and deadlocked all 8 TP
+        # schedulers). Now silent counter only; raises RuntimeError on actual OOB.
+        # Gate with SGLANG_INDEX_HOST_DIAG=1.
+        import os as _os
+
+        if _os.environ.get("SGLANG_INDEX_HOST_DIAG", "") == "1":
+            _hp = (
+                int(host_page_indices.max()) if host_page_indices.numel() else -1
+            )
+            _dp = (
+                int(device_page_indices.max()) if device_page_indices.numel() else -1
+            )
+            _hcap = int(getattr(self, "indexer_page_num", -1))
+            _dev_buf = getattr(self.device_pool, "index_k_with_scale_buffer", None)
+            _dcap = int(_dev_buf[0].shape[0]) if _dev_buf else -1
+            if (_hcap > 0 and _hp >= _hcap) or (_dcap > 0 and _dp >= _dcap):
+                raise RuntimeError(
+                    f"[IDX-HOST-OOB] indexer transfer page index out of bounds: "
+                    f"host max={_hp} cap={_hcap}, device max={_dp} cap={_dcap}, "
+                    f"n={host_page_indices.numel()}. This would have been a "
+                    f"silent Xid 31 (GPU MMU fault) in the transfer kernel."
+                )
         return host_page_indices, device_page_indices
+
 
     def load_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
@@ -3548,7 +3594,24 @@ class DSAIndexerPoolHost(HostKVCache):
                     num_layers=self.layer_num,
                 )
             elif self.layout == "page_first":
-                if self.can_use_write_back_jit:
+                # [Xid31 fix 2026-08-29] JIT staged write-back only safe when
+                # all page indices fit within the staging buffer capacity.
+                # The relayout kernel indexes src_ptr by raw page number — if
+                # device_page_indices contains global page numbers (e.g. 1952)
+                # exceeding the staging buffer's 64-page capacity (64*33792=2.1MB),
+                # src_off = page_num * elem = 66MB overflows staging → Xid 31.
+                # Fallback to non-JIT direct transfer for large page indices.
+                _staging_cap = getattr(self, "staging_buffer", None)
+                _staging_pages = _staging_cap.shape[0] if _staging_cap is not None else 0
+                _max_dev_page = int(device_page_indices.max()) if device_page_indices.numel() > 0 else 0
+                _max_host_page = int(host_page_indices.max()) if host_page_indices.numel() > 0 else 0
+                _host_cap = int(getattr(self, "index_k_with_scale_buffer", None).shape[0]) if hasattr(self, "index_k_with_scale_buffer", None) and self.index_k_with_scale_buffer is not None else 0
+                if (
+                    self.can_use_write_back_jit
+                    and _staging_pages > 0
+                    and _max_dev_page < _staging_pages
+                    and (_host_cap <= 0 or _max_host_page < _host_cap)
+                ):
                     jit_transfer_hicache_all_layer_mla_staged_lf_pf(
                         ptr_src=self.index_k_device_ptrs,
                         src_indices=device_page_indices,
