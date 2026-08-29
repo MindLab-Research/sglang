@@ -589,12 +589,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if len(prefetch_key) < self.prefetch_threshold:
             return 0
 
+        # NOTE: args must align with PrefetchOperation.__init__ signature
+        # (request_id, token_ids, last_hash, prefix_keys, extra_key). The old
+        # call passed the RadixKey/dummy-page in positional slots 2-5, which
+        # mis-bound every parameter AND collided with the extra_key kwarg
+        # (TypeError: multiple values for 'extra_key') — every L3 storage hit
+        # query failed and decode fell back to L2-only restore (312x in the
+        # 1104 case50 run). _storage_hit_query consumes operation.token_ids
+        # to build the hash chain, so pass the page-aligned token ids here.
         operation = PrefetchOperation(
             "__storage_hit_query__",
-            self.cache_controller.mem_pool_host.get_dummy_flat_data_page()[:0],
-            prefetch_key,
-            last_hash,
-            prefix_keys,
+            list(prefetch_key.token_ids),
+            last_hash=last_hash,
+            prefix_keys=prefix_keys,
             extra_key=getattr(prefetch_key, "extra_key", None),
         )
         hash_values, storage_hit_count = self.cache_controller._storage_hit_query(

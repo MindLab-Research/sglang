@@ -1180,8 +1180,12 @@ class KVCacheConfigurator:
         # GLM-5.3 shared-indexer (IndexShare): pass indexer_types so
         # DSATokenToKVPool only allocates physical index buffers for 'full'
         # layers (21/78 for GLM-5.3), cutting index device memory 73%.
+        # GATED OFF by default (2026-08-29): shared-indexer x DCP=4 garbles
+        # output (bisection-confirmed; DCP=4 + share-off = 6/6 clean, share-on
+        # = token soup). DCP=8 verified OK — enable explicitly there via
+        # --enable-indexer-share after validating the DCP size.
         indexer_types = getattr(self.model_config.hf_config, "indexer_types", None)
-        if indexer_types is not None:
+        if indexer_types is not None and self.server_args.enable_indexer_share:
             pool_kwargs["indexer_types"] = indexer_types
         if self.server_args.enable_hisparse and not self.is_draft_worker:
             PoolCls = HiSparseDSATokenToKVPool

@@ -2273,6 +2273,10 @@ class ServerArgs:
     # Hierarchical sparse attention
     # -------------------------------------------------------------------------
     enable_hisparse: A[bool, "Enable hierarchical sparse attention"] = False
+    enable_indexer_share: A[
+        bool,
+        "Share one physical index_k buffer across 'shared' indexer layers via config.indexer_types (GLM-5.3 IndexShare, cuts index device memory ~73%). OFF by default: shared-indexer x DCP=4 garbles output (2026-08-29 bisection); DCP=8 verified OK. Enable explicitly with your DCP size validated.",
+    ] = False
     hisparse_config: A[
         Optional[str],
         Arg(
