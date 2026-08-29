@@ -142,10 +142,17 @@ inline bool try_copy_page_first_pages_batch(
       first_page_bytes = src_page_bytes;
     }
     for (const auto page_offset : host::irange(num_pages)) {
+      const int64_t _dst_page = dst_indices_ptr[page_offset * page_size];
+      // [BATCHCOPY-BOUNDS] Xid31 probe: dst page must be within host buffer.
+      if (_dst_page < 0 || static_cast<uint64_t>(_dst_page) >= static_cast<uint64_t>(dst_ptrs[tensor_id].size(0))) {
+        host::RuntimeCheck(false, "[BATCHCOPY-OOB] dst_page=", _dst_page,
+                           " >= size(0)=", dst_ptrs[tensor_id].size(0),
+                           " page_offset=", page_offset, " num_pages=", num_pages);
+      }
       char* src_ptr = static_cast<char*>(src_ptrs[tensor_id].data_ptr()) +
                       static_cast<size_t>(page_offset * page_size * src_stride0 * elem_size);
       char* dst_ptr = static_cast<char*>(dst_ptrs[tensor_id].data_ptr()) +
-                      static_cast<size_t>(dst_indices_ptr[page_offset * page_size] * dst_stride0 * elem_size);
+                      static_cast<size_t>(_dst_page * dst_stride0 * elem_size);
       batch_srcs.push_back(src_ptr);
       batch_dsts.push_back(dst_ptr);
       batch_sizes.push_back(src_page_bytes);

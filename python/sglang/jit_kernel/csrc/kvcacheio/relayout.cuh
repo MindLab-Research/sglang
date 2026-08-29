@@ -42,6 +42,19 @@ __global__ void hicache_relayout_kernel(const __grid_constant__ HicacheRelayoutP
     const auto vec_id = token_vec_id % kVecPerItem;
     const auto src_page = static_cast<uint32_t>(static_cast<const IndexType*>(indices_src)[page_id]);
     const auto src_token = src_page + token_in_page;
+    // [RELAYOUT-BOUNDS] Xid31 probe: device-side OOB check on src offset.
+    const int64_t _src_off = static_cast<int64_t>(src_token) * kElementSize + static_cast<int64_t>(vec_id) * kVecBytes;
+    const int64_t _dst_off = static_cast<int64_t>(linear_vec_id) * kVecBytes;
+    const uint64_t _src_max = static_cast<uint64_t>(num_pages) * page_size * kElementSize;
+    const uint64_t _dst_max = static_cast<uint64_t>(num_pages) * page_size * num_layers * kElementSize;
+    if (static_cast<uint64_t>(_src_off + kVecBytes) > _src_max ||
+        static_cast<uint64_t>(_dst_off + kVecBytes) > _dst_max) {
+      printf("[RELAYOUT-OOB] layer=%u page_id=%u src_page=%u tok=%u vec=%u src_off=%lld dst_off=%lld elem=%lld ps=%u np=%u nl=%u\\n",
+             layer_id, page_id, src_page, token_in_page, vec_id,
+             static_cast<long long>(_src_off), static_cast<long long>(_dst_off),
+             static_cast<long long>(kElementSize), page_size, num_pages, num_layers);
+      continue;
+    }
     const auto src_k = pointer::offset(
         static_cast<const void*>(k_ptr_src_arr[layer_id]),
         static_cast<int64_t>(src_token) * kElementSize + static_cast<int64_t>(vec_id) * kVecBytes);

@@ -221,9 +221,34 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             device=self.device_pool.device,
         )
 
+    def _mla_idx_probe(self, tag, host_indices, device_indices, device_pool):
+        # [MLA-HOST-DIAG] Xid31 probe: host/device token index bounds for MLA L2 path
+        # (VIRT_READ @ 0x7f host VA). Gate with SGLANG_INDEX_HOST_DIAG=1.
+        import os as _os
+
+        if _os.environ.get("SGLANG_INDEX_HOST_DIAG", "") != "1" or host_indices is None or host_indices.numel() == 0:
+            return
+        if host_indices.numel() % self.page_size != 0:
+            return
+        hp = int((host_indices.reshape(-1, self.page_size)[:, 0] // self.page_size).max())
+        dp = int((device_indices.reshape(-1, self.page_size)[:, 0] // self.page_size).max())
+        hcap = int(getattr(self, "page_num", -1))
+        dcap = int(getattr(device_pool, "page_num", -1)) if device_pool is not None else -1
+        import logging as _l
+
+        _l.getLogger(__name__).warning(
+            "[MLA-HOST-DIAG] %s h_pg[max=%d cap=%d] d_pg[max=%d cap=%d]",
+            tag, hp, hcap, dp, dcap,
+        )
+        if (hcap > 0 and hp >= hcap) or (dcap > 0 and dp >= dcap):
+            raise RuntimeError(
+                f"[MLA-HOST-OOB] {tag}: h {hp}/{hcap} d {dp}/{dcap} — Xid31 would follow"
+            )
+
     def load_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
     ):
+        self._mla_idx_probe("load", host_indices, device_indices, device_pool)
         if not self._is_device_layer_owned(device_pool, layer_id):
             return
         host_layer = self._host_layer_index(layer_id)
@@ -370,6 +395,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        self._mla_idx_probe("backup", host_indices, device_indices, device_pool)
         if self._is_device_layer_sharded(device_pool):
             for layer_id in self._owned_device_layer_ids(device_pool):
                 self._backup_from_device_per_layer(
@@ -399,7 +425,16 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         num_layers=self.layer_num,
                     )
             elif self.layout == "page_first":
-                if self.can_use_write_back_jit:
+                if self.can_use_write_back_jit and self.page_size <= 64:
+                    # [Xid31 fix 2026-08-29] JIT staged write-back only safe for
+                    # small page sizes. At page_size=256 (DCP virtual pages) the
+                    # staged relayout kernel produces OOB reads (Xid 31,
+                    # VIRT_READ @ 0x7f...ac000, 6 GPUs). Root cause: relayout
+                    # kernel's linear_vec decomposition assumes page_size <= 64
+                    # token granularity; with 256 the staging buffer's
+                    # element_size (kv_cache_dim * page_size) overflows the
+                    # 16-byte vector copy path. Fallback to non-JIT transfer
+                    # for large pages.
                     jit_transfer_hicache_all_layer_mla_staged_lf_pf(
                         ptr_src=device_pool.data_ptrs,
                         src_indices=device_indices,
@@ -409,11 +444,19 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         page_size=self.page_size,
                     )
                 else:
+                    # [Xid31 fix 2026-08-29] page_size > 64 falls back to non-JIT
+                    # path. transfer_kv_all_layer_mla_lf_pf requires CUDA tensors
+                    # for both indices; host_indices arrives on CPU.
+                    _hi = host_indices if host_indices.is_cuda else host_indices.to(
+                        device_pool.kv_buffer[0].device
+                        if isinstance(device_pool.kv_buffer, list) and len(device_pool.kv_buffer) > 0
+                        else torch.device("cuda")
+                    )
                     transfer_kv_all_layer_mla_lf_pf(
                         src_layers=device_pool.data_ptrs,
                         dst=self.kv_buffer,
                         src_indices=device_indices,
-                        dst_indices=host_indices,
+                        dst_indices=_hi,
                         item_size=self.token_stride_size,
                         dst_layout_dim=self.layout_dim,
                         num_layers=self.layer_num,
