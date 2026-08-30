@@ -113,6 +113,29 @@ class LayerDoneCounter:
             return
         self.events[self.consumer_index].wait(threshold)
 
+    def wait_all_in_flight(self, stream=None) -> None:
+        """Make `stream` (default: current stream) wait on every load slot's
+        finish event.
+
+        PD-decode HiCache fix: decode running batches never bind a per-batch
+        consumer index (``hicache_consumer_index`` is only set by prefill's
+        ``get_new_batch_prefill``), so ``wait_until`` is a no-op on the decode
+        path. Meanwhile ``load_back`` commits tree node ``value`` immediately
+        after queueing the DMA (``commit_hicache_transfer`` runs before
+        ``start_loading`` executes), so any request whose prefix matches a
+        load_back-committed node reads KV slots whose DMA may still be in
+        flight — read-before-ready garble. Waiting on all slot finish events
+        closes that window: completed / never-recorded events pass instantly
+        (torch Event semantics), in-flight ones gate the forward stream.
+
+        Rank-invariant: this is a per-rank local GPU stream operation and
+        changes no collective call parameters.
+        """
+        if stream is None:
+            stream = device_module.current_stream()
+        for ev in self.events:
+            stream.wait_event(ev.finish_event)
+
     def reset(self):
         self.producer_index = -1
         self.consumer_index = -1

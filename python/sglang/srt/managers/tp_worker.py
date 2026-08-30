@@ -473,6 +473,20 @@ class TpModelWorker(BaseTpWorker):
 
     def set_hicache_consumer(self, consumer_index: int):
         if self.hicache_layer_transfer_counter is not None:
+            if consumer_index < 0:
+                # PD-decode HiCache read-before-ready fix: decode running
+                # batches never set hicache_consumer_index (only prefill's
+                # get_new_batch_prefill does), so set_consumer(-1) would
+                # leave wait_until() a no-op. Meanwhile load_back commits tree
+                # node value before the DMA executes, so requests matching a
+                # load_back-committed node can read in-flight slots with no
+                # gate at all. Instead of no-op'ing, make the forward stream
+                # wait on ALL in-flight load events once per forward —
+                # completed/never-recorded events pass instantly.
+                self.hicache_layer_transfer_counter.wait_all_in_flight(
+                    self.model_runner.forward_stream
+                )
+                return
             self.hicache_layer_transfer_counter.set_consumer(consumer_index)
 
     def register_hisparse_coordinator(self, coordinator):
