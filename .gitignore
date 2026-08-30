@@ -296,3 +296,11 @@ internal-docs/
 
 # 生产 API key —— 真值放仓库根 secrets.env (gitignored)，repo 内只引用 ${MOL_API_KEY_*}
 secrets.env
+
+# 本地杂项（2026-08-30：不相干文件不进 repo）
+.tmp/
+skills-pkg/
+test_hisparse_logic.py
+*.cuh.bak
+*.bak
+
