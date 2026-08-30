@@ -3413,7 +3413,12 @@ class DSAIndexerPoolHost(HostKVCache):
             self.indexer_size_per_token * self.page_size * self.indexer_dtype.itemsize
         )
         self.indexer_layout_dim = self.indexer_page_stride_size * self.layer_num
-        self.indexer_page_num = self.page_num  # [DCP fix 2026-08-30] align with the anchor host pool's page domain: the old round-up formula ((size+page_size+1)//page_size) can land one page short of anchor_host.page_num, so MLA-slot 20032 (page 39, valid in the 40-page anchor domain) hit IndexError on the 39-page DSA buffer (1104 write-back crash).
+        self.indexer_page_num = (self.size + self.page_size + 1) // self.page_size
+        # [2026-08-30 revert] A previous "page_num alignment" change was the
+        # WRONG fix for the 1104 IndexError — the real bug was the DCP
+        # token-level path indexing buffer[layer] on page_first layouts (dim0
+        # is PAGES, not layers). Restore the original host-page formula: it
+        # covers the anchor host pool's full token domain with +1 slack page.
         self.size_per_token = (
             self.indexer_size_per_token * self.layer_num * self.indexer_dtype.itemsize
         )
@@ -3563,16 +3568,31 @@ class DSAIndexerPoolHost(HostKVCache):
 
         # [DCP virtual id domain fix 2026-08-30] mirror of the backup
         # token-granular copy (owner-filtered local tokens; see backup_from_
-        # device_all_layer for the full rationale).
+        # device_all_layer for the full rationale). LAYOUT-AWARE host indexing:
+        # page_first dim0 is PAGES — buffer[layer] there is a page slice, so
+        # map rows via ((t//ps)*layer_num + l)*ps + t%ps (see backup comments).
         if _dcp_active():
             tok_stride = self.indexer_page_stride_size // self.page_size
-            host_buf = self.index_k_with_scale_buffer[host_layer]
+            ps = self.page_size
+            lf = self.layout == "layer_first"
+            host_idx = host_indices.long()
+            dev_idx = device_indices.long()
             dev_buf = device_pool.index_k_with_scale_buffer[layer_id]
-            dev_buf.view(-1, tok_stride)[device_indices.long()] = (
-                host_buf.view(-1, tok_stride)[host_indices.long()].to(
+            if lf:
+                host_rows = self.index_k_with_scale_buffer[host_layer].view(
+                    -1, tok_stride
+                )
+                dev_buf.view(-1, tok_stride)[dev_idx] = host_rows[host_idx].to(
                     dev_buf.device, non_blocking=True
                 )
-            )
+            else:
+                host_flat = self.index_k_with_scale_buffer.view(-1, tok_stride)
+                row = ((host_idx // ps) * self.layer_num + host_layer) * ps + (
+                    host_idx % ps
+                )
+                dev_buf.view(-1, tok_stride)[dev_idx] = host_flat[row].to(
+                    dev_buf.device, non_blocking=True
+                )
             return
 
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
@@ -3670,24 +3690,46 @@ class DSAIndexerPoolHost(HostKVCache):
         # [DCP virtual id domain fix 2026-08-30] HostPoolGroup delivers
         # owner-filtered LOCAL tokens (64-token segments, not 512-contiguous),
         # which breaks _get_indexer_page_indices' page reshape — and the page
-        # widths mismatch anyway (host 512 vs device 64). Both buffers are
-        # token-linear (132 B/token, pages contiguous), so do a token-granular
-        # copy. Layer-dedup via buffer identity (IndexShare shared layers
-        # alias the full layer's buffer).
+        # widths mismatch anyway (host 512 vs device 64). Token-granular copy
+        # with LAYOUT-AWARE host indexing (the 1104 IndexError root cause #2:
+        # on page_first layouts buffer[layer] indexes the PAGES dim, giving a
+        # (layer_num,1,stride) slice whose flat-token view spans layer_num*512
+        # rows instead of the host page domain — host slot 20032 hit a
+        # 19968-row view). Row mapping per layout:
+        #   layer_first (layer,page,stride)[l]: row == host token t
+        #   page_first  (page,layer,1,stride): row == ((t//ps)*layer_num+l)*ps + t%ps
+        # IndexShare shared device layers: gather device data once per unique
+        # buffer, write every host layer region (dedup on read, not on write).
         if _dcp_active():
             tok_stride = self.indexer_page_stride_size // self.page_size
-            seen = set()
+            ps = self.page_size
+            lf = self.layout == "layer_first"
+            host_flat = (
+                None
+                if lf
+                else self.index_k_with_scale_buffer.view(-1, tok_stride)
+            )
+            host_idx = host_indices.long()
+            dev_idx = device_indices.long()
+            src_cache = {}
             for layer in range(self.layer_num):
                 dev_buf = device_pool.index_k_with_scale_buffer[layer]
-                if id(dev_buf) in seen:
-                    continue
-                seen.add(id(dev_buf))
-                host_buf = self.index_k_with_scale_buffer[layer]
-                host_buf.view(-1, tok_stride)[host_indices.long()] = (
-                    dev_buf.view(-1, tok_stride)[device_indices.long()].to(
-                        host_buf.device, non_blocking=True
+                src = src_cache.get(id(dev_buf))
+                if src is None:
+                    src = dev_buf.view(-1, tok_stride)[dev_idx].to(
+                        self.index_k_with_scale_buffer.device, non_blocking=True
                     )
-                )
+                    src_cache[id(dev_buf)] = src
+                if lf:
+                    host_rows = self.index_k_with_scale_buffer[layer].view(
+                        -1, tok_stride
+                    )
+                    host_rows[host_idx] = src
+                else:
+                    row = (
+                        (host_idx // ps) * self.layer_num + layer
+                    ) * ps + (host_idx % ps)
+                    host_flat[row] = src
             return
         if self._is_device_layer_sharded(device_pool):
             for layer_id in self._owned_device_layer_ids(device_pool):
