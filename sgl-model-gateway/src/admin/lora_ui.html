@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>smg · LoRA Console</title>
+<style>
+:root{--bg:#0a0a0f;--card:rgba(255,255,255,.02);--bd:rgba(255,255,255,.07);--bd2:rgba(255,255,255,.12);--fg:#e4e4e7;--dim:#71717a;--dim2:#52525b;--ind:#6366f1;--ind2:#818cf8;--cyn:#22d3ee;--emr:#34d399;--amb:#fbbf24;--red:#f87171}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);color:var(--fg);font:14px/1.6 -apple-system,'Segoe UI',Roboto,'PingFang SC','Microsoft YaHei',sans-serif;min-height:100vh}
+.mono{font-family:ui-monospace,'SF Mono',Menlo,Consolas,monospace}
+.card{border:1px solid var(--bd);background:var(--card);border-radius:14px;padding:18px}
+.dim{color:var(--dim)} .dim2{color:var(--dim2)}
+header{position:sticky;top:0;z-index:40;border-bottom:1px solid var(--bd);backdrop-filter:blur(14px);background:rgba(10,10,15,.85)}
+.hw{max-width:1120px;margin:0 auto;padding:0 16px;height:54px;display:flex;align-items:center;gap:12px}
+.logo{width:28px;height:28px;border-radius:8px;background:linear-gradient(135deg,var(--ind),var(--cyn));display:flex;align-items:center;justify-content:center;font-size:14px}
+.ttl{font-weight:600;font-size:14px;letter-spacing:.02em}
+.tag{font-size:10px;color:var(--dim2);border:1px solid var(--bd);border-radius:6px;padding:1px 6px;font-family:ui-monospace,monospace}
+.spacer{flex:1}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--emr);box-shadow:0 0 8px var(--emr);animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.ok{color:var(--emr)} .warn{color:var(--amb)} .err{color:var(--red)}
+main{max-width:1120px;margin:0 auto;padding:20px 16px 60px;display:flex;gap:20px;flex-wrap:wrap}
+nav{width:200px;flex-shrink:0;display:flex;flex-direction:column;gap:6px}
+@media(max-width:860px){nav{width:100%;flex-direction:row;overflow-x:auto}}
+.tab{display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:12px;border:1px solid transparent;background:none;color:var(--dim);cursor:pointer;text-align:left;font-size:13px;transition:.15s;font-family:inherit}
+.tab:hover{background:rgba(255,255,255,.04);color:var(--fg)}
+.tab.active{background:linear-gradient(90deg,rgba(99,102,241,.18),rgba(34,211,238,.07));border-color:rgba(99,102,241,.35);color:#fff}
+.tab .ic{width:28px;height:28px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:13px;background:rgba(255,255,255,.05)}
+.tab.active .ic{background:rgba(99,102,241,.3);color:var(--ind2)}
+.tab small{display:block;font-size:9px;color:var(--dim2)}
+#content{flex:1;min-width:0;min-width:320px}
+h2{font-size:14px;font-weight:600;margin-bottom:4px}
+.sub{font-size:11px;color:var(--dim);font-weight:400}
+.grid{display:grid;gap:10px}
+.g4{grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}
+.g2{grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}
+.stat{border:1px solid var(--bd);background:var(--card);border-radius:12px;padding:14px}
+.stat .lb{font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em}
+.stat .vl{font-size:20px;font-weight:600;margin-top:6px;font-family:ui-monospace,monospace}
+.slots{display:grid;gap:10px;grid-template-columns:repeat(auto-fill,minmax(230px,1fr))}
+.slot{border:1px solid rgba(52,211,153,.3);background:linear-gradient(160deg,rgba(52,211,153,.08),transparent);border-radius:12px;padding:12px;position:relative;overflow:hidden}
+.slot .nm{font-size:12px;color:var(--emr);font-family:ui-monospace,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.slot .pt{font-size:10px;color:var(--dim);font-family:ui-monospace,monospace;margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.slot .meta{font-size:10px;color:var(--dim2);margin-top:4px;display:flex;gap:8px;flex-wrap:wrap}
+.slot .del{margin-top:8px;width:100%;font-size:10px;padding:4px;border-radius:6px;background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.2);color:var(--red);cursor:pointer;font-family:inherit;transition:.15s}
+.slot .del:hover{background:rgba(248,113,113,.2)}
+.slot.empty{border:1px dashed rgba(255,255,255,.1);display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:110px;color:var(--dim2);font-size:10px}
+.pill{font-size:9px;padding:1px 5px;border-radius:4px;background:rgba(52,211,153,.15);color:var(--emr);font-family:ui-monospace,monospace}
+.wnote{border:1px solid rgba(251,191,36,.2);background:rgba(251,191,36,.04);border-radius:8px;padding:8px 10px;font-size:10.5px;color:rgba(251,191,36,.85);margin-top:10px;line-height:1.7}
+.cnote{border:1px solid rgba(34,211,238,.18);background:rgba(34,211,238,.04);border-radius:10px;padding:10px 12px;font-size:11px;color:rgba(103,232,249,.85);line-height:1.8}
+.log{border:1px solid var(--bd);border-radius:12px;font-family:ui-monospace,monospace;font-size:11px;margin-top:14px}
+.log .r{display:flex;gap:10px;padding:8px 14px;border-bottom:1px solid rgba(255,255,255,.04);align-items:center;flex-wrap:wrap}
+.log .r:last-child{border-bottom:none}
+.log .t{color:var(--dim2)} .log .a{padding:0 8px;border-radius:4px;font-size:10px}
+.log .a.load{background:rgba(34,211,238,.1);color:var(--cyn)} .log .a.unload{background:rgba(248,113,113,.1);color:var(--red)} .log .a.err{background:rgba(248,113,113,.15);color:var(--red)} .log .a.ok{background:rgba(52,211,153,.1);color:var(--emr)}
+.btn{border:none;border-radius:10px;padding:9px 18px;font-size:12px;font-weight:600;cursor:pointer;font-family:inherit;transition:.15s}
+.btn-primary{background:linear-gradient(90deg,var(--ind),var(--cyn));color:#fff}
+.btn-primary:hover{opacity:.9}.btn-primary:disabled{opacity:.3;cursor:not-allowed}
+.btn-ghost{background:none;border:1px solid var(--bd2);color:var(--dim)}
+.btn-ghost:hover{color:#fff;border-color:rgba(255,255,255,.3)}
+.btn-danger{background:rgba(248,113,113,.85);color:#fff}.btn-danger:hover{background:var(--red)}
+.input{width:100%;background:rgba(0,0,0,.4);border:1px solid var(--bd);border-radius:10px;padding:10px 12px;color:var(--fg);font-size:12px;font-family:ui-monospace,monospace;outline:none;transition:.15s}
+.input:focus{border-color:rgba(99,102,241,.5);box-shadow:0 0 0 3px rgba(99,102,241,.12)}
+select.input{font-family:inherit}
+pre.code{background:rgba(0,0,0,.45);border:1px solid var(--bd);border-radius:0 0 12px 12px;padding:14px;font-size:11px;line-height:1.75;overflow-x:auto;font-family:ui-monospace,monospace;color:#d4d4d8;white-space:pre}
+.code-hd{display:flex;justify-content:space-between;align-items:center;padding:8px 14px;border:1px solid var(--bd);border-bottom:none;border-radius:12px 12px 0 0;background:rgba(255,255,255,.03);font-family:ui-monospace,monospace;font-size:11px;color:var(--dim)}
+.copy-btn{background:none;border:1px solid var(--bd);border-radius:6px;color:var(--dim);font-size:10px;padding:2px 10px;cursor:pointer;font-family:inherit}
+.copy-btn:hover{color:#fff;border-color:rgba(255,255,255,.3)}
+.copy-btn.done{background:rgba(52,211,153,.15);border-color:rgba(52,211,153,.3);color:var(--emr)}
+.kv{display:flex;gap:8px;font-family:ui-monospace,monospace;font-size:10.5px;margin:5px 0;flex-wrap:wrap}
+.kv .k{color:var(--ind2);background:rgba(99,102,241,.12);padding:0 6px;border-radius:4px;white-space:nowrap}
+.kv .v{color:var(--dim)}
+.tbl{width:100%;border-collapse:collapse;font-size:11px}
+.tbl td{padding:6px 10px;border-bottom:1px solid rgba(255,255,255,.04);vertical-align:top}
+.tbl td:first-child{color:var(--ind2);font-family:ui-monospace,monospace;white-space:nowrap}
+.seq{font-family:ui-monospace,monospace;font-size:10.5px;line-height:2.2}
+.seq .who{display:inline-block;width:52px;text-align:right;color:var(--dim2);margin-right:10px;font-size:9px}
+.seq .step{color:var(--dim)}
+h3{font-size:13px;font-weight:600;margin-bottom:10px}
+#gate{position:fixed;inset:0;background:var(--bg);display:flex;align-items:center;justify-content:center;z-index:99;padding:20px}
+#gate .box{width:100%;max-width:380px;border:1px solid var(--bd2);border-radius:18px;padding:26px;background:rgba(255,255,255,.02);backdrop-filter:blur(20px)}
+#gate .ic{width:56px;height:56px;margin:0 auto 14px;border-radius:16px;background:linear-gradient(135deg,var(--ind),var(--cyn));display:flex;align-items:center;justify-content:center;font-size:22px}
+#toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%) translateY(80px);background:rgba(52,211,153,.12);border:1px solid rgba(52,211,153,.3);color:var(--emr);padding:9px 18px;border-radius:12px;font-size:12px;backdrop-filter:blur(10px);transition:.3s;z-index:98;max-width:90vw}
+#toast.show{transform:translateX(-50%) translateY(0)}
+#toast.err{background:rgba(248,113,113,.12);border-color:rgba(248,113,113,.3);color:var(--red)}
+#modal{position:fixed;inset:0;background:rgba(0,0,0,.7);backdrop-filter:blur(4px);display:none;align-items:center;justify-content:center;z-index:97;padding:20px}
+#modal.show{display:flex}
+#modal .box{width:100%;max-width:400px;border:1px solid var(--bd2);border-radius:16px;padding:22px;background:#0d0d14}
+.empty{color:var(--dim2);text-align:center;padding:40px 20px;font-size:12px}
+.loading{color:var(--dim);font-size:12px;padding:30px;text-align:center}
+</style>
+</head>
+<body>
+
+<div id="gate">
+  <div class="box">
+    <div class="ic">🎛️</div>
+    <div style="text-align:center;margin-bottom:18px">
+      <div class="ttl" style="font-size:16px">smg · LoRA Console</div>
+      <div class="dim" style="font-size:11px;margin-top:2px" id="gate-host">smg gateway</div>
+    </div>
+    <label style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.08em">API Key</label>
+    <input id="key-in" type="password" class="input" placeholder="sk-..." style="margin-top:6px" autocomplete="off">
+    <div id="gate-err" style="font-size:11px;color:var(--red);margin-top:6px;min-height:14px"></div>
+    <button class="btn btn-primary" id="gate-btn" style="width:100%;margin-top:10px" onclick="doLogin()">连接 Connect →</button>
+    <div class="dim2" style="font-size:9.5px;margin-top:12px;line-height:1.7;text-align:center">key 存于浏览器 localStorage，仅作为 Bearer 头发送至本 smg 网关<br>401 将自动返回此页重新输入</div>
+  </div>
+</div>
+
+<header><div class="hw">
+  <div class="logo">🎛️</div><span class="ttl">LoRA Console</span>
+  <span class="tag" id="hd-host">smg</span>
+  <div class="spacer"></div>
+  <span class="dot" id="hd-dot"></span><span class="ok mono" style="font-size:10px" id="hd-conn">PD · ONLINE</span>
+  <span class="dim2" style="font-size:10px" id="hd-units">—</span>
+  <button class="tag" style="cursor:pointer" id="hd-key" onclick="logout()" title="清除 API Key">key •••</button>
+</div></header>
+
+<main>
+<nav>
+  <button class="tab active" data-t="dash" onclick="go('dash')"><span class="ic">◈</span><span>挂载总览<small>Dashboard</small></span></button>
+  <button class="tab" data-t="swap" onclick="go('swap')"><span class="ic">⇄</span><span>换 LoRA<small>Load / Unload</small></span></button>
+  <button class="tab" data-t="usage" onclick="go('usage')"><span class="ic">⌨</span><span>请求教学<small>How to call</small></span></button>
+  <button class="tab" data-t="sse" onclick="go('sse')"><span class="ic">⟲</span><span>SSE 快照<small>Resilient SSE</small></span></button>
+</nav>
+<div id="content">
+
+<section id="t-dash">
+  <div class="grid g4" style="margin-bottom:14px" id="stats"></div>
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+    <h2>Adapter 槽位 <span class="sub" id="cap-lb">· max_loaded_loras = —</span></h2>
+    <button class="btn btn-primary" style="padding:6px 14px;font-size:11px" onclick="go('swap')">+ 挂载新 Adapter</button>
+  </div>
+  <div class="slots" id="slots"><div class="loading">加载中…（GET /v1/control/units）</div></div>
+  <div class="wnote">⚠ 槽位只计 LoRA（base 不占）。触达 capacity 时新 adapter 将 swap 驱逐最旧（LRU）——在途长请求若正在使用被驱逐 adapter 会导致 KV 污染（中途乱码），建议低峰期操作。</div>
+  <h2 style="margin-top:20px">操作日志 <span class="sub">· 本会话（浏览器本地）</span></h2>
+  <div class="log" id="log"><div class="r"><span class="t">—</span><span class="dim2">暂无操作</span></div></div>
+</section>
+
+<section id="t-swap" style="display:none">
+  <div class="card" style="margin-bottom:14px">
+    <h2>挂载新 LoRA <span class="tag">POST /v1/control/models</span></h2>
+    <div class="sub" style="margin-bottom:12px">本地路径（节点盘）或 https OSS URL（引擎派生 cache key + 16 线程并行下载）。PD 双端顺序加载：prefill → decode（大 LoRA 可能数分钟）。</div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <input id="dep-path" class="input" style="flex:1;min-width:260px" placeholder="https://oss.../adapter.safetensors 或 /root/glm52_local/lora/L3" value="">
+      <input id="dep-name" class="input" style="width:180px" placeholder="name（默认=path）">
+      <select id="dep-strategy" class="input" style="width:110px"><option value="all">strategy: all</option><option value="any">strategy: any</option></select>
+    </div>
+    <button class="btn btn-primary" style="margin-top:12px" id="dep-btn" onclick="deploy()">挂载 Deploy</button>
+    <span class="dim2" style="font-size:10px;margin-left:10px">type 固定 lora · strategy all = PD 双端都装（推荐）</span>
+    <div id="dep-status" style="margin-top:10px;font-size:11px" class="mono"></div>
+  </div>
+  <div class="card">
+    <h3>操作须知 <span class="sub">· 生产事故沉淀</span></h3>
+    <div style="font-size:11.5px;line-height:1.9;color:var(--dim)">
+      <div>🔴 <b style="color:var(--fg)">swap 语义</b> — 槽位满时新 adapter 顶替最旧（LRU）。在途请求正用被顶 adapter → 窗口内 KV 污染 → 中途数字汤。低峰操作。</div>
+      <div>🟡 <b style="color:var(--fg)">lora_name = path</b> — engine 注册键是 adapter 的 path 而非短名。smg 部署时 lora_name 传 path，否则运行时 lora_path 查不到 → 400 "never been loaded"。</div>
+      <div>🟡 <b style="color:var(--fg)">400 响应看 error_message</b> — LoRAUpdateOutput 字段是 error_message 不是 message，排错必须打响应 body。</div>
+      <div>🟡 <b style="color:var(--fg)">OSS URL 下载</b> — GDS 调度可能走新加坡（0.5-2MB/s）。引擎侧 curl wrapper 已 16 线程并行（≥16MB 自动）；北京直连源快 10-30×。</div>
+      <div>🟢 <b style="color:var(--fg)">换装后</b> — 引擎重启后 router 熔断需恢复（health 300s 自动）；请求 hang 则重启 router 清 circuit。</div>
+    </div>
+  </div>
+</section>
+
+<section id="t-usage" style="display:none">
+  <div class="card" style="margin-bottom:14px">
+    <h3>请求 LoRA — curl <span class="sub">POST /v1/chat/completions</span></h3>
+    <div class="code-hd"><span>curl · chat + LoRA + SSE 快照</span><button class="copy-btn" onclick="copyCode('c-curl',this)">复制</button></div>
+    <pre class="code" id="c-curl">curl -N http://<span style="color:#7dd3fc">SMG_HOST</span>/v1/chat/completions \
+  -H "Authorization: Bearer <span style="color:#fbbf24">$API_KEY</span>" \
+  -H "X-Sse-Snapshot-Key: $(uuidgen)" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "glm-5.3",
+    <span style="color:#f472b6">"lora_path"</span>: "/root/glm52_local/lora/L0",
+    "stream": true,
+    "messages": [{"role": "user", "content": "用 L0 的风格写一个快速排序"}]
+  }'</pre>
+  </div>
+  <div class="grid g2">
+    <div class="card">
+      <h3>请求字段</h3>
+      <div class="kv"><span class="k">lora_path</span><span class="v">string · 必填 — adapter 的 path/URL（部署时的 key），不是名字</span></div>
+      <div class="kv"><span class="k">model</span><span class="v">string — 任意（引擎不校验），填 served model 即可</span></div>
+      <div class="kv"><span class="k">stream</span><span class="v">bool — true = SSE 流式（推荐搭配 SSE 快照）</span></div>
+      <div class="kv"><span class="k">model:xxx:L0</span><span class="v" style="color:var(--red)">❌ 冒号语法不生效 — 只能用 lora_path 字段</span></div>
+    </div>
+    <div class="card">
+      <h3>首次请求行为</h3>
+      <div style="font-size:11px;color:var(--dim);line-height:2">
+        <span class="ok mono">①</span> lora_path 命中已挂载 adapter → 直接注入<br>
+        <span class="ok mono">②</span> URL 冷路径 → 引擎按派生 key 查 cache → miss 则下载（16 线程）→ 挂载（首请求延迟数秒~分钟）<br>
+        <span class="ok mono">③</span> 超过 max_loaded_loras 的不同 lora_path → LRU 驱逐最旧（见换装页警告）<br>
+        <span class="ok mono">④</span> LoRA 权重保持 BF16 注入（保微调精度），base FP8 不受影响
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="t-sse" style="display:none">
+  <div class="card" style="margin-bottom:14px;border-color:rgba(99,102,241,.25);background:linear-gradient(160deg,rgba(99,102,241,.06),rgba(34,211,238,.02))">
+    <h2 style="display:flex;align-items:center;gap:8px">⟲ SSE 快照 + 重放 <span class="tag" style="color:var(--ind2);border-color:rgba(99,102,241,.35)">已启用 · 默认开启</span></h2>
+    <div style="font-size:11.5px;color:var(--dim);line-height:1.8;margin-top:4px">RL 长流（30min+）断线容错：<b style="color:#22d3ee">带上一个 header</b>，smg 对 SSE 内容做快照；客户端断开后用<b style="color:#22d3ee">同一个 key</b> 重连 → byte 级重放缓存 + 无缝续传新 token——不丢任何已生成内容。</div>
+  </div>
+  <div class="card" style="margin-bottom:14px">
+    <h3>协议时序</h3>
+    <div class="seq">
+      <div><span class="who">client</span><span class="step" style="color:#7dd3fc">① 首次请求 <b>X-Sse-Snapshot-Key: k1</b></span></div>
+      <div><span class="who">smg</span><span class="step" style="color:#a5b4fc">② tee 转发 + 同步快照（响应头 x-sse-snapshot: first）</span></div>
+      <div><span class="who">engine</span><span class="step" style="color:#71717a">③ 流式生成 ──────────────────▶</span></div>
+      <div><span class="who">client</span><span class="step" style="color:#f87171">④ ✕ 网络断开</span></div>
+      <div><span class="who">smg</span><span class="step" style="color:#a5b4fc">⑤ 断开检测 → 不 abort，继续读 engine 到 [DONE] → 快照完整</span></div>
+      <div><span class="who">client</span><span class="step" style="color:#7dd3fc">⑥ 重连（同 key k1）</span></div>
+      <div><span class="who">smg</span><span class="step" style="color:#34d399">⑦ byte 级重放缓存 ─▶ 无缝接 live tail（x-sse-snapshot: replay+live）</span></div>
+      <div><span class="who">client</span><span class="step" style="color:#34d399">⑧ 100% 完整输出（含断线期间生成）✓</span></div>
+    </div>
+  </div>
+  <div class="grid g2" style="margin-bottom:14px">
+    <div class="card">
+      <h3>生命周期</h3>
+      <div class="kv"><span class="k">正常结束</span><span class="v ok">快照立即删（客户端已拿全量）</span></div>
+      <div class="kv"><span class="k">客户端断开</span><span class="v warn">快照保留 · engine 继续跑到 [DONE]</span></div>
+      <div class="kv"><span class="k">重放完成</span><span class="v ok">快照删除</span></div>
+      <div class="kv"><span class="k">永不重连</span><span class="v">TTL 30min 兜底删</span></div>
+      <div class="kv"><span class="k">大小上限</span><span class="v">无 · 会话数 4096 LRU</span></div>
+      <div class="kv"><span class="k">不带 header</span><span class="v" style="color:#7dd3fc">完全旁路 · 零开销</span></div>
+    </div>
+    <div class="card">
+      <h3>响应头</h3>
+      <div class="kv"><span class="k">first</span><span class="v" style="color:#7dd3fc">首次请求 · 正在快照</span></div>
+      <div class="kv"><span class="k">replay</span><span class="v" style="color:#a5b4fc">重连 · 快照已完成（纯重放）</span></div>
+      <div class="kv"><span class="k">replay+live</span><span class="v ok">重连 · 重放 + 续传新 token</span></div>
+      <div style="font-size:10px;color:var(--dim2);margin-top:8px;line-height:1.7">重放是 byte 级一致（原始 SSE bytes 逐字节回放，含 usage/finish/[DONE]）——不解析不重算。适用任何 SSE 端点。</div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="code-hd" style="border-radius:12px 12px 0 0;border-bottom:1px solid var(--bd)"><span>python · 断线重连完整示例</span><button class="copy-btn" onclick="copyCode('c-py',this)">复制</button></div>
+    <pre class="code" id="c-py" style="border-radius:0 0 12px 12px">import httpx, uuid
+
+key = str(uuid.uuid4())            # 断线重连用同一个 key
+url = "http://SMG_HOST/v1/chat/completions"
+
+def ask(msg):
+    with httpx.stream("POST", url, headers={
+            "Authorization": "Bearer <API-KEY>",
+            <span style="color:#f472b6">"X-Sse-Snapshot-Key": key</span>,   # ← 同 key 重连即重放
+        }, json={"model": "glm-5.3", "stream": True,
+                 "lora_path": "/root/glm52_local/lora/L0",
+                 "messages": [{"role": "user", "content": msg}]},
+        timeout=None) as r:
+        print(r.headers.get("x-sse-snapshot"))  # first | replay | replay+live
+        for line in r.iter_lines():
+            if line.startswith("data: "): print(line[6:], end="")
+
+ask("写一个快速排序")   # 网络断? 没关系 ——
+ask("接着写")           # ↑ 同 key 重连: 重放缓存 + 无缝续传</pre>
+  </div>
+</section>
+
+</div>
+</main>
+
+<div id="modal"><div class="box">
+  <h3>卸载确认</h3>
+  <div style="font-size:12px;color:var(--dim);margin-top:8px">将卸载 <b class="mono" id="um-nm" style="color:var(--red)"></b>（PD 双端）。</div>
+  <div class="wnote">⚠ 在途请求若正在使用此 adapter，卸载后请求将失败——建议确认 reqs 归零后操作。</div>
+  <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
+    <button class="btn btn-ghost" onclick="hideModal()">取消</button>
+    <button class="btn btn-danger" id="um-btn">卸载</button>
+  </div>
+</div></div>
+
+<div id="toast"></div>
+
+
+<script>
+// ===== smg LoRA Console (single-file, no build chain; see docs/agent/) =====
+const LS_KEY = 'smg_lora_ui_key';
+let KEY = localStorage.getItem(LS_KEY) || '';
+let unloadTarget = null;
+const $ = id => document.getElementById(id);
+const esc = s => (s || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const now = () => new Date().toTimeString().slice(0, 8);
+
+function toast(msg, isErr) {
+  const t = $('toast');
+  t.textContent = msg; t.className = isErr ? 'err show' : 'show';
+  clearTimeout(t._h); t._h = setTimeout(() => t.className = '', 2600);
+}
+
+async function api(path, opts = {}) {
+  const h = { Authorization: 'Bearer ' + KEY };
+  if (opts.body) h['Content-Type'] = 'application/json';
+  const r = await fetch(path, { ...opts, headers: h });
+  if (r.status === 401 || r.status === 403) { logout(); throw new Error('401 unauthorized'); }
+  return r;
+}
+
+function logout() { localStorage.removeItem(LS_KEY); location.reload(); }
+
+async function doLogin() {
+  const k = $('key-in').value.trim();
+  if (!k) { $('gate-err').textContent = '请输入 API Key'; return; }
+  KEY = k;
+  $('gate-btn').textContent = '验证中…'; $('gate-btn').disabled = true;
+  try {
+    const r = await fetch('/v1/control/units', { headers: { Authorization: 'Bearer ' + KEY } });
+    if (r.status === 401 || r.status === 403) { $('gate-err').textContent = '鉴权失败（' + r.status + '）—— 请检查 API Key'; }
+    else {
+      localStorage.setItem(LS_KEY, KEY);
+      $('gate').style.display = 'none';
+      $('hd-key').textContent = 'key \u2022\u2022\u2022' + KEY.slice(-4);
+      $('gate-err').textContent = '';
+      toast('鉴权通过 \u00b7 已连接 smg');
+      refresh();
+    }
+  } catch (e) { $('gate-err').textContent = '连接失败: ' + e.message; }
+  $('gate-btn').textContent = '连接 Connect \u2192'; $('gate-btn').disabled = false;
+}
+
+function go(t) {
+  document.querySelectorAll('.tab').forEach(x => x.classList.toggle('active', x.dataset.t === t));
+  ['dash','swap','usage','sse'].forEach(x => $('t-' + x).style.display = x === t ? '' : 'none');
+  if (t === 'dash') refresh();
+}
+
+let opLog = [];
+function addLog(action, detail, ok) {
+  opLog.unshift({ t: now(), action, detail, ok });
+  opLog = opLog.slice(0, 30);
+  $('log').innerHTML = opLog.map(r =>
+    '<div class="r"><span class="t">' + r.t + '</span>' +
+    '<span class="a ' + (r.ok ? 'load' : 'err') + '">' + esc(r.action) + '</span>' +
+    '<span class="dim" style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(r.detail) + '</span>' +
+    '<span class="a ' + (r.ok ? 'ok' : 'err') + '">' + (r.ok ? 'ok' : 'fail') + '</span></div>').join('');
+}
+
+async function refresh() {
+  $('slots').innerHTML = '<div class="loading">加载中\u2026（GET /v1/control/units）</div>';
+  try {
+    const r = await api('/v1/control/units');
+    const j = await r.json().catch(() => null);
+    const list = Array.isArray(j) ? j : (j.units || j.children || []);
+    const loras = []; let cap = 0, bases = 0;
+    for (const u of list) {
+      if (u.capacity) cap = Math.max(cap, u.capacity);
+      for (const m of (u.models || [])) {
+        const mt = m.model_type || m.type || '';
+        if (mt === 'lora') loras.push({ name: m.name, path: m.path || m.name, unit: u.id, kind: u.kind || 'engine' });
+        else if (mt === 'base') bases++;
+      }
+    }
+    $('hd-units').textContent = list.length + ' units \u00b7 ' + bases + ' base';
+    const filled = loras.length;
+    $('stats').innerHTML =
+      stat('已挂载 / 槽位', filled + (cap ? ' / ' + cap : ''), '#e4e4e7') +
+      stat('注册单元', list.length + ' (engines)', '#818cf8') +
+      stat('Base Models', bases + '', '#34d399') +
+      stat('Cap 空闲', cap ? Math.max(0, cap - filled) + ' slot' : '\u2014', '#22d3ee');
+    $('cap-lb').textContent = cap ? '\u00b7 capacity = ' + cap : '\u00b7 /v1/control/units';
+    let html = loras.map(l =>
+      '<div class="slot"><div style="display:flex;justify-content:space-between;gap:6px;align-items:center">' +
+      '<span class="nm">' + esc(l.name) + '</span><span class="pill">' + esc(l.kind) + '</span></div>' +
+      '<div class="pt">' + esc(l.path) + '</div>' +
+      '<div class="meta"><span>unit: ' + esc(l.unit) + '</span></div>' +
+      '<button class="del" onclick="askUnload(' + JSON.stringify(JSON.stringify(l.name)) + ')">\u5378\u8f7d unload</button></div>').join('');
+    const emptyN = cap ? Math.max(0, Math.min(cap - filled, 4)) : 1;
+    for (let i = 0; i < emptyN; i++) html += '<div class="slot empty">+ \u7a7a\u69fd slot</div>';
+    $('slots').innerHTML = html || '<div class="empty">\u6ca1\u6709\u6302\u8f7d\u7684 LoRA adapter\uff08GET /v1/control/units \u65e0 lora \u6a21\u578b\uff09</div>';
+  } catch (e) {
+    $('slots').innerHTML = '<div class="empty">\u52a0\u8f7d\u5931\u8d25: ' + esc(e.message) + '</div>';
+  }
+}
+function stat(lb, vl, color) {
+  return '<div class="stat"><div class="lb">' + lb + '</div><div class="vl" style="color:' + color + '">' + vl + '</div></div>';
+}
+
+async function deploy() {
+  const path = $('dep-path').value.trim();
+  if (!path) { toast('\u8bf7\u8f93\u5165 adapter path \u6216 URL', true); return; }
+  const name = $('dep-name').value.trim() || path;
+  $('dep-btn').disabled = true;
+  const st = $('dep-status');
+  st.textContent = '\u25b8 \u63d0\u4ea4\u4e2d\u2026';
+  try {
+    const r = await api('/v1/control/models', {
+      method: 'POST',
+      body: JSON.stringify({ name: name, type: 'lora', path: path, strategy: $('dep-strategy').value })
+    });
+    const body = await r.text();
+    const ok = r.ok;
+    addLog('load', name + ' \u00b7 HTTP ' + r.status, ok);
+    st.textContent = (ok ? '\u2713 ' : '\u2717 ') + r.status + ' ' + body.slice(0, 300);
+    st.style.color = ok ? '#34d399' : '#f87171';
+    if (r.status === 202) { toast('\u90e8\u7f72\u5df2\u63d0\u4ea4 \u00b7 \u6392\u961f/\u52a0\u8f7d\u4e2d\uff08PD \u53cc\u7aef\uff09'); setTimeout(refresh, 5000); setTimeout(refresh, 15000); }
+    else if (ok) { toast('\u90e8\u7f72\u5b8c\u6210'); refresh(); }
+    else if (r.status === 409) toast('\u5df2\u5b58\u5728\u540c\u540d\u90e8\u7f72\uff08already_deployed\uff09', true);
+    else toast('\u90e8\u7f72\u5931\u8d25 ' + r.status, true);
+  } catch (e) { st.textContent = '\u2717 ' + e.message; st.style.color = '#f87171'; toast('\u8bf7\u6c42\u5931\u8d25: ' + e.message, true); }
+  $('dep-btn').disabled = false;
+}
+
+function askUnload(name) { unloadTarget = name; $('um-nm').textContent = name; $('modal').classList.add('show'); }
+function hideModal() { $('modal').classList.remove('show'); }
+async function doUnload() {
+  const name = unloadTarget; hideModal();
+  if (!name) return;
+  try {
+    const r = await api('/v1/control/models/' + encodeURIComponent(name), { method: 'DELETE' });
+    const body = await r.text();
+    addLog('unload', name + ' \u00b7 HTTP ' + r.status, r.ok);
+    toast(r.ok ? '\u5378\u8f7d\u5df2\u63d0\u4ea4\uff08PD \u53cc\u7aef\u6392\u961f\uff09' : '\u5378\u8f7d\u5931\u8d25 ' + r.status + ': ' + body.slice(0, 120), !r.ok);
+    setTimeout(refresh, 4000);
+  } catch (e) { toast('\u8bf7\u6c42\u5931\u8d25: ' + e.message, true); }
+}
+
+function copyCode(id, btn) {
+  const el = document.getElementById(id);
+  const txt = el.innerText.replace(/^SMG_HOST$/gm, location.host);
+  navigator.clipboard.writeText(txt).then(() => {
+    btn.textContent = '\u2713 \u5df2\u590d\u5236'; btn.classList.add('done');
+    setTimeout(() => { btn.textContent = '\u590d\u5236'; btn.classList.remove('done'); }, 1600);
+  });
+}
+
+$('key-in').addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
+$('gate-btn').addEventListener('click', doLogin);
+$('um-btn').addEventListener('click', doUnload);
+$('gate-host').textContent = location.host || 'smg gateway';
+$('hd-host').textContent = location.host || 'smg';
+if (KEY) { $('key-in').value = KEY; doLogin(); } else { $('key-in').focus(); }
+</script>
+</body>
+</html>

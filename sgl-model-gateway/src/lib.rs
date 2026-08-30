@@ -1,3 +1,4 @@
+pub mod admin;
 pub mod app_context;
 pub use smg_auth as auth;
 pub mod config;
