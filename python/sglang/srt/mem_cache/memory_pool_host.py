@@ -3413,7 +3413,7 @@ class DSAIndexerPoolHost(HostKVCache):
             self.indexer_size_per_token * self.page_size * self.indexer_dtype.itemsize
         )
         self.indexer_layout_dim = self.indexer_page_stride_size * self.layer_num
-        self.indexer_page_num = (self.size + self.page_size + 1) // self.page_size
+        self.indexer_page_num = self.page_num  # [DCP fix 2026-08-30] align with the anchor host pool's page domain: the old round-up formula ((size+page_size+1)//page_size) can land one page short of anchor_host.page_num, so MLA-slot 20032 (page 39, valid in the 40-page anchor domain) hit IndexError on the 39-page DSA buffer (1104 write-back crash).
         self.size_per_token = (
             self.indexer_size_per_token * self.layer_num * self.indexer_dtype.itemsize
         )
