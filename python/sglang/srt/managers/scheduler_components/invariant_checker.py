@@ -115,6 +115,13 @@ class SchedulerInvariantChecker:
                 // allocator.page_size
                 * allocator.page_size
             )
+            # [DCP domain unification 2026-08-30] total (max_total_num_tokens)
+            # is PHYSICAL (per-rank slots) while available (free_pages ×
+            # page_size) and tree counters are VIRTUAL (capacity = size ×
+            # dcp). Mixing domains misreports 4x/dcp-x: 1104 crash evidence
+            # total=2709824 vs available=10839296 (= 4 × total, dcp=4).
+            # Unify: lift total into the virtual domain.
+            total = total * getattr(self.server_args, "dcp_size", 1)
         leak, msg = self._check_pool_invariant(
             "full",
             ps.full_available_size,
