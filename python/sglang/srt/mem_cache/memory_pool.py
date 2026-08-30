@@ -3935,7 +3935,11 @@ class MLATokenToKVPool(KVCache):
         assert not self.dsa_kv_cache_store_fp8
         parallel = get_parallel()
         if parallel.dcp_enabled:
-            valid_mask = loc % parallel.attn_dcp_size == parallel.attn_dcp_rank
+            # [DCP fix 2026-08-30] Ownership is per 64-token page
+            # ((loc//64)%dcp==rank), matching the write path
+            # (_write_mla_kv_buffer). Slot-level modulo dropped 7/8 of every
+            # page's slots on the set_kv_buffer (MLA non-DSA) path.
+            valid_mask = (loc // 64) % parallel.attn_dcp_size == parallel.attn_dcp_rank
             if not valid_mask.all():
                 loc = loc[valid_mask]
                 cache_k = cache_k[valid_mask]

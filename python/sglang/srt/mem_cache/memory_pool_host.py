@@ -20,6 +20,10 @@ from sglang.jit_kernel.hicache import (
     transfer_hicache_all_layer_mla_staged_lf_pf as jit_transfer_hicache_all_layer_mla_staged_lf_pf,
 )
 from sglang.jit_kernel.hisparse import transfer_cache_dsv4_mla
+from sglang.srt.layers.dcp.comm import (
+    get_attention_dcp_rank,
+    get_attention_dcp_world_size,
+)
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, MambaPool
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
@@ -3150,6 +3154,43 @@ class PoolEntry:
     device_free_fn: Optional[Callable] = None
 
 
+def _dcp_owner_localize(
+    device_indices: torch.Tensor, host_indices: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """DCP decode: localize VIRTUAL slot ids to this rank's physical slots for
+    HiCache host (L2) transfers, keeping only the owner segment.
+
+    The radix tree / allocator operate on VIRTUAL ids (capacity = size*dcp,
+    virtual page = 512 slots = dcp logical pages of 64). Anchor device pools
+    are per-rank physical (size), so a virtual id must be mapped
+    (vpage*64 + slot) and only this rank's owner slots ((v // 64) % dws ==
+    rank) may be touched — the peers own the rest and back up their own
+    segments. Mirrors the write-path mapping in
+    memory_pool.py::_write_mla_kv_buffer (DCP virtual id domain fix 9db63a6abb).
+
+    Draft pools cover the full virtual domain (size*dcp) and are invoked
+    directly by HybridCacheController (bypassing HostPoolGroup), so this
+    filter never sees them.
+
+    Returns (device_local, host_local) filtered to owner slots.
+    """
+    if device_indices is None or device_indices.numel() == 0:
+        return device_indices, host_indices
+    dws = get_attention_dcp_world_size()
+    if dws <= 1:
+        return device_indices, host_indices
+    ps = 64  # logical token page (mirrors _write_mla_kv_buffer's mapping)
+    rank = get_attention_dcp_rank()
+    owner = (device_indices // ps) % dws == rank
+    local = (device_indices // (ps * dws)) * ps + device_indices % ps
+    return local[owner], host_indices[owner]
+
+
+def _dcp_active() -> bool:
+    """True when running under attention DCP (decode CP) with sharded pools."""
+    return get_attention_dcp_world_size() > 1
+
+
 class HostPoolGroup:
     def __init__(self, entries: list[PoolEntry]):
         if not entries:
@@ -3237,6 +3278,25 @@ class HostPoolGroup:
         io_backend,
         pool_transfers: Optional[list] = None,
     ) -> None:
+        # [DCP virtual id domain fix 2026-08-30] mirror of backup: load
+        # restores host->device with the same virtual->local + owner filter;
+        # each rank writes its own 1/dcp segment (ranks together fill the
+        # virtual page — rank-invariant since every rank runs the same tree).
+        if _dcp_active():
+            device_indices, host_indices = _dcp_owner_localize(
+                device_indices, host_indices
+            )
+            for transfer in pool_transfers or []:
+                if (
+                    transfer.host_indices is not None
+                    and transfer.device_indices is not None
+                ):
+                    (
+                        transfer.device_indices,
+                        transfer.host_indices,
+                    ) = _dcp_owner_localize(
+                        transfer.device_indices, transfer.host_indices
+                    )
         # 1. Anchor (KV) transfer
         anchor = self.anchor_entry
         local_layer_id = anchor.layer_mapper(layer_id)
@@ -3273,6 +3333,27 @@ class HostPoolGroup:
         io_backend,
         pool_transfers: Optional[list] = None,
     ) -> None:
+        # [DCP virtual id domain fix 2026-08-30] Tree/allocator ids are
+        # VIRTUAL (capacity size*dcp); anchor device pools are per-rank
+        # physical. Map virtual->local + owner-filter before any host
+        # transfer (.8/.9 CUDA IMA: 8x OOB on high virtual watermarks; the
+        # write path got this mapping in 9db63a6abb, the host path never did).
+        # Draft pools bypass HostPoolGroup (controller calls them directly).
+        if _dcp_active():
+            device_indices, host_indices = _dcp_owner_localize(
+                device_indices, host_indices
+            )
+            for transfer in pool_transfers or []:
+                if (
+                    transfer.host_indices is not None
+                    and transfer.device_indices is not None
+                ):
+                    (
+                        transfer.device_indices,
+                        transfer.host_indices,
+                    ) = _dcp_owner_localize(
+                        transfer.device_indices, transfer.host_indices
+                    )
         # 1. Anchor (KV) backup
         self.anchor_entry.host_pool.backup_from_device_all_layer(
             self.anchor_entry.device_pool,
@@ -3480,6 +3561,20 @@ class DSAIndexerPoolHost(HostKVCache):
             return
         host_layer = self._host_layer_index(layer_id)
 
+        # [DCP virtual id domain fix 2026-08-30] mirror of the backup
+        # token-granular copy (owner-filtered local tokens; see backup_from_
+        # device_all_layer for the full rationale).
+        if _dcp_active():
+            tok_stride = self.indexer_page_stride_size // self.page_size
+            host_buf = self.index_k_with_scale_buffer[host_layer]
+            dev_buf = device_pool.index_k_with_scale_buffer[layer_id]
+            dev_buf.view(-1, tok_stride)[device_indices.long()] = (
+                host_buf.view(-1, tok_stride)[host_indices.long()].to(
+                    dev_buf.device, non_blocking=True
+                )
+            )
+            return
+
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
             host_indices, device_indices
         )
@@ -3572,6 +3667,28 @@ class DSAIndexerPoolHost(HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        # [DCP virtual id domain fix 2026-08-30] HostPoolGroup delivers
+        # owner-filtered LOCAL tokens (64-token segments, not 512-contiguous),
+        # which breaks _get_indexer_page_indices' page reshape — and the page
+        # widths mismatch anyway (host 512 vs device 64). Both buffers are
+        # token-linear (132 B/token, pages contiguous), so do a token-granular
+        # copy. Layer-dedup via buffer identity (IndexShare shared layers
+        # alias the full layer's buffer).
+        if _dcp_active():
+            tok_stride = self.indexer_page_stride_size // self.page_size
+            seen = set()
+            for layer in range(self.layer_num):
+                dev_buf = device_pool.index_k_with_scale_buffer[layer]
+                if id(dev_buf) in seen:
+                    continue
+                seen.add(id(dev_buf))
+                host_buf = self.index_k_with_scale_buffer[layer]
+                host_buf.view(-1, tok_stride)[host_indices.long()] = (
+                    dev_buf.view(-1, tok_stride)[device_indices.long()].to(
+                        host_buf.device, non_blocking=True
+                    )
+                )
+            return
         if self._is_device_layer_sharded(device_pool):
             for layer_id in self._owned_device_layer_ids(device_pool):
                 self._backup_from_device_per_layer(

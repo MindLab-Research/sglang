@@ -227,18 +227,21 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
 
         if _os.environ.get("SGLANG_INDEX_HOST_DIAG", "") != "1" or host_indices is None or host_indices.numel() == 0:
             return
-        if host_indices.numel() % self.page_size != 0:
-            return
         type(self)._probe_count += 1
-        hp = int((host_indices.reshape(-1, self.page_size)[:, 0] // self.page_size).max())
-        dp = int((device_indices.reshape(-1, self.page_size)[:, 0] // self.page_size).max())
-        hcap = int(getattr(self, "page_num", -1))
-        dcap = int(getattr(device_pool, "page_num", -1)) if device_pool is not None else -1
-        # Silent counter — no logger.warning in hot path (it deadlocked schedulers).
-        # Only print once every 1000 calls, and only raise on actual OOB.
+        # [DCP fix 2026-08-30] Token-level OOB check. The old page-level probe
+        # read a nonexistent `page_num` attribute (always -1 → device side
+        # never checked) and its 512-contiguous reshape breaks on DCP
+        # owner-filtered segments. Token-level max vs the actual pool sizes
+        # catches the 8x virtual-id overflow that crashed .8/.9 (post-fix,
+        # device_indices are localized so this stays green; a regression to
+        # raw virtual ids raises loudly before Xid 31).
+        hp = int(host_indices.max())
+        dp = int(device_indices.max())
+        hcap = int(self.size)
+        dcap = int(device_pool.size) if device_pool is not None else -1
         if (hcap > 0 and hp >= hcap) or (dcap > 0 and dp >= dcap):
             raise RuntimeError(
-                f"[MLA-HOST-OOB] {tag}: h {hp}/{hcap} d {dp}/{dcap} — Xid31 would follow"
+                f"[MLA-HOST-OOB] {tag}: h {hp}/{hcap} d {dp}/{dcap} — token-level OOB"
             )
 
     def load_to_device_per_layer(

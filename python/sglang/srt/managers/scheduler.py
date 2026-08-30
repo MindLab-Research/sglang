@@ -3760,7 +3760,6 @@ class Scheduler(
             if (
                 getattr(self, "tree_cache", None) is not None
                 and getattr(self.tree_cache, "cache_controller", None) is not None
-                and getattr(self.tree_cache, "enable_storage", False)
             ):
                 # Device tokens allocated by load_back but not yet committed
                 # to the tree: total allocated - available - tree-owned

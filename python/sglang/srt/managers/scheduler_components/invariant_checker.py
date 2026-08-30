@@ -129,11 +129,22 @@ class SchedulerInvariantChecker:
             and getattr(self.server_args, "dcp_size", 1) > 1
             and allocator.page_size > 1
         ):
-            # Radix/Mamba cache accounting is logical-token based while DCP full
-            # KV allocation is physical-page based. Partial physical pages can
-            # leave a small page-level slack even when all pages are owned by
-            # either the allocator or the prefix cache.
-            return False, f"{msg}, dcp_physical_page_slack_allowed=True"
+            # Radix/Mamba cache accounting is logical-token based while DCP
+            # full KV allocation is physical-page based, so sub-page rounding
+            # differences are benign. 2026-08-30 tightening: ONLY sub-page
+            # slack (< page_size) is exempt — whole-page shortfalls are REAL
+            # leaks and must be reported (the old blanket exemption silently
+            # swallowed e.g. the observed [full] 64-token page shortfall:
+            # total=2830208, available=376128, evictable=2454016).
+            short = total - (
+                ps.full_available_size
+                + full_evictable_size
+                + protected
+                + session_held
+                + uncached
+            )
+            if 0 < short < allocator.page_size:
+                return False, f"{msg}, dcp_rounding_slack={short}"
         return leak, msg
 
     def _check_swa_pool(self, ps: PoolStats, uncached: int = 0) -> Tuple[bool, str]:
