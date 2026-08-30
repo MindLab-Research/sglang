@@ -3575,7 +3575,11 @@ class DSAIndexerPoolHost(HostKVCache):
             tok_stride = self.indexer_page_stride_size // self.page_size
             ps = self.page_size
             lf = self.layout == "layer_first"
-            host_idx = host_indices.long()
+            # [2026-08-30 device fix] host buffers are CPU (pinned) — tree
+            # indices can arrive on GPU; indexing a CPU tensor with GPU
+            # indices raises RuntimeError and degrades the restore to direct
+            # transfer (L2-hit 1104 log). Force the host side to CPU.
+            host_idx = host_indices.cpu().long()
             dev_idx = device_indices.long()
             dev_buf = device_pool.index_k_with_scale_buffer[layer_id]
             if lf:
@@ -3709,7 +3713,7 @@ class DSAIndexerPoolHost(HostKVCache):
                 if lf
                 else self.index_k_with_scale_buffer.view(-1, tok_stride)
             )
-            host_idx = host_indices.long()
+            host_idx = host_indices.cpu().long()
             dev_idx = device_indices.long()
             src_cache = {}
             for layer in range(self.layer_num):
