@@ -159,7 +159,9 @@ class StorageBackendFactory:
     ) -> HiCacheStorage:
         """Create built-in backend with original initialization logic."""
         if backend_name == "file":
-            return backend_class(storage_config)
+            return backend_class(
+                storage_config, file_path=storage_config.file_path
+            )
         elif backend_name == "nixl":
             return backend_class(storage_config)
         elif backend_name == "mooncake":

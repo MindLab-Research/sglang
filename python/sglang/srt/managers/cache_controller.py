@@ -22,6 +22,8 @@ from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.server_args import get_global_server_args
+
 from sglang.srt.mem_cache.hicache_storage import (
     STORAGE_BATCH_SIZE,
     HiCacheStorageConfig,
@@ -654,6 +656,7 @@ class HiCacheController:
             should_split_heads=should_split_heads,
             extra_config=storage_backend_extra_config,
             is_cp_layersplit=self.is_cp_layersplit,
+            file_path=get_global_server_args().file_storage_path,
         )
 
     def reset(self):

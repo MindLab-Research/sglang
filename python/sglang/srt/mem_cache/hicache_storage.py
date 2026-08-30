@@ -39,6 +39,13 @@ class HiCacheStorageConfig:
     should_split_heads: bool = False
     extra_config: Optional[dict] = None
     is_cp_layersplit: bool = False
+    # [2026-08-30 fix] --file-storage-path was a dead arg (no consumer):
+    # HiCacheFile defaulted to /tmp/hicache (30G tmpfs on 1104) and a 29G
+    # write-back filled the disk -> Triton JIT "No space left on device".
+    # Thread the server arg through config so the file backend lands on the
+    # intended (large) disk. Env SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR
+    # still wins (existing deployments rely on it).
+    file_path: Optional[str] = None
 
 
 @dataclass
@@ -358,9 +365,18 @@ class MetadataCache:
 class HiCacheFile(HiCacheStorage):
 
     def __init__(
-        self, storage_config: HiCacheStorageConfig, file_path: str = "/tmp/hicache"
+        self,
+        storage_config: HiCacheStorageConfig,
+        file_path: Optional[str] = None,
     ):
-        self.file_path = envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.get() or file_path
+        # Priority: env var > explicit arg > --file-storage-path (via
+        # storage_config, the 2026-08-30 fix) > legacy default.
+        self.file_path = (
+            envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.get()
+            or file_path
+            or storage_config.file_path
+            or "/tmp/hicache"
+        )
 
         tp_rank, tp_size, pp_rank, pp_size, model_name, is_mla_model = (
             storage_config.tp_rank,
