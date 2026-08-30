@@ -3605,7 +3605,7 @@ class DSAIndexerPoolHost(HostKVCache):
                 _staging_pages = _staging_cap.shape[0] if _staging_cap is not None else 0
                 _max_dev_page = int(device_page_indices.max()) if device_page_indices.numel() > 0 else 0
                 _max_host_page = int(host_page_indices.max()) if host_page_indices.numel() > 0 else 0
-                _host_cap = int(getattr(self, "index_k_with_scale_buffer", None).shape[0]) if hasattr(self, "index_k_with_scale_buffer", None) and self.index_k_with_scale_buffer is not None else 0
+                _host_cap = int(getattr(self, "index_k_with_scale_buffer", None).shape[0]) if getattr(self, "index_k_with_scale_buffer", None) is not None else 0
                 if (
                     self.can_use_write_back_jit
                     and _staging_pages > 0
