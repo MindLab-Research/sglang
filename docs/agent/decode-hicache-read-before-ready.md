@@ -132,6 +132,21 @@ def set_hicache_consumer(self, consumer_index: int):
 3. **长跑观察**：三集群低 accept 窗口（<0.1，0.4-1.3%）消失。
 4. 判据（新日志无）：decode 日志 accept rate 无无故突降（并发 restore 期间）。
 
+## 部署与验证记录（2026-08-31，1102/1104）
+
+**部署**（commit `7da1b4e9b8` 全量）：
+- ⚠️ **部署插曲——远端版本漂移**：首次只 rsync 两个修改文件（cache_controller.py + tp_worker.py）后 prefill 启动崩：`TypeError: HiCacheStorageConfig.__init__() got an unexpected keyword argument 'file_path'`。法证：远端旧 `cache_controller.py` md5 = commit `32a068412b`（**比 06bba15854 更早**）——**远端 srt/ 是多次部分 rsync 的混合版本**（06bba15854 引入的 `file_path` kwarg + 配套 `hicache_storage.py` 修复从未部署到 1102/1104；旧 cache_controller 不传该 kwarg 所以能跑）。单文件 rsync 覆盖 cache_controller.py 后暴露漂移。**修复：tar overlay 全量 HEAD srt/**（1520 个 py，md5 抽查 5 文件全对 + pycache 清零）——**教训：1102/1104 部署必须全量 tar overlay，单文件 rsync 有跨文件版本漂移风险**。
+- 配对重启：停 decode → 停 prefill → 起 prefill（110s health 200）→ 起 decode（150s health 200）→ smg circuit 自愈（~30s）
+- pkill 教训：`pkill -f 'sglang::'` 会匹配 ssh bash 自身命令行 → exit 255 自杀；用 `[s]glang` 字符类规避
+
+**验证**（全链路经 smg:31000，model glm-5.3）：
+- 小规模 10 case：10/10 通过
+- **全量 case50：50/50 通过，0 失败，0 乱码 0 重复**
+- **decode accept 病态窗口（<0.1）：0/229 个 decode batch**（修复前基线 0.4-1.3%）
+- cache_ratio 0.334（1.29M/3.87M cached tokens——radix/HiCache L2 路径大量命中，修复路径被充分走到：HiCache draft KV registered + load_back 活动确认）
+- TTFT p50=30.9s（大 prompt case50 正常水平），修复无性能回归迹象
+- accept rate 0.19-0.56 区间（AGENTS 健康基准内）
+
 ## 相关文件
 
 | 文件 | 角色 |
