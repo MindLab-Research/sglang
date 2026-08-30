@@ -1,9 +1,10 @@
 import inspect
 import unittest
+from unittest import mock
 
 import torch
 
-from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, MLATokenToKVPool
 from sglang.srt.mem_cache.memory_pool_host import DSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
@@ -23,6 +24,21 @@ class TestDSAOffloadSignatures(unittest.TestCase):
             with self.subTest(method_name=method_name):
                 signature = inspect.signature(getattr(DSATokenToKVPool, method_name))
                 self.assertIn("mamba_indices", signature.parameters)
+
+
+class TestDSAIndexerShareRelocation(unittest.TestCase):
+    def test_aliased_index_buffer_is_moved_once(self):
+        pool = object.__new__(DSATokenToKVPool)
+        shared_buffer = torch.arange(4, dtype=torch.int64).reshape(4, 1)
+        pool.index_k_with_scale_buffer = [shared_buffer, shared_buffer]
+
+        tgt_loc = torch.tensor([1, 2], dtype=torch.int64)
+        src_loc = torch.tensor([0, 1], dtype=torch.int64)
+
+        with mock.patch.object(MLATokenToKVPool, "move_kv_cache"):
+            pool.move_kv_cache(tgt_loc, src_loc)
+
+        self.assertEqual(shared_buffer.flatten().tolist(), [0, 0, 1, 3])
 
 
 class TestDSAHiCacheTransfer(unittest.TestCase):

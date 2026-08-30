@@ -4428,7 +4428,14 @@ class DSATokenToKVPool(MLATokenToKVPool):
 
         tgt_loc_flat = tgt_loc.view(-1).long()
         src_loc_flat = src_loc.view(-1).long()
+        # Shared-indexer layers alias their owner's tensor. Moving an alias twice
+        # can read source rows already overwritten by the first in-place move.
+        moved_buffers: set[int] = set()
         for index_k in self.index_k_with_scale_buffer:
+            buffer_id = id(index_k)
+            if buffer_id in moved_buffers:
+                continue
+            moved_buffers.add(buffer_id)
             index_k[tgt_loc_flat] = index_k[src_loc_flat]
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
