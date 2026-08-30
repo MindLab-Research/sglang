@@ -869,6 +869,10 @@ pub fn build_app(
     // Control plane routes (recursive router tree: models / units / register)
     // Namespaced under /v1/control/ to avoid clashing with OpenAI-compatible
     // /v1/* endpoints (e.g. /v1/models already serves the model list).
+    // Auth: same Bearer gate as admin routes (2026-08-30 fix — these were
+    // merged without a route_layer, exposing deploy/unload/units to the
+    // public internet with no API key; the LoRA Console login also relies
+    // on /v1/control/units returning 401 for a missing key).
     let control_plane_routes = Router::new()
         .route(
             "/v1/control/models",
@@ -885,6 +889,13 @@ pub fn build_app(
             get(control_plane::get_routing).put(control_plane::put_routing),
         )
         .route("/v1/control/register", post(control_plane::register))
+        .with_state(app_state.control_plane.clone())
+        .route_layer(axum::middleware::from_fn_with_state(
+            auth_config.clone(),
+            middleware::auth_middleware,
+        ));
+    // healthz stays public: it is a liveness probe (no secrets in payload).
+    let control_plane_healthz = Router::new()
         .route("/v1/control/healthz", get(control_plane::healthz))
         .with_state(app_state.control_plane.clone());
 
@@ -896,6 +907,7 @@ pub fn build_app(
         .merge(mesh_routes)
         .merge(jobs_routes)
         .merge(control_plane_routes)
+        .merge(control_plane_healthz)
         .layer(axum::extract::DefaultBodyLimit::max(max_payload_size))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             max_payload_size,

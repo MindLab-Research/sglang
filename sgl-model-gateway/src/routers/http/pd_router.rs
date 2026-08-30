@@ -998,6 +998,9 @@ impl PDRouter {
                 (Some(reg), Some(k)) => Some((k.clone(), reg.insert(k.clone()))),
                 _ => None,
             };
+        // Capture before `snap` is moved into the spawned task: the response
+        // advertises to the client that snapshotting is active (X-Sse-Snapshot: first).
+        let has_snapshot = snap.is_some();
         tokio::spawn(async move {
             // Once the client is gone (detached), keep draining upstream into
             // the snapshot only — no tx.send, and do NOT select on tx.closed()
@@ -1124,6 +1127,12 @@ impl PDRouter {
 
         let mut response_headers = headers.unwrap_or_default();
         response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+        if has_snapshot {
+            response_headers.insert(
+                crate::routers::snapshot::SNAPSHOT_RESULT_HEADER,
+                HeaderValue::from_static(crate::routers::snapshot::SNAPSHOT_RESULT_FIRST),
+            );
+        }
         *response.headers_mut() = response_headers;
 
         AttachedBody::wrap_response(response, guards)
