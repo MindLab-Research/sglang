@@ -62,7 +62,15 @@ pub struct RouterConfig {
     pub health_check: HealthCheckConfig,
     #[serde(default)]
     pub enable_igw: bool,
-    /// Can be a HuggingFace model ID or local path
+    /// SSE snapshot+replay protocol (X-Sse-Snapshot-Key header; routers/snapshot.rs)
+    #[serde(default = "default_sse_snapshot_enabled")]
+    pub sse_snapshot_enabled: bool,
+    /// Max concurrent SSE snapshot sessions (LRU eviction leak guard)
+    #[serde(default = "default_sse_snapshot_max_sessions")]
+    pub sse_snapshot_max_sessions: usize,
+    /// TTL (secs) for detached SSE snapshots nobody reconnects to
+    #[serde(default = "default_sse_snapshot_ttl_secs")]
+    pub sse_snapshot_ttl_secs: u64,    /// Can be a HuggingFace model ID or local path
     pub model_path: Option<String>,
     /// Overrides model_path tokenizer if provided
     pub tokenizer_path: Option<String>,
@@ -129,6 +137,18 @@ fn default_l0_max_entries() -> usize {
 
 fn default_enable_l1() -> bool {
     false
+}
+
+fn default_sse_snapshot_enabled() -> bool {
+    true
+}
+
+fn default_sse_snapshot_max_sessions() -> usize {
+    4096
+}
+
+fn default_sse_snapshot_ttl_secs() -> u64 {
+    1800
 }
 
 fn default_l1_max_memory() -> usize {
@@ -541,6 +561,9 @@ impl Default for RouterConfig {
             disable_circuit_breaker: false,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
+            sse_snapshot_enabled: default_sse_snapshot_enabled(),
+            sse_snapshot_max_sessions: default_sse_snapshot_max_sessions(),
+            sse_snapshot_ttl_secs: default_sse_snapshot_ttl_secs(),
             connection_mode: ConnectionMode::Http,
             worker_runtime: None,
             model_path: None,

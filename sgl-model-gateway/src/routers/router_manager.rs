@@ -545,6 +545,17 @@ impl RouterTrait for RouterManager {
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
+        // SSE snapshot replay short-circuit (docs/agent/sse-snapshot-replay.md):
+        // a request carrying X-Sse-Snapshot-Key whose snapshot exists replays
+        // the cached stream instead of dispatching to workers (no upstream,
+        // no token bucket — replay is free and byte-identical).
+        if body.stream {
+            if let Some(h) = headers {
+                if let Some(resp) = crate::routers::snapshot::try_replay(h) {
+                    return resp;
+                }
+            }
+        }
         // In IGW mode, resolve model_id and fail fast if not resolvable
         // In non-IGW mode, pass through to router (router handles validation)
         let effective_model_id = if self.enable_igw {

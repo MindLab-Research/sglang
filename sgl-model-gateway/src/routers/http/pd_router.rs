@@ -492,6 +492,7 @@ impl PDRouter {
                 Some(response_headers),
                 prefill,
                 decode,
+                None,
             )
         } else {
             // Handle non-streaming error response
@@ -705,6 +706,11 @@ impl PDRouter {
 
                     let response_headers = header_utils::preserve_response_headers(res.headers());
 
+                    let snapshot_key = context
+                        .headers
+                        .as_ref()
+                        .and_then(crate::routers::snapshot::SnapshotRegistry::key_from_headers);
+
                     self.create_streaming_response(
                         res.bytes_stream(),
                         status,
@@ -713,6 +719,7 @@ impl PDRouter {
                         Some(response_headers),
                         prefill,
                         decode,
+                        snapshot_key,
                     )
                 } else {
                     // Non-streaming response
@@ -953,6 +960,7 @@ impl PDRouter {
         headers: Option<HeaderMap>,
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
+        snapshot_key: Option<String>,
     ) -> Response {
         use crate::core::AttachedBody;
 
@@ -979,60 +987,125 @@ impl PDRouter {
             tracked.mark_errored();
         }
         let decode_for_log = decode.clone();
+        // SSE snapshot+replay (docs/agent/sse-snapshot-replay.md): tee the
+        // client-visible bytes into a snapshot when the request carried
+        // X-Sse-Snapshot-Key. On client disconnect the upstream keeps draining
+        // into the snapshot so a reconnect with the same key replays; normal
+        // completion ([DONE] with client still attached) deletes it.
+        let snapshot_reg = crate::routers::snapshot::registry().filter(|r| r.enabled());
+        let snap: Option<(String, std::sync::Arc<crate::routers::snapshot::SseSnapshot>)> =
+            match (snapshot_reg.as_ref(), snapshot_key.as_ref()) {
+                (Some(reg), Some(k)) => Some((k.clone(), reg.insert(k.clone()))),
+                _ => None,
+            };
         tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    biased;
-                    chunk_result = tracked.next() => {
-                        match chunk_result {
-                            Some(Ok(chunk)) => {
-                                let is_done = memmem::find(&chunk, b"data: [DONE]").is_some();
-
-                                let result = if return_logprob && prefill_logprobs.is_some() {
-                                    Self::merge_streaming_logprobs(prefill_logprobs.clone(), &chunk)
-                                        .unwrap_or(chunk)
-                                } else {
-                                    chunk
-                                };
-
-                                // Mark the wrapper completed before the client
-                                // send: upstream finished cleanly regardless of
-                                // whether the client is still listening, and
-                                // the worker deserves the success tick either
-                                // way. `mark_completed` is a no-op once Errored
-                                // is set, so the synthetic-error path is unaffected.
-                                if is_done {
-                                    tracked.mark_completed();
-                                }
-
-                                if tx.send(Ok(result)).is_err() {
-                                    tracing::debug!(
-                                        "Receiver dropped (likely client disconnect), \
-                                        cancelling upstream PD stream"
+            // Once the client is gone (detached), keep draining upstream into
+            // the snapshot only — no tx.send, and do NOT select on tx.closed()
+            // (it would be ready forever after the receiver is dropped).
+            let mut detached = false;
+            'outer: loop {
+                let chunk_result = if !detached {
+                    tokio::select! {
+                        biased;
+                        chunk_result = tracked.next() => chunk_result,
+                        _ = tx.closed() => {
+                            match &snap {
+                                Some((k, s)) => {
+                                    s.set_detached();
+                                    detached = true;
+                                    tracing::info!(
+                                        "sse-snapshot: client disconnected, draining key={k} \
+                                         (upstream continues for replay)"
                                     );
-                                    break;
+                                    continue 'outer;
                                 }
-
-                                if is_done {
-                                    break;
+                                None => {
+                                    tracing::info!(
+                                        "Client disconnected, cancelling upstream PD stream from {}",
+                                        decode_for_log.url()
+                                    );
+                                    break 'outer;
                                 }
                             }
-                            Some(Err(e)) => {
-                                // BreakerTrackedStream already logged the error
-                                // and marked the terminal state as Errored so
-                                // the worker's circuit breaker will tick on drop.
-                                let _ = tx.send(Err(format!("Stream error: {}", e)));
-                                break;
-                            }
-                            None => break,
                         }
                     }
-                    _ = tx.closed() => {
-                        tracing::info!(
-                            "Client disconnected, cancelling upstream PD stream from {}",
-                            decode_for_log.url()
-                        );
-                        break;
+                } else {
+                    tracked.next().await
+                };
+                match chunk_result {
+                    Some(Ok(chunk)) => {
+                        let is_done = memmem::find(&chunk, b"data: [DONE]").is_some();
+
+                        let result = if return_logprob && prefill_logprobs.is_some() {
+                            Self::merge_streaming_logprobs(prefill_logprobs.clone(), &chunk)
+                                .unwrap_or(chunk)
+                        } else {
+                            chunk
+                        };
+
+                        if is_done {
+                            tracked.mark_completed();
+                        }
+
+                        if let Some((_, s)) = &snap {
+                            s.append(result.clone());
+                        }
+
+                        if !detached && tx.send(Ok(result)).is_err() {
+                            if let Some((_, s)) = &snap {
+                                s.set_detached();
+                                detached = true;
+                                tracing::info!(
+                                    "sse-snapshot: client disconnected mid-send, draining continues"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    "Receiver dropped (likely client disconnect), \
+                                    cancelling upstream PD stream"
+                                );
+                                break 'outer;
+                            }
+                        }
+
+                        if is_done {
+                            if let Some((k, s)) = &snap {
+                                s.finish();
+                                // Normal completion (client saw [DONE]) deletes the
+                                // snapshot; detached ones linger awaiting replay.
+                                if !s.is_detached() {
+                                    if let Some(r) = &snapshot_reg {
+                                        r.remove(k);
+                                    }
+                                }
+                            }
+                            break 'outer;
+                        }
+                    }
+                    Some(Err(e)) => {
+                        // BreakerTrackedStream already logged the error
+                        // and marked the terminal state as Errored so
+                        // the worker's circuit breaker will tick on drop.
+                        let _ = tx.send(Err(format!("Stream error: {}", e)));
+                        if let Some((k, s)) = &snap {
+                            s.finish();
+                            if !s.is_detached() {
+                                if let Some(r) = &snapshot_reg {
+                                    r.remove(k);
+                                }
+                            }
+                        }
+                        break 'outer;
+                    }
+                    None => {
+                        if let Some((k, s)) = &snap {
+                            s.finish();
+                            if !s.is_detached() {
+                                if let Some(r) = &snapshot_reg {
+                                    r.remove(k);
+                                }
+                            }
+                        }
+                        break 'outer;
                     }
                 }
             }
@@ -1748,6 +1821,7 @@ mod tests {
                 None,
                 prefill_ref.clone(),
                 decode_ref.clone(),
+                None,
             );
 
             // Guards are now attached to response body, so load should be 1

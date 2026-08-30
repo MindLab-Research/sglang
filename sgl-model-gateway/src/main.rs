@@ -295,6 +295,16 @@ struct CliArgs {
     /// Request timeout in seconds
     #[arg(long, default_value_t = 1800, help_heading = "Request Handling")]
     request_timeout_secs: u64,
+    /// Enable SSE snapshot+replay (X-Sse-Snapshot-Key header; reconnect replays cached stream)
+    #[arg(long, default_value_t = true, help_heading = "Request Handling")]
+    sse_snapshot_enabled: bool,
+    /// Max concurrent SSE snapshot sessions (LRU eviction leak guard)
+    #[arg(long, default_value_t = 4096, help_heading = "Request Handling")]
+    sse_snapshot_max_sessions: usize,
+    /// TTL (secs) for detached SSE snapshots nobody reconnects to
+    #[arg(long, default_value_t = 1800, help_heading = "Request Handling")]
+    sse_snapshot_ttl_secs: u64,
+
 
     /// Grace period in seconds to wait for in-flight requests during shutdown
     #[arg(long, default_value_t = 180, help_heading = "Request Handling")]
@@ -1081,6 +1091,9 @@ impl CliArgs {
             .circuit_breaker(!self.disable_circuit_breaker)
             .enable_wasm(self.enable_wasm)
             .igw(self.enable_igw)
+            .sse_snapshot_enabled(self.sse_snapshot_enabled)
+            .sse_snapshot_max_sessions(self.sse_snapshot_max_sessions)
+            .sse_snapshot_ttl_secs(self.sse_snapshot_ttl_secs)
             .maybe_server_cert_and_key(self.tls_cert_path.as_ref(), self.tls_key_path.as_ref());
 
         builder.build()

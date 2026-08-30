@@ -183,6 +183,21 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn sse_snapshot_enabled(mut self, enabled: bool) -> Self {
+        self.config.sse_snapshot_enabled = enabled;
+        self
+    }
+
+    pub fn sse_snapshot_max_sessions(mut self, v: usize) -> Self {
+        self.config.sse_snapshot_max_sessions = v;
+        self
+    }
+
+    pub fn sse_snapshot_ttl_secs(mut self, v: u64) -> Self {
+        self.config.sse_snapshot_ttl_secs = v;
+        self
+    }
+
     pub fn worker_startup_timeout_secs(mut self, timeout: u64) -> Self {
         self.config.worker_startup_timeout_secs = timeout;
         self

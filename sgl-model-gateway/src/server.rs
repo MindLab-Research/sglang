@@ -1016,6 +1016,14 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         AppContext::from_config(config.router_config.clone(), config.request_timeout_secs).await?,
     );
 
+    // SSE snapshot+replay registry (see routers/snapshot.rs; docs/agent/sse-snapshot-replay.md)
+    crate::routers::snapshot::init_registry(crate::routers::snapshot::SnapshotConfig {
+        enabled: config.router_config.sse_snapshot_enabled,
+        max_sessions: config.router_config.sse_snapshot_max_sessions,
+        ttl_secs: config.router_config.sse_snapshot_ttl_secs,
+    });
+    tokio::spawn(crate::routers::snapshot::sweep_loop());
+
     if config.prometheus_config.is_some() {
         app_context.inflight_tracker.start_sampler(20);
     }
