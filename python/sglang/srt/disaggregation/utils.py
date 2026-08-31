@@ -194,11 +194,31 @@ def _padded_all_reduce_min(polls: list, gloo_group):
             _caller.f_code.co_filename.rsplit("/", 1)[-1],
             _caller.f_lineno,
         )
-    local_len = torch.tensor(len(polls), dtype=torch.int, device="cpu")
+    local_info = torch.tensor(
+        [len(polls), _PADDED_CALL_COUNT], dtype=torch.int64, device="cpu"
+    )
     try:
-        dist.all_reduce(local_len, op=dist.ReduceOp.MAX, group=gloo_group)
+        dist.all_reduce(local_info, op=dist.ReduceOp.MAX, group=gloo_group)
 
-        max_len = max(1, local_len.item())
+        # Collective-count divergence detection (2026-08-31 decode HiCache
+        # deadlock fix): piggyback _PADDED_CALL_COUNT on the existing size-sync
+        # all_reduce (zero extra collective). If any rank's count is lower
+        # than the max, that rank is BEHIND in the gloo FIFO — the next
+        # all_reduce WILL hang. Raise immediately to crash this rank (better
+        # than a silent 1h watchdog timeout — the crash carries forensic
+        # PADDED-AR counts on every rank for post-mortem diff).
+        max_count = int(local_info[1].item())
+        if _PADDED_CALL_COUNT < max_count:
+            raise RuntimeError(
+                f"[PADDED-AR-DIVERGENCE] rank behind: local_count="
+                f"{_PADDED_CALL_COUNT} max_count={max_count} — this rank has "
+                f"fewer collective calls than peers. The gloo FIFO is already "
+                f"misaligned; the next all_reduce would deadlock. Crashing now "
+                f"with forensic data (check all ranks' PADDED-AR counts to "
+                f"pinpoint the diverging call site)."
+            )
+
+        max_len = max(1, int(local_info[0].item()))
         polls_padded = list(polls) + [255] * (max_len - len(polls))
         tensor_to_reduce = torch.tensor(polls_padded, dtype=torch.uint8, device="cpu")
         dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=gloo_group)
