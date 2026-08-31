@@ -181,10 +181,7 @@ case "${1:-}" in
       --speculative-algorithm EAGLE --speculative-num-steps 5 \
       --speculative-eagle-topk 1 --speculative-num-draft-tokens 6 \
       --disaggregation-mode decode --dcp-size 8 \
-      --disaggregation-decode-enable-radix-cache \
-      --enable-hierarchical-cache --hicache-ratio 1 \
-      --hicache-write-policy write_back --hicache-mem-layout page_first \
-      --hicache-storage-backend mooncake
+      --disaggregation-decode-enable-radix-cache
     overlay_code glm53-decode
     docker start glm53-decode
     echo "glm53-decode started (port 30200)"
