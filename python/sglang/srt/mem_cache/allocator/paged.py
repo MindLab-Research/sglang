@@ -268,8 +268,14 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             # draft/verify KV reuse can alias it (or the pad row), and freeing
             # it makes available_size exceed the pool size (double-free assert).
             # Drop invalid pages (0 or beyond the pool) before re-freeing.
+            # 2026-08-31 off-by-one fix (.8 B200 production, KV-PRODUCER-OOB):
+            # valid page ids are [0, num_pages); the old `<= num_pages` let
+            # page num_pages through, whose slots [num_pages*page_size,
+            # ...) are exactly cap and beyond — the freed page re-entered the
+            # free list and later allocations handed out slot ids >= cap
+            # (OOB samples all started precisely at cap=8810496). Must be `<`.
             free_page_indices = free_page_indices[
-                (free_page_indices >= 1) & (free_page_indices <= self.num_pages)
+                (free_page_indices >= 1) & (free_page_indices < self.num_pages)
             ]
             if free_page_indices.numel() == 0:
                 return
@@ -285,8 +291,18 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
+        # 2026-08-31 off-by-one fix (.8 B200 production, KV-PRODUCER-OOB):
+        # valid page ids are [0, num_pages); page 0 is reserved for padding,
+        # so the free list must be [1, num_pages) — the old `arange(1,
+        # num_pages + 1)` handed out page `num_pages`, whose slots
+        # [num_pages*page_size, ...) start exactly at the pool cap
+        # (cap=8810496 on the .8 DCP pool: OOB samples all started at
+        # 8810496 = cap). That extra page entered the free list at init, was
+        # eventually allocated (page 17,207 * 512 = 8810496), and the
+        # consumer-side guard rewrote those 100 OOB slots to the shared
+        # padding page 0 — cross-request KV read/write collisions on page 0.
         self.free_pages = torch.arange(
-            1, self.num_pages + 1, dtype=torch.int64, device=self.device
+            1, self.num_pages, dtype=torch.int64, device=self.device
         )
         self.is_not_in_free_group = True
         self.free_group = []

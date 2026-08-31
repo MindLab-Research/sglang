@@ -2201,6 +2201,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.token_to_kv_pool_allocator.size_full,
                 "pre_alloc.prefix_indices",
             )
+            if prefix_indices is None:
+                # KV-PRODUCER-OOB in the matched prefix (out-of-range slots
+                # in the radix tree / restore path). Abort this request
+                # gracefully — never write garbage slot ids into
+                # req_to_token (that poisons downstream KV reads).
+                logger.error(
+                    "[PD-PREALLOC-PREFIX-OOB] aborting req=%s: prefix_indices "
+                    "had out-of-range slots",
+                    req.rid,
+                )
+                return None
             self.req_to_token_pool.write(
                 (req.req_pool_idx, slice(0, prefix_len)), prefix_indices
             )
@@ -2394,10 +2405,20 @@ def _guard_kv_indices(
         samples = t[bad][:8].tolist()
         logger.error(
             "[KV-PRODUCER-OOB] %s: %d/%d bad slots, samples=%s, cap=%d "
-            "— producer emitted garbage; containing in-range",
+            "— producer emitted garbage; failing the request",
             ctx, n, t.numel(), samples, cap,
         )
-        t = torch.where(bad, torch.zeros_like(t), t)
+        # 2026-08-31: do NOT contain-to-0. Zeroing bad slots silently rewrites
+        # them to the shared padding-sink page 0, and the KV transfer then
+        # writes/reads page 0 across requests — deterministic cross-request KV
+        # contamination (the .8 03:04 incident: 100 OOB slots rewritten to 0,
+        # downstream readers on page 0 got garbage KV, accept collapsed to
+        # 0.07 with digit-soup outputs, retry did not heal). Return None
+        # instead: the existing kv_loc/prefix_indices None path aborts this
+        # one request gracefully (PD-PREALLOC-KV-FULL style, caller turns it
+        # into 503 + cleanup) — one request dies loudly rather than the
+        # whole pool getting poisoned.
+        return None
     return t
 
 
