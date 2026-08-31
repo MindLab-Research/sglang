@@ -82,12 +82,47 @@ class DecodeHiCachePreallocMixin:
                     else None
                 )
                 try:
+                    # query_storage_hit_length does synchronous file I/O
+                    # (os.path.exists per key in L3 cache). When L3 has
+                    # 10000+ files and LRU eviction is active (os.remove
+                    # competing for inode lock), this can block the main
+                    # thread for minutes → all 8 ranks stuck in file I/O
+                    # simultaneously → no NCCL work enqueued for 600s →
+                    # NCCL watchdog kills the process (2026-08-31 crash:
+                    # 30 rounds 3000 requests ok, then 600s hang at
+                    # 21:45:02 → 21:55:03 NCCL timeout, enqueued=
+                    # completed=2 on all ranks, PADDED-AR-DIVERGENCE=0
+                    # because the check is AFTER this call).
+                    # Fix: time-box the query. If it takes >5s, skip L3
+                    # hit (return 0) and fall back to L2/PD transfer.
+                    import time as _time
+                    _t0 = _time.monotonic()
                     l3_storage_hit_length = self.tree_cache.query_storage_hit_length(
                         last_host_node,
                         suffix_tokens,
                         last_hash,
                         prefix_keys,
                     )
+                    _elapsed = _time.monotonic() - _t0
+                    if _elapsed > 5.0:
+                        logger.warning(
+                            "L3 storage hit query took %.1fs for rid=%s; "
+                            "L3 has %d files. Skipping L3 hit to avoid "
+                            "blocking the event loop (gloo all_reduce "
+                            "timeout risk).",
+                            _elapsed,
+                            req.rid,
+                            len(os.listdir(
+                                self.tree_cache.cache_controller
+                                .storage_backend.storage_dir
+                            )) if hasattr(self.tree_cache, 'cache_controller')
+                            and self.tree_cache.cache_controller is not None
+                            and hasattr(self.tree_cache.cache_controller,
+                                        'storage_backend')
+                            and hasattr(self.tree_cache.cache_controller
+                                        .storage_backend, 'storage_dir')
+                            else -1,
+                        )
                 except Exception:
                     logger.warning(
                         "L3 storage hit query failed for rid=%s; "
