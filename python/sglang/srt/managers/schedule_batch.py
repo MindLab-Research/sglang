@@ -2256,6 +2256,27 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     req.set_extend_range(min_plen, req.extend_range.end)
                     prefix_lens[i] = min_plen
 
+            # Re-derive input_ids AFTER the consensus truncation. The
+            # pre-consensus input_ids (computed above) were cut from per-rank
+            # prefix_indices, which diverge when the chunked-prefill
+            # chunk-merge timing differs across ranks (2026-08-31 .6 prefill
+            # crash: 7 ranks had already folded the previous 16384-token
+            # chunk into prefix while rank 0 had not — 262144 vs 245760 —
+            # so input_ids lengths diverged 28018 vs 11634). The DIVERGENCE
+            # clamp below then clamps each rank to its OWN stale length,
+            # leaving extend_range permanently divergent across ranks → the
+            # next token-count-dependent collective gets mismatched NumelIn
+            # (ALLGATHER_BASE rank0=262144 vs others=186240) → NCCL hangs
+            # forever → 600s watchdog SIGQUIT. fill_ids is rank-invariant
+            # (same request tokens) and the consensus prefix is
+            # rank-invariant, so re-deriving input_ids here makes input_ids
+            # and extend_num_tokens rank-invariant too — and the clamp below
+            # becomes a no-op on this divergence class.
+            input_ids = [
+                r.get_fill_ids()[len(r.prefix_indices) :] for r in reqs
+            ]
+            extend_num_tokens = sum(len(ids) for ids in input_ids)
+
         # [EXTEND-ACCOUNTING-INVARIANT 2026-08-22] input_ids, seq_lens
         # (=extend_range.end) and prefix_lens come from three independently
         # maintained sources. Any mutation between scheduling and here (async
