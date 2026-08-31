@@ -68,14 +68,23 @@ def _fused_dsa_quant_store_kernel(
     safe_loc = safe_loc // DCP_WORLD_SIZE
 
     if block_id < NUM_NOPE_BLOCKS:
-        # Quantize this nope block with its own per-block scale.
-        # DIM_NOPE % GROUP_SIZE == 0, so no mask is needed here.
+        # Quantize this nope block with its own per-block scale. Match the
+        # unfused path byte-for-byte: quantize via ``y * (1 / y_s)`` (not
+        # ``y / y_s``) and keep the defensive ``offs < DIM_NOPE`` mask.
         offs = block_id * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
-        y = tl.load(k_nope_ptr + token_id * k_nope_stride_0 + offs).to(tl.float32)
+        mask = offs < DIM_NOPE
+        y = tl.load(
+            k_nope_ptr + token_id * k_nope_stride_0 + offs, mask=mask, other=0.0
+        ).to(tl.float32)
         y_s = tl.max(tl.abs(y)) / FP8_MAX
-        y_q = tl.clamp(y / y_s, -FP8_MAX, FP8_MAX).to(nope_buf_ptr.dtype.element_ty)
+        y_s_inv = 1.0 / y_s
+        y_q = tl.clamp(y * y_s_inv, -FP8_MAX, FP8_MAX).to(
+            nope_buf_ptr.dtype.element_ty
+        )
         tl.store(
-            nope_buf_ptr + safe_loc * nope_buf_stride_0 + offs, y_q, mask=is_valid
+            nope_buf_ptr + safe_loc * nope_buf_stride_0 + offs,
+            y_q,
+            mask=mask & is_valid,
         )
         tl.store(
             scale_buf_ptr + safe_loc * scale_buf_stride_0 + block_id,
@@ -120,6 +129,10 @@ def fused_dsa_quant_store(
     """
     num_tokens = k_nope.shape[0]
     kv_buffer = kv_buffer.contiguous()
+    # The kernel indexes the last dim with stride 1; guarantee it the same way
+    # the unfused path (quantize_k_cache_separate) does.
+    k_nope = k_nope.contiguous()
+    k_rope = k_rope.contiguous()
 
     # Three dtype-different views over the same buffer at different byte offsets.
     buf_flat = kv_buffer.view(kv_buffer.shape[0], kv_buffer.shape[1], -1)
