@@ -293,6 +293,19 @@ impl PDRouter {
     ) -> Response {
         let start_time = Instant::now();
 
+        // SSE snapshot+replay (docs/agent/sse-snapshot-replay.md): a reconnect
+        // carrying X-Sse-Snapshot-Key that matches a live/finished snapshot is
+        // served entirely from the registry — replay cached bytes and live-tail
+        // any remaining chunks. This MUST run before worker selection so a hit
+        // never touches upstream (no dispatch, no token bucket, no double-count).
+        // Non-streaming requests never create snapshots, so a key here only
+        // matches a snapshot created by an earlier streaming request.
+        if let Some(h) = context.headers.as_ref() {
+            if let Some(resp) = crate::routers::snapshot::try_replay(h) {
+                return resp;
+            }
+        }
+
         let route = context.route;
         let model = context.model_id.unwrap_or(UNKNOWN_MODEL_ID);
         let endpoint = route_to_endpoint(route);
