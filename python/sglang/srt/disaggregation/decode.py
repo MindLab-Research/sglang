@@ -3276,9 +3276,12 @@ class SchedulerDisaggregationDecodeMixin:
             self.process_decode_queue()
 
             # Iteration barrier: before _engine_paused so all ranks participate
+            # Use dedicated dec_barrier_gloo_group (mirrors prefill's
+            # pf_barrier_gloo_group fix 538ee9d0d1) to prevent FIFO cross-match
+            # with recv_requests broadcast when ranks straddle iterations.
             _eb = torch.tensor(0, dtype=torch.int, device="cpu")
             torch.distributed.all_reduce(_eb, op=torch.distributed.ReduceOp.MIN,
-                                         group=self.tp_cpu_group)
+                                         group=getattr(self, "dec_barrier_gloo_group", None) or self.tp_cpu_group)
 
             if self._engine_paused:
                 continue
@@ -3334,9 +3337,17 @@ class SchedulerDisaggregationDecodeMixin:
             # process_decode_queue ensures pop_transferred's all_reduce is always
             # the Nth collective across all ranks, never shifted by recv_requests
             # latency variance.
+            #
+            # FIX: Use dedicated dec_barrier_gloo_group (mirrors prefill's
+            # pf_barrier_gloo_group fix 538ee9d0d1). Without this, the barrier's
+            # all_reduce and recv_requests broadcast share tp_cpu_group's FIFO —
+            # when ranks straddle iterations (one rank's poll completes faster),
+            # the next iteration's broadcast cross-matches the current iteration's
+            # all_reduce → permanent deadlock (py-spy: ranks scattered across
+            # broadcast/all_reduce/poll_and_all_reduce on same group).
             _eb = torch.tensor(0, dtype=torch.int, device="cpu")
             torch.distributed.all_reduce(_eb, op=torch.distributed.ReduceOp.MIN,
-                                         group=self.tp_cpu_group)
+                                         group=getattr(self, "dec_barrier_gloo_group", None) or self.tp_cpu_group)
 
             self.process_decode_queue()
 

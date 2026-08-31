@@ -1222,6 +1222,26 @@ class Scheduler(
                     timeout=_pf_timeout,
                 )
 
+            # Decode-side dedicated barrier gloo group (mirrors prefill fix
+            # 538ee9d0d1). The decode event_loop_overlap_disagg_decode iteration
+            # barrier (decode.py all_reduce with tp_cpu_group) and recv_requests
+            # broadcast BOTH use tp_cpu_group. When a rank completes the poll
+            # collective (_disagg_poll_gloo_group, which IS dedicated) one iteration
+            # faster than peers (e.g. empty-queue compensation path vs full-queue
+            # path), it races ahead into the next iteration's broadcast while peers
+            # are still in the barrier's all_reduce — both on tp_cpu_group → gloo
+            # FIFO cross-matches broadcast with all_reduce → permanent deadlock
+            # (py-spy: ranks scattered across broadcast/all_reduce/poll_and_all_reduce).
+            # The dedicated dec_barrier_gloo_group gives the barrier its own FIFO,
+            # structurally preventing the mismatch.
+            if self.server_args.disaggregation_mode == "decode":
+                _dec_timeout = datetime.timedelta(seconds=600)
+                self.dec_barrier_gloo_group = torch.distributed.new_group(
+                    ranks=self.tp_group.ranks,
+                    backend="gloo",
+                    timeout=_dec_timeout,
+                )
+
             # The decode requests polling kv cache
             self.disagg_decode_transfer_queue = DecodeTransferQueue(
                 gloo_group=self._disagg_poll_gloo_group,
