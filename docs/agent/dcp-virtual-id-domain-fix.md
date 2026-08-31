@@ -2,7 +2,7 @@
 
 > commit `9db63a6abb`（b300-glm52）。解决两个集群的同家族崩溃：
 > 2P3D 集群（8.222.11.182，DCP=4 fp8）EAGLE accept-cliff（1.05）+ 虚拟 id 污染；
-> B300-2 bf16 集群（8.213.215.2:1022，DCP=8）Xid 31 写越界 + 8 rank 齐崩
+> B300-2 bf16 集群（8.213.214.14:1022，DCP=8）Xid 31 写越界 + 8 rank 齐崩
 > （排查文档 `docs/agent/decode-crash-2026-08-20-0144.md`）。
 
 ---

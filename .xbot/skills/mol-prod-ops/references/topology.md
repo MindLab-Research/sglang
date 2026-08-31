@@ -70,7 +70,7 @@ Each PD pair = prefill node (30100 + 8998 + router 30000) + decode node
 
 ## B300 dev stack (source/reference machine)
 
-B300-1 (`ssh -p 1021 root@8.213.215.2`) runs a **develop-branch** MoL stack for
+B300-1 (`ssh -p 1021 root@8.213.214.14`) runs a **develop-branch** MoL stack for
 compatibility testing. It is **separate** from production deploy-0.
 
 | component | bind | notes |
@@ -92,8 +92,8 @@ compatibility testing. It is **separate** from production deploy-0.
   confirmation; production-side mutations need explicit user confirmation.
 - "deploy-2/3 is a debug sandbox" is **obsolete** — they are now
   pd-router-1's prefill/decode and serve live traffic.
-- Source/reference machines `ssh -p 1021 root@8.213.215.2` (prefill+router)
-  and `ssh -p 1022 root@8.213.215.2` (decode) are **read-only**. Copy from
+- Source/reference machines `ssh -p 1021 root@8.213.214.14` (prefill+router)
+  and `ssh -p 1022 root@8.213.214.14` (decode) are **read-only**. Copy from
   them; never modify. ⚠️ their sglang `conn.py` drifted — copy sglang from a
   verified deploy-2 instead (see deploy-notes §8.1).
 - The dev box (this host) **cannot** reach 10.0.58.x. Any curl to a worker

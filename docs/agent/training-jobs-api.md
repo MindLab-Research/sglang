@@ -19,7 +19,7 @@
 
 | 项 | 值 |
 |---|---|
-| 公网入口 | `http://8.213.215.2:18888` |
+| 公网入口 | `http://8.213.214.14:18888` |
 | 认证 | `Authorization: Bearer sk-control-pd-2026` |
 | 路径前缀 | `/v1/control/jobs` |
 | 并发上限 | 64（同 job 的任务共享，多个 job 同时提交也在 64 内排队） |
@@ -118,7 +118,7 @@ HTTP 状态码：`202 Accepted`（成功）；`400`（JSON 解析失败/空数�
 ### 3.4 提交示例（curl）
 
 ```bash
-curl -X POST http://8.213.215.2:18888/v1/control/jobs \
+curl -X POST http://8.213.214.14:18888/v1/control/jobs \
   -H 'Authorization: Bearer sk-control-pd-2026' \
   -H 'Content-Type: application/json' \
   -d '[
@@ -151,7 +151,7 @@ curl -X POST ... -d @tasks.json
 
 ```bash
 curl -H 'Authorization: Bearer sk-control-pd-2026' \
-  http://8.213.215.2:18888/v1/control/jobs/{job_id}
+  http://8.213.214.14:18888/v1/control/jobs/{job_id}
 ```
 
 ### 响应
@@ -192,7 +192,7 @@ task status：`queued` / `running` / `completed` / `failed`。
 
 ```bash
 curl -H 'Authorization: Bearer sk-control-pd-2026' \
-  http://8.213.215.2:18888/v1/control/jobs/{job_id}/result -o result.json
+  http://8.213.214.14:18888/v1/control/jobs/{job_id}/result -o result.json
 ```
 
 job 未完成时返回 `409 Conflict`（提示先轮询）。
@@ -201,7 +201,7 @@ job 未完成时返回 `409 Conflict`（提示先轮询）。
 
 ```bash
 curl -H 'Authorization: Bearer sk-control-pd-2026' \
-  http://8.213.215.2:18888/v1/control/jobs/{job_id}/tasks/{task_id}/result -o task.json
+  http://8.213.214.14:18888/v1/control/jobs/{job_id}/tasks/{task_id}/result -o task.json
 ```
 
 ### 5.3 结果结构（核心）
@@ -270,7 +270,7 @@ Python `requests` / curl 默认自动带 gzip（`requests` 发 `Accept-Encoding:
 ```python
 import json, time, requests
 
-BASE = "http://8.213.215.2:18888"
+BASE = "http://8.213.214.14:18888"
 HEADERS = {"Authorization": "Bearer sk-control-pd-2026", "Content-Type": "application/json"}
 
 # 1) 提交：任务数组；lora_path 可选（不传=基模）

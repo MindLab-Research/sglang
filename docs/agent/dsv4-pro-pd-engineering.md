@@ -2,7 +2,7 @@
 
 > **周期**：2026-08-13 → 2026-08-16（72h 连续工程，三段主线）
 > **集群**：B300 1P1D（prefill 8×B300 @1021 + decode 8×B300 @1022），mooncake RDMA，
-> router PD 分离（cache_aware），公网 `8.213.215.2:18888`
+> router PD 分离（cache_aware），公网 `8.213.214.14:18888`
 > **模型**：`deepseek-v4-pro-0813`（853GB 官方权重，FP4 expert + FP8 attention，
 > 61 层，DSA 稀疏注意力 + 双层压缩 KV c4/c128 + SWA 滑窗）
 > **目标**：PD 分离 + DSPARK 投机解码 + 双端 radix cache + prefill CP=8，

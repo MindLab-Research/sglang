@@ -6,11 +6,11 @@ set -uo pipefail
 # 分支: b300-glm52 (HEAD f29e50bc93)
 #
 # 拓扑:
-#   B300-1 (8.213.215.2:1021, 内网 10.0.0.75): prefill + router (port 30100 / 31000)
-#   B300-2 (8.213.215.2:1022, 内网 10.0.0.67): decode   (port 30200, DCP=4 + DSPARK)
+#   B300-1 (8.213.214.14:1021, 内网 10.0.0.75): prefill + router (port 30100 / 31000)
+#   B300-2 (8.213.214.14:1022, 内网 10.0.0.67): decode   (port 30200, DCP=4 + DSPARK)
 #   venv: prefill=/root/sglang_venv, decode=/root/v15_patched
 #   模型: /root/deepseek_v4_pro_0813 (官方 853GB, 61 层, 384 experts, FP4 expert + FP8 attention)
-#   公网: 8.213.215.2:18888, API key sk-mol-... (见 docs/agent/v4-pro-deploy.md)
+#   公网: 8.213.214.14:18888, API key sk-mol-... (见 docs/agent/v4-pro-deploy.md)
 #
 # 用法:
 #   bash recover_b300_v4_pd.sh decode    # 在 B300-2 上运行（decode + DSPARK + DCP + radix）
@@ -94,9 +94,9 @@ case "${1:-}" in
   monitor)
     # 本地运行：等两端 health 200（V4 冷启动 2-30 分钟，编译缓存后 70-160s）
     for i in $(seq 1 400); do
-      P=$(ssh -o ConnectTimeout=10 -o BatchMode=yes -p 1021 root@8.213.215.2 \
+      P=$(ssh -o ConnectTimeout=10 -o BatchMode=yes -p 1021 root@8.213.214.14 \
             "curl -sf -m 3 http://localhost:30100/health_generate >/dev/null 2>&1 && echo OK" 2>/dev/null)
-      D=$(ssh -o ConnectTimeout=10 -o BatchMode=yes -p 1022 root@8.213.215.2 \
+      D=$(ssh -o ConnectTimeout=10 -o BatchMode=yes -p 1022 root@8.213.214.14 \
             "curl -sf -m 3 http://localhost:30200/health_generate >/dev/null 2>&1 && echo OK" 2>/dev/null)
       if [ "$P" = "OK" ] && [ "$D" = "OK" ]; then
         echo "BOTH_READY after ~$((i*30))s"
@@ -110,7 +110,7 @@ case "${1:-}" in
   clean)
     # 本地运行：杀两端进程 + 清 pycache（重启前必做）
     for P in 1021 1022; do
-      ssh -o ConnectTimeout=15 -p $P root@8.213.215.2 \
+      ssh -o ConnectTimeout=15 -p $P root@8.213.214.14 \
         "ps aux | grep -E 'launch_server|sglang::scheduler' | grep -v grep | awk '{print \$2}' | xargs -r kill -9 2>/dev/null; \
          lsof -ti :30100 2>/dev/null | xargs -r kill -9 2>/dev/null; \
          lsof -ti :30200 2>/dev/null | xargs -r kill -9 2>/dev/null; \

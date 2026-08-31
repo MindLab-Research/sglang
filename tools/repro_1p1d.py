@@ -2,7 +2,7 @@
 """1P1D 复现脚本：填高 pool 水位 + 缓存命中 + DCP 传输触发"""
 import os, urllib.request, json, sys, time, threading
 
-URL = "http://8.213.215.2:18888/v1/chat/completions"
+URL = "http://8.213.214.14:18888/v1/chat/completions"
 MOL_API_KEY_1P1D = os.environ.get("MOL_API_KEY_1P1D", "")   # 真值见仓库根 secrets.env (gitignored)
 HEADERS = {"Content-Type": "application/json", "Authorization": "Bearer " + MOL_API_KEY_1P1D}
 

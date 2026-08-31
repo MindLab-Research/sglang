@@ -163,7 +163,7 @@ smg launch --host 0.0.0.0 --port 30001 --prometheus-port 29000 \
 
 ## B300 dev gateway + proxy (develop branch)
 
-The B300 source/reference machine (`ssh -p 1021 root@8.213.215.2`) runs a
+The B300 source/reference machine (`ssh -p 1021 root@8.213.214.14`) runs a
 **develop-branch** MoL stack at `/root/Mixture-of-LoRA-Harness-alpha/`. This is
 used for compatibility testing before promoting to production deploy-0.
 
@@ -254,8 +254,8 @@ The sglang at `/usr/local/lib/python3.12/dist-packages/sglang/` must have:
 These are in the b300 sglang fork at `/home/user/src/sglang_b300_decode`
 (commit `86747d1`). Sync with:
 ```bash
-scp srt/parser/reasoning_parser.py root@8.213.215.2:/usr/local/lib/python3.12/dist-packages/sglang/srt/parser/
-scp srt/layers/attention/dsa_backend.py root@8.213.215.2:/usr/local/lib/python3.12/dist-packages/sglang/srt/layers/attention/
+scp srt/parser/reasoning_parser.py root@8.213.214.14:/usr/local/lib/python3.12/dist-packages/sglang/srt/parser/
+scp srt/layers/attention/dsa_backend.py root@8.213.214.14:/usr/local/lib/python3.12/dist-packages/sglang/srt/layers/attention/
 ```
 After syncing, **restart prefill + decode** for the fix to take effect.
 

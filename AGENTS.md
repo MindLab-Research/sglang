@@ -18,7 +18,7 @@ MoL（Mixture-of-LoRA）虚拟专家**，以及一系列分布式死锁修复。
 | 本地 HEAD | `21b00129fe`（2026-08-22，见 §3 commit 清单） |
 | 模型 | GLM-5.2-FP8（`n_routed_experts=256`，`num_experts_per_tok=8`，`num_hidden_layers=78`，`hidden_size=6144`，FP8 E4M3FNUZ） |
 | 推理架构 | PD 分离（prefill/decode 异机）+ DCP（Data/Context Parallel）+ HiCache + DSA + EAGLE |
-| 部署 | 1P1D（8.213.215.2）+ 2P3D（8.222.11.182）两个集群，见 §5 |
+| 部署 | 1P1D（8.213.214.14）+ 2P3D（8.222.11.182）两个集群，见 §5 |
 
 ---
 
@@ -131,11 +131,11 @@ collective（NCCL/gloo）调用数或参数跨 rank 不匹配 → 死锁 → 600
 
 ## 5. 部署拓扑与运维要点
 
-### 5.1 1P1D（8.213.215.2）
+### 5.1 1P1D（8.213.214.14）
 - B300-1 = SSH `1021`：prefill + router(30000) + gateway(31001) + proxy(31000)；
   Python `/root/sglang_venv/bin/python3`；代码 `/root/sglang_venv/.../sglang/srt/`
 - B300-2 = SSH `1022`：decode（**DCP=4 + EAGLE 5 steps**）；Python `/root/v15_patched/bin/python3`
-- 公网 `8.213.215.2:18888`，model `Macaron-V1-Venti`，key `$MOL_API_KEY_1P1D`（真值见仓库根 secrets.env）
+- 公网 `8.213.214.14:18888`，model `Macaron-V1-Venti`，key `$MOL_API_KEY_1P1D`（真值见仓库根 secrets.env）
 - **必须带 `thinking_mode`（reasoning_effort=max）**，否则 GLM-5.2 输出异常
 
 ### 5.1.1 1P1D 规范启动配置（2026-08-10 round30-34 二分实验验证）

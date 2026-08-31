@@ -1,6 +1,6 @@
 ---
 name: glm52-bf16-pd-ops
-description: "GLM-5.2 BF16 + 4 LoRA 1P1D PD 集群运维 runbook（B300 8.213.215.2）。触发条件：/glm52-bf16-pd-ops，或用户提到 GLM-5.2 BF16 部署、EAGLE draft graph、DCP=8、prefill CP=8、LoRA 虚拟专家、KV cache 容量、start_glm52_bf16_pd.sh。"
+description: "GLM-5.2 BF16 + 4 LoRA 1P1D PD 集群运维 runbook（B300 8.213.214.14）。触发条件：/glm52-bf16-pd-ops，或用户提到 GLM-5.2 BF16 部署、EAGLE draft graph、DCP=8、prefill CP=8、LoRA 虚拟专家、KV cache 容量、start_glm52_bf16_pd.sh。"
 ---
 
 # GLM-5.2 BF16 + 4 LoRA 1P1D PD 集群运维
@@ -9,10 +9,10 @@ description: "GLM-5.2 BF16 + 4 LoRA 1P1D PD 集群运维 runbook（B300 8.213.21
 
 | 节点 | SSH | 角色 | Python | 端口 |
 |---|---|---|---|---|
-| B300-1 | `ssh -p 1021 root@8.213.215.2` | prefill (CP=8) + router + gateway | `/root/sglang_venv/bin/python3` | prefill=30100, router=31000 |
-| B300-2 | `ssh -p 1022 root@8.213.215.2` | decode (DCP=8 + EAGLE) | `/root/v15_patched/bin/python3` | decode=30200 |
+| B300-1 | `ssh -p 1021 root@8.213.214.14` | prefill (CP=8) + router + gateway | `/root/sglang_venv/bin/python3` | prefill=30100, router=31000 |
+| B300-2 | `ssh -p 1022 root@8.213.214.14` | decode (DCP=8 + EAGLE) | `/root/v15_patched/bin/python3` | decode=30200 |
 
-- 公网入口：`8.213.215.2:31000`（router），API key `sk-glm52-pd`
+- 公网入口：`8.213.214.14:31000`（router），API key `sk-glm52-pd`
 - 模型名：`glm52-bf16-pd`
 - 模型路径：`/root/glm52_local/bf16`（GLM-5.2 BF16，78层/256专家/MTP=1，282 shards）
 - LoRA：`/root/glm52_local/loras/L0..L3`（4 个，`--lora-use-virtual-experts`，rank 16）
@@ -49,7 +49,7 @@ cd /root && bash /root/start_glm52_bf16_pd.sh router --prefill 10.0.0.75:30100 -
 ## 规范重启流程
 
 1. **备份日志**：`cp /root/prefill.log /root/prefill.log.bak_$(date +%Y%m%d_%H%M%S)`（decode 同理，注意是 `prefill.log`/`decode.log` 不是 `prefill_v4.log`）
-2. **同步代码**：`rsync -az -e "ssh -p <PORT>" python/sglang/srt/<file> root@8.213.215.2:<DEST>/<file>`（逐条 rsync）
+2. **同步代码**：`rsync -az -e "ssh -p <PORT>" python/sglang/srt/<file> root@8.213.214.14:<DEST>/<file>`（逐条 rsync）
 3. **清缓存**：`find <venv>/lib/python3.12/site-packages/sglang -name '__pycache__' -type d | xargs rm -rf`
 4. **杀进程**：`pkill -9 -f 'sglang[.]launch_server'; pkill -9 -f 'sglang::scheduler'; pkill -9 -f 'sglang::router'`
 5. **确认清零**：`ps aux | grep -aE 'launch_server|sglang::scheduler' | grep -av grep | wc -l`（必须 0）

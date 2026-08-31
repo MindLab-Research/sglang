@@ -4,7 +4,7 @@
 PORT=$1
 if [ -z "$PORT" ]; then echo "usage: $0 <1021|1022>"; exit 1; fi
 
-ssh -p $PORT -o ConnectTimeout=15 root@8.213.215.2 bash -s << 'EOF'
+ssh -p $PORT -o ConnectTimeout=15 root@8.213.214.14 bash -s << 'EOF'
 set -e
 cd /root
 cp start_pd.sh start_pd.sh.bak_mol  # 备份 MoL 版
