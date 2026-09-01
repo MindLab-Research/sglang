@@ -771,12 +771,23 @@ class PrefillBootstrapQueue:
         good_rids: List[str] = []
         failed_rids: List[str] = []
         if len(self.queue) == 0:
+            # Compensation: must call poll_and_all_reduce_attn_cp_tp_group even
+            # with empty queue to keep gloo collective count synchronized.
+            poll_and_all_reduce_attn_cp_tp_group(
+                [],
+                getattr(self.scheduler, "pf_poll_cp_gloo_group", None)
+                or self.scheduler.attn_cp_cpu_group,
+                getattr(self.scheduler, "pf_poll_tp_gloo_group", None)
+                or self.scheduler.attn_tp_cpu_group,
+            )
             return good_rids, failed_rids
 
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender for req in self.queue],
-            self.scheduler.attn_cp_cpu_group,
-            self.scheduler.attn_tp_cpu_group,
+            getattr(self.scheduler, "pf_poll_cp_gloo_group", None)
+            or self.scheduler.attn_cp_cpu_group,
+            getattr(self.scheduler, "pf_poll_tp_gloo_group", None)
+            or self.scheduler.attn_tp_cpu_group,
         )
 
         metadata_credits = (
@@ -1027,11 +1038,22 @@ class SchedulerDisaggregationPrefillMixin:
         """
         candidates = [req for req in self.waiting_queue if not is_aborted(req)]
         if not candidates:
+            # Compensation: must call poll_and_all_reduce_attn_cp_tp_group even
+            # with empty list to keep gloo collective count synchronized.
+            poll_and_all_reduce_attn_cp_tp_group(
+                [],
+                getattr(self, "pf_poll_cp_gloo_group", None)
+                or self.attn_cp_cpu_group,
+                getattr(self, "pf_poll_tp_gloo_group", None)
+                or self.attn_tp_cpu_group,
+            )
             return
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender for req in candidates],
-            self.attn_cp_cpu_group,
-            self.attn_tp_cpu_group,
+            getattr(self, "pf_poll_cp_gloo_group", None)
+            or self.attn_cp_cpu_group,
+            getattr(self, "pf_poll_tp_gloo_group", None)
+            or self.attn_tp_cpu_group,
         )
         failed = set()
         for req, poll in zip(candidates, polls):
@@ -1615,12 +1637,26 @@ class SchedulerDisaggregationPrefillMixin:
         if optimistic_reqs:
             polls = poll_and_all_reduce_attn_cp_tp_group(
                 [req.disagg_kv_sender for _, req in optimistic_reqs],
-                self.attn_cp_cpu_group,
-                self.attn_tp_cpu_group,
+                getattr(self, "pf_poll_cp_gloo_group", None)
+                or self.attn_cp_cpu_group,
+                getattr(self, "pf_poll_tp_gloo_group", None)
+                or self.attn_tp_cpu_group,
             )
             optimistic_polls = {
                 idx: poll for (idx, _), poll in zip(optimistic_reqs, polls)
             }
+        else:
+            # Compensation: must call poll_and_all_reduce_attn_cp_tp_group even
+            # with empty list — inflight_middle_chunks can differ across CP ranks
+            # (different chunks processed at different rates), so some ranks may
+            # have optimistic_reqs while others don't → count mismatch → deadlock.
+            poll_and_all_reduce_attn_cp_tp_group(
+                [],
+                getattr(self, "pf_poll_cp_gloo_group", None)
+                or self.attn_cp_cpu_group,
+                getattr(self, "pf_poll_tp_gloo_group", None)
+                or self.attn_tp_cpu_group,
+            )
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
@@ -1755,14 +1791,34 @@ class SchedulerDisaggregationPrefillMixin:
         rids_to_check: For PP, on rank > 0, check the rids from the previous rank has consensus with the current rank.
         """
         if len(self.disagg_prefill_inflight_queue) == 0:
+            # Compensation: must call poll_and_all_reduce_attn_cp_tp_group even
+            # with an empty poller list to keep the gloo collective count
+            # synchronized across all ranks. Without this, ranks with empty
+            # inflight queues skip the _padded_all_reduce_min inside
+            # poll_and_all_reduce_attn_cp_tp_group, while ranks with non-empty
+            # queues call it — causing a gloo FIFO count mismatch → deadlock.
+            # This mirrors the pop_bootstrapped empty-queue compensation (commit
+            # 538ee9d0d1) and the decode-side pop_transferred empty-queue
+            # compensation (_padded_all_reduce_min([], ...)).
+            # Trigger: decode HiCache makes decode slow → KV transfer slow →
+            # some ranks' inflight queues empty while others are non-empty.
+            poll_and_all_reduce_attn_cp_tp_group(
+                [],
+                getattr(self.scheduler, "pf_poll_cp_gloo_group", None)
+                or self.attn_cp_cpu_group,
+                getattr(self.scheduler, "pf_poll_tp_gloo_group", None)
+                or self.attn_tp_cpu_group,
+            )
             return []
 
         done_reqs = []
 
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
-            self.attn_cp_cpu_group,
-            self.attn_tp_cpu_group,
+            getattr(self.scheduler, "pf_poll_cp_gloo_group", None)
+            or self.attn_cp_cpu_group,
+            getattr(self.scheduler, "pf_poll_tp_gloo_group", None)
+            or self.attn_tp_cpu_group,
         )
 
         undone_reqs: List[Req] = []
@@ -1897,8 +1953,10 @@ class SchedulerDisaggregationPrefillMixin:
         """
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
-            self.attn_cp_cpu_group,
-            self.attn_tp_cpu_group,
+            getattr(self, "pf_poll_cp_gloo_group", None)
+            or self.attn_cp_cpu_group,
+            getattr(self, "pf_poll_tp_gloo_group", None)
+            or self.attn_tp_cpu_group,
         )
 
         transferred_rids: List[str] = []
@@ -1976,8 +2034,10 @@ class SchedulerDisaggregationPrefillMixin:
             return True
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender],
-            self.attn_cp_cpu_group,
-            self.attn_tp_cpu_group,
+            getattr(self, "pf_poll_cp_gloo_group", None)
+            or self.attn_cp_cpu_group,
+            getattr(self, "pf_poll_tp_gloo_group", None)
+            or self.attn_tp_cpu_group,
         )
         return self.handle_pending_bootstrap(req, polls[0])
 
