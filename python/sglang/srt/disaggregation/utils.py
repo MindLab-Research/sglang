@@ -170,58 +170,39 @@ _PADDED_CALL_COUNT = 0
 def _padded_all_reduce_min(polls: list, gloo_group):
     """All_reduce a variable-length uint8 list with size synchronization.
 
+    Uses a SINGLE all_reduce call (MIN) with complement encoding for the
+    size/count fields to avoid the gloo FIFO cross-iteration mismatch that
+    occurs when two separate all_reduce calls (MAX + MIN) are used on the
+    same gloo group. With two calls, fast ranks (empty queue) complete both
+    and enter the next iteration's first all_reduce (MAX) while slow ranks
+    are still in the current iteration's second all_reduce (MIN) — the gloo
+    FIFO matches next-iteration MAX with current-iteration MIN → deadlock.
+
+    Single-call design: encode [complement(len), complement(count), polls...]
+    into one int32 tensor, all_reduce(MIN) once. complement encoding converts
+    MAX semantics to MIN: MIN(255 - x) = 255 - MAX(x).
+
     Different ranks may have different list lengths (different transfer queue
-    sizes). This pads to the max length across ranks (255 = neutral for MIN)
-    so gloo doesn't crash with size mismatch ("4 vs 1").
+    sizes). Padded to a fixed MAX_POLLS (255) so all ranks have the same
+    tensor shape without needing a size-sync all_reduce first.
     """
     global _PADDED_CALL_COUNT
     _PADDED_CALL_COUNT += 1
-    if envs.SGLANG_DEBUG_DIAG.get():
-        # Collective-count forensics (2026-08-24 windowed-mode abort-storm
-        # wedge): every rank must execute the SAME NUMBER of calls in the
-        # SAME order. Any per-rank count divergence = FIFO offset = wedge.
-        # Log every entry so a post-mortem diff across ranks pinpoints the
-        # diverging call site immediately. (The log line's TP<n> prefix
-        # already identifies the rank; do NOT format ProcessGroup.rank —
-        # it is a method on this torch version and %d formatting raised a
-        # logging error on every call.)
-        import sys as _sys
-        _caller = _sys._getframe(1)
-        logger.info(
-            "[PADDED-AR] count=%d len=%d site=%s:%d",
-            _PADDED_CALL_COUNT,
-            len(polls),
-            _caller.f_code.co_filename.rsplit("/", 1)[-1],
-            _caller.f_lineno,
-        )
-    local_info = torch.tensor(
-        [len(polls), _PADDED_CALL_COUNT], dtype=torch.int64, device="cpu"
-    )
+
+    MAX_POLLS = 255  # max possible polls across all ranks (max_running_requests)
+    COMPLEMENT_BASE = 1 << 30  # large enough that complement(len) > any poll value
+
+    n = len(polls)
+    # Build combined tensor: [comp_len, comp_count, polls_padded...]
+    # comp = COMPLEMENT_BASE - value, so MIN(comp) = COMPLEMENT_BASE - MAX(value)
+    combined = torch.full((2 + MAX_POLLS,), COMPLEMENT_BASE, dtype=torch.int32, device="cpu")
+    combined[0] = COMPLEMENT_BASE - n  # complement of len
+    combined[1] = COMPLEMENT_BASE - _PADDED_CALL_COUNT  # complement of count
+    for i, p in enumerate(polls):
+        combined[2 + i] = p  # actual poll values (0-255), MIN gives correct result
+
     try:
-        dist.all_reduce(local_info, op=dist.ReduceOp.MAX, group=gloo_group)
-
-        # Collective-count divergence detection (2026-08-31 decode HiCache
-        # deadlock fix): piggyback _PADDED_CALL_COUNT on the existing size-sync
-        # all_reduce (zero extra collective). If any rank's count is lower
-        # than the max, that rank is BEHIND in the gloo FIFO — the next
-        # all_reduce WILL hang. Raise immediately to crash this rank (better
-        # than a silent 1h watchdog timeout — the crash carries forensic
-        # PADDED-AR counts on every rank for post-mortem diff).
-        max_count = int(local_info[1].item())
-        if _PADDED_CALL_COUNT < max_count:
-            raise RuntimeError(
-                f"[PADDED-AR-DIVERGENCE] rank behind: local_count="
-                f"{_PADDED_CALL_COUNT} max_count={max_count} — this rank has "
-                f"fewer collective calls than peers. The gloo FIFO is already "
-                f"misaligned; the next all_reduce would deadlock. Crashing now "
-                f"with forensic data (check all ranks' PADDED-AR counts to "
-                f"pinpoint the diverging call site)."
-            )
-
-        max_len = max(1, int(local_info[0].item()))
-        polls_padded = list(polls) + [255] * (max_len - len(polls))
-        tensor_to_reduce = torch.tensor(polls_padded, dtype=torch.uint8, device="cpu")
-        dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=gloo_group)
+        dist.all_reduce(combined, op=dist.ReduceOp.MIN, group=gloo_group)
     except Exception as e:
         logger.error(
             f"[PADDED-AR-FAIL] count={_PADDED_CALL_COUNT} local_len={len(polls)} "
@@ -229,7 +210,33 @@ def _padded_all_reduce_min(polls: list, gloo_group):
         )
         raise
 
-    return tensor_to_reduce.tolist()[:len(polls)]
+    # Decode results from the single all_reduce
+    max_len = COMPLEMENT_BASE - int(combined[0].item())  # MAX(len) across ranks
+    max_count = COMPLEMENT_BASE - int(combined[1].item())  # MAX(count) across ranks
+
+    if _PADDED_CALL_COUNT < max_count:
+        raise RuntimeError(
+            f"[PADDED-AR-DIVERGENCE] rank behind: local_count="
+            f"{_PADDED_CALL_COUNT} max_count={max_count} — this rank has "
+            f"fewer collective calls than peers. The gloo FIFO is already "
+            f"misaligned. Crashing now with forensic data."
+        )
+
+    if envs.SGLANG_DEBUG_DIAG.get():
+        import sys as _sys
+        _caller = _sys._getframe(1)
+        logger.info(
+            "[PADDED-AR] count=%d max_count=%d len=%d max_len=%d site=%s:%d",
+            _PADDED_CALL_COUNT,
+            max_count,
+            n,
+            max_len,
+            _caller.f_code.co_filename.rsplit("/", 1)[-1],
+            _caller.f_lineno,
+        )
+
+    result = combined[2 : 2 + n].tolist()
+    return result
 
 
 def poll_and_all_reduce(
