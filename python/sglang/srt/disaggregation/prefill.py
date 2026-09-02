@@ -1804,9 +1804,9 @@ class SchedulerDisaggregationPrefillMixin:
             # some ranks' inflight queues empty while others are non-empty.
             poll_and_all_reduce_attn_cp_tp_group(
                 [],
-                getattr(self.scheduler, "pf_poll_cp_gloo_group", None)
+                getattr(self, "pf_poll_cp_gloo_group", None)
                 or self.attn_cp_cpu_group,
-                getattr(self.scheduler, "pf_poll_tp_gloo_group", None)
+                getattr(self, "pf_poll_tp_gloo_group", None)
                 or self.attn_tp_cpu_group,
             )
             return []
@@ -1815,9 +1815,9 @@ class SchedulerDisaggregationPrefillMixin:
 
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
-            getattr(self.scheduler, "pf_poll_cp_gloo_group", None)
+            getattr(self, "pf_poll_cp_gloo_group", None)
             or self.attn_cp_cpu_group,
-            getattr(self.scheduler, "pf_poll_tp_gloo_group", None)
+            getattr(self, "pf_poll_tp_gloo_group", None)
             or self.attn_tp_cpu_group,
         )
 
