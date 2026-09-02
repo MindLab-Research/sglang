@@ -3091,13 +3091,22 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 )
             except Exception:
                 logger.exception(
-                    "HiCache local restore failed; degrading to direct transfer"
+                    "HiCache local restore failed; failing affected requests"
                 )
-                # Ensure gloo all_reduce below is still reached: mark all
-                # PENDING restores as READY so they proceed to normal transfer.
+                # 2026-09-03 fix: mark PENDING as FAILED (uniform abort via the
+                # gated poll's all_reduce min), NOT READY. The old READY
+                # degradation sent requests with unrestored L2 prefixes into
+                # _commit_hicache_local_restore_to_req with
+                # hicache_restored_node=None (AttributeError crash) or with KV
+                # holes — and it was unilateral per-rank state (the same
+                # divergence family as the 2026-09-03 02:10 batch-divergence
+                # SIGABRT: one rank's local state diverging from peers' →
+                # batch membership mismatch → EAGLE verify NCCL hang).
+                # FAILED propagates through HiCacheRestoreGatedKVReceiver as
+                # KVPoll.Failed (=0, the min) so ALL ranks abort together.
                 for dr in self.queue:
                     if dr.hicache_restore_status == HiCacheRestoreResult.PENDING:
-                        dr.hicache_restore_status = HiCacheRestoreResult.READY
+                        dr.hicache_restore_status = HiCacheRestoreResult.FAILED
 
         if self.enable_staging:
             polls = self._poll_with_staging()
@@ -3129,16 +3138,36 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 poll = KVPoll.Failed
 
             hicache_restore_status = decode_req.hicache_restore_status
-            if (
-                poll == KVPoll.Failed
-                or hicache_restore_status == HiCacheRestoreResult.FAILED
-            ):
+            # 2026-09-03 fix: abort ONLY on the collectively-reduced poll.
+            # The old `or hicache_restore_status == FAILED` aborted UNILATERALLY
+            # on the local restore failure while other ranks' gated polls were
+            # still Transferring/Success — the padded all_reduce min never saw
+            # the failure, so only the failing rank dropped the request
+            # ([PADDED-AR] len=19 vs peers' 20) while the others COMMITted it
+            # into their running batch → batch membership divergence → EAGLE
+            # verify TP-collective mismatch (eagle_sample broadcast PG2
+            # 600s watchdog SIGABRT, 2026-09-03 02:10 crash). The gated
+            # receiver (HiCacheRestoreGatedKVReceiver) now maps restore-FAILED
+            # → KVPoll.Failed (=0, the all_reduce min) so the abort below
+            # fires on EVERY rank in the same iteration (rank-invariant).
+            if poll == KVPoll.Failed:
                 error_message = (
                     f"Decode transfer failed for request rank={self.tp_rank} "
                     f"{decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
                 )
                 is_propagated = False
-                if poll == KVPoll.Failed:
+                if hicache_restore_status == HiCacheRestoreResult.FAILED:
+                    # HiCache L2 restore failed on (at least) this rank; the
+                    # gated poll propagated KVPoll.Failed through the padded
+                    # all_reduce min, so every rank takes this branch together
+                    # (uniform abort). Loud marker for grep (per-rank L2 state
+                    # divergence root cause: one rank's L2 host tree lost
+                    # pages its radix match promised — see load_back failed).
+                    error_message += (
+                        " (HiCache restore FAILED: L2 load_back shortfall; "
+                        "uniform abort via gated-poll all_reduce min)"
+                    )
+                else:
                     # Surface an exception stashed by the exception-safe poll
                     # wrapper (_poll_with_failure_injection) if present; it is
                     # the original error that got converted to KVPoll.Failed to
