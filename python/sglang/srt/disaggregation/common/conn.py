@@ -1206,7 +1206,19 @@ class CommonKVSender(BaseKVSender):
         )
 
     def pop_decode_prefix_len(self) -> int:
-        return self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, 0)
+        # NOTE(2026-09-02): must NOT .pop() here. finalize_bootstrap (prefill
+        # event loop) calls this BEFORE the first TransferKVChunk enters the
+        # transfer_worker queue, so .pop() removed the entry before the
+        # worker's per-rank offset alignment (XFER-RANK-OFFSET in
+        # mooncake/conn.py transfer_worker) could read it — 13,931/13,931
+        # XFER-OFFSET-DBG lines showed room_min=None. The transfer_worker
+        # reads req_to_decode_prefix_len per chunk for cross-rank alignment
+        # (decode TP ranks legitimately disagree on radix hit length; see
+        # PD-PFX-MIN). Cleanup ownership stays with the transfer_worker's
+        # Success path (mooncake/conn.py req_to_decode_prefix_len.pop on
+        # KVPoll.Success / absent-room) and CommonKVSender.clear(), both of
+        # which already pop the entry at request end.
+        return self.kv_mgr.req_to_decode_prefix_len.get(self.bootstrap_room, 0)
 
     def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
         return num_pages > 0 or last_chunk
@@ -1288,6 +1300,7 @@ class CommonKVSender(BaseKVSender):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
+        page_size: int = 0,
     ):
         pass
 

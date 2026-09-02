@@ -49,6 +49,12 @@ class TransferKVChunk:
     pd_hidden_renotify_args: Optional[dict] = None
     enqueue_time: float = 0.0
     source_event: Optional[Any] = None
+    # Page size used by the sender for prefill_kv_indices (tokens per page).
+    # transfer_worker needs it for per-rank offset alignment (2026-09-02
+    # src/dst mismatch fix): decode TP ranks' radix hits diverge, so each
+    # rank's dst array length differs; the offset (rank_prefix - room_min)
+    # // page_size converts token deltas into the page domain.
+    page_size: int = 0
 
 
 @dataclasses.dataclass

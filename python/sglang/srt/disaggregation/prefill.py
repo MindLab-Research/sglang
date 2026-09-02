@@ -448,6 +448,18 @@ class PrefillBootstrapQueue:
 
         req.time_stats.set_bootstrap_done_time()
         num_kv_indices = len(req.origin_input_ids)
+        # NOTE: start_send_idx must EXACTLY equal decode_prefix_len (the prefix
+        # decode says it already holds). decode registers dst_kv_indices only
+        # for [decode_prefix_len, num) — the sender's page index bookkeeping
+        # (curr_idx/num_pages in _prepare_send_indices) is sized against that
+        # delta. Clamping it to prefill's device_resident prefix (an earlier
+        # fix attempt) shifts the send window BELOW decode_prefix_len, whose
+        # src rows have no matching dst slots on decode — numpy boolean mask
+        # mismatch (37 vs 9) kills the transfer_worker thread and wedges the
+        # whole shard queue (observed 16:24:54, 8 threads dead). Prefill
+        # simply re-transmits from decode_prefix_len regardless of what its
+        # radix holds: KV rows [decode_prefix_len, num) are all forward-
+        # computed fresh or radix-served, both are valid sources.
         req.start_send_idx = decode_prefix_len
         num_kv_indices_to_send = num_kv_indices - decode_prefix_len
         num_pages = kv_to_page_num(
@@ -2138,6 +2150,14 @@ class SchedulerDisaggregationPrefillMixin:
             end_idx = end_idx - end_idx % page_size
 
         if end_idx < start_idx:
+            if envs.SGLANG_DEBUG_DIAG.get():
+                logger.info(
+                    "[SEND-SKIP] rid=%s start_send_idx=%s end_idx=%s last=%s",
+                    req.rid,
+                    start_idx,
+                    end_idx,
+                    last_chunk,
+                )
             logger.debug(
                 "send_kv_chunk skip: rid=%s start_send_idx=%s end_idx=%s",
                 req.rid,
@@ -2304,6 +2324,15 @@ class SchedulerDisaggregationPrefillMixin:
             len(page_indices), last_chunk
         )
         if not should_send_kv_chunk and not has_current_pd_hidden:
+            if envs.SGLANG_DEBUG_DIAG.get():
+                logger.info(
+                    "[SEND-SKIP2] rid=%s pages=%d last=%s start=%s end=%s",
+                    req.rid,
+                    len(page_indices),
+                    last_chunk,
+                    start_idx,
+                    end_idx,
+                )
             return True
         if has_current_pd_hidden:
             source_event = self.device_module.Event()
@@ -2325,13 +2354,25 @@ class SchedulerDisaggregationPrefillMixin:
                     f"is_last={pd_hidden_state(req).current_is_last} "
                     f"streaming={streaming_pd_hidden}"
                 )
-        req.disagg_kv_sender.send(page_indices, state_indices)
+        req.disagg_kv_sender.send(page_indices, state_indices, page_size=page_size)
         if has_current_pd_hidden and streaming_pd_hidden:
             pd_hidden_state(req).src_indices = None
         pd_hidden_state(req).current_src_indices = None
         pd_hidden_state(req).current_start = None
         pd_hidden_state(req).current_row_len = 0
         pd_hidden_state(req).current_is_last = False
+        if envs.SGLANG_DEBUG_DIAG.get():
+            import sys as _sys
+
+            _caller = _sys._getframe(1).f_code.co_name
+            logger.info(
+                "[SEND-DONE] rid=%s caller=%s start=%s->end=%s last=%s",
+                req.rid,
+                _caller,
+                start_idx,
+                end_idx,
+                last_chunk,
+            )
         req.start_send_idx = end_idx
         return True
 
