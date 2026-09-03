@@ -1489,15 +1489,23 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
             return
         if v is not node:
+            # [2026-09-03 fix] Stale node: the parent's children map has a
+            # different node at this key (e.g. _split_node replaced it, or a
+            # prior eviction cascade already restructured the tree). The node
+            # being removed is stale — its device/host data has already been
+            # freed by the caller, so this is a no-op. Previously this was
+            # `assert v == node` which crashed all 8 TP ranks when a zombie
+            # node (evicted=True, backuped=False from a failed L2 write_back)
+            # was later processed by host eviction and found stale in the tree.
             import logging
             logging.getLogger("sglang").error(
                 "REMOVE_LEAF_MISMATCH node.id=%s v.id=%s node.parent.id=%s "
-                "node.evicted=%s node.backuped=%s",
+                "node.evicted=%s node.backuped=%s — skipping stale removal",
                 getattr(node, "id", "?"), getattr(v, "id", None),
                 getattr(node.parent, "id", "?"),
                 node.evicted, node.backuped,
             )
-        assert v == node
+            return
 
     def _evict_component_and_detach_lru(
         self,
