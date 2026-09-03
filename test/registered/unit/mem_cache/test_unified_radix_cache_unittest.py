@@ -2749,6 +2749,90 @@ class UnifiedRadixCacheSuite:
 
         cache.sanity_check()
 
+    def test_hicache_zombie_parent_stale_removal_keeps_live_child(self):
+        """Regression (2026-09-03 8-rank assert crash in _remove_leaf_from_parent).
+
+        Production chain: write_backup failure fallback detaches a device
+        leaf while its host-tier child still references it via .parent; a
+        re-insert then reuses the detached node's slot in the parent's
+        children map; the orphaned child's host eviction tombstone walk
+        climbs to the zombie parent and calls _remove_leaf_from_parent on
+        it. The parent's slot now holds a DIFFERENT live node — the removal
+        must be a no-op (peek-then-pop), never detach the live child:
+          - original code (pop + assert v == node): AssertionError, 8 ranks
+          - pop-then-return: silently detaches the live subtree (KV leak)
+          - peek-then-pop: live child kept, stale parent skipped
+        """
+        if self._skip_unsupported_hicache_test():
+            return
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(cache, write_policy="write_back")
+        ct = ComponentType.FULL
+        tracker = {c: 0 for c in cache.tree_components}
+
+        # Tree: root -> A (device, seq_a) -> B (device, seq_b extension).
+        seq_a = self._make_seq(1, 2)
+        seq_b = seq_a + self._make_seq(1000, 2)
+        self._insert(cache, allocator, req_to_token_pool, seq_a)
+        self._insert(cache, allocator, req_to_token_pool, seq_b)
+        node_a = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", seq_a)))
+        ).last_device_node
+        node_b = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", seq_b)))
+        ).last_device_node
+        self.assertIs(node_b.parent, node_a)
+
+        # Backup ONLY B (A must stay unbacked so its device eviction goes
+        # down the write_backup-failure fallback path later).
+        self.assertGreater(cache.write_backup(node_b, write_back=True), 0)
+        cache.writing_check(write_back=True)
+        self.assertTrue(node_b.backuped)
+        self.assertFalse(node_a.backuped)
+
+        # Demote B to host (evicted=True, backuped=True, H-leaf). B's own
+        # token count is exactly what this eviction asks for, so it stops
+        # before touching A.
+        result = cache.evict(EvictParams(num_tokens=len(seq_b) - len(seq_a)))
+        self.assertGreaterEqual(result.num_tokens_evicted, len(seq_b) - len(seq_a))
+        self.assertTrue(node_b.evicted)
+        self.assertIn(node_b, cache.evictable_host_leaves)
+        # A is now a device leaf whose only child holds host-tier data.
+        self.assertTrue(cache._is_device_leaf(node_a))
+
+        # write_backup fails for A (host pool full) -> fallback: A evicted,
+        # detached from root. B is orphaned (still in the host leaf set,
+        # .parent=A, A no longer reachable from the tree).
+        with mock.patch.object(cache, "write_backup", return_value=0):
+            cache._evict_device_leaf(node_a, tracker)
+        self.assertTrue(node_a.evicted)
+        self.assertFalse(node_a.backuped)
+        a_key = node_a.key.child_key(cache.page_size)
+        self.assertIsNone(node_a.parent.children.get(a_key))
+        self.assertIs(node_b.parent, node_a)  # orphaned child still points at A
+
+        # Re-insert seq_a: a fresh live node C occupies A's old slot.
+        self._insert(cache, allocator, req_to_token_pool, seq_a)
+        node_c = node_a.parent.children[a_key]
+        self.assertIsNot(node_c, node_a)
+
+        # Host-evict the orphaned B (the L2->L3 eviction path): frees B's
+        # host data, removes B from A.children, then the tombstone walk
+        # climbs to zombie A and calls _remove_leaf_from_parent(A). Root's
+        # slot at a_key now holds C — the exact production crash scenario.
+        cache.evict_host(len(seq_b))
+        self.assertIsNone(node_b.component_data[ct].host_value)
+
+        # The live replacement node C must still be in the tree.
+        self.assertIs(node_a.parent.children.get(a_key), node_c)
+        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq_a))))
+        self.assertEqual(len(m.device_indices), len(seq_a))
+
+        # Full integrity sweep: catches a detached-but-tracked C (the
+        # pop-then-return damage: stale leaf-set membership + size
+        # accounting mismatch).
+        cache.sanity_check()
+
     def test_hicache_evict_to_host(self):
         """Evicting a backed-up device leaf demotes it to host-only state."""
         if self._skip_unsupported_hicache_test():
