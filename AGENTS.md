@@ -292,10 +292,16 @@ B200 容器集群：`.6/.7` prefill（30100，CP=8 layersplit + HiCache L3 moonc
 
 ## 7. 开发流程
 
+⛔ **禁止直接 push `b300-glm52`（2026-09-03 起铁律）**：每次开发必须单独开新分支（如 `fix/<scope>-<desc>`）→ commit → push 分支 → 提 PR → 人工 review 后合并。`git push origin b300-glm52` 仅允许用于**紧急生产热修且无法走 PR 流程时**（事后必须补 PR 记录）。分支命名：`fix/`（bug 修复）、`feat/`（新功能）、`docs/`（文档）。
+
 ```bash
-# 改代码 → 本地验证 → commit（保持 b300-glm52 分支）
+# 开发流程：新分支 → 修改 → commit → push → PR
+git checkout -b fix/<scope>-<desc>   # 从最新 b300-glm52 切出
+# 改代码 → 本地验证 → commit
 git add <files> && git commit -m "fix(scope): description with root cause"
-git push origin b300-glm52   # remote 是 MindLab-Research/sglang 的 b300-glm52
+git push origin fix/<scope>-<desc>   # push 分支（不是 b300-glm52！）
+gh pr create --base b300-glm52 --head fix/<scope>-<desc> --title "fix(scope): ..." --body "..."
+# PR 合并后删除分支：git branch -d fix/<scope>-<desc> && git push origin --delete fix/<scope>-<desc>
 
 # 部署到集群（每次重启必须同步最新代码）
 SRC=python/sglang/srt/; DEST=/opt/sglang-venv/lib/python3.12/site-packages/sglang/srt/
