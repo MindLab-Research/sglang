@@ -118,7 +118,7 @@ decode() {
         --disaggregation-transfer-backend mooncake \
         --disaggregation-bootstrap-port 8998 \
         --disaggregation-ib-device mlx5_0 \
-        --disaggregation-mode decode --dcp-size 2 \
+        --disaggregation-mode decode --dcp-size 8 \
         --dist-timeout 60 \
         --speculative-algorithm EAGLE --speculative-num-steps 3 \
         --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
