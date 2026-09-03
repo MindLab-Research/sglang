@@ -341,6 +341,14 @@ class DecodeRequest:
     # queue instead — backpressure, not a deadlock).
     pd_hidden_reserved_indices: Optional[List[int]] = None
 
+    # PFX-SYNC (2026-09-03 source elimination of per-rank radix divergence):
+    # cached radix match from the defer tick (its inc_lock_ref stays held, so
+    # the cached match is valid across ticks) + the agreed cross-rank min
+    # total_prefix_len. See DecodePreallocQueue._pfx_sync_collective.
+    pfx_sync_match: Optional["DecodePrefixMatch"] = None
+    pfx_sync_cached_total: int = -1  # -1 = not yet matched this request
+    pfx_sync_min: Optional[int] = None  # None = not graduated; int = agreed min
+
     @property
     def seqlen(self) -> int:
         return self.req.seqlen
@@ -1129,6 +1137,95 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 continue
             decode_req.kv_receiver.init(prefill_dp_rank)
 
+    def _pfx_sync_collective(self, force_empty: bool = False) -> None:
+        """PFX-SYNC (2026-09-03 source elimination of per-rank radix
+        divergence): one all_gather round agreeing min(total_prefix_len)
+        per bootstrap_room across TP ranks BEFORE any ACK (send_metadata).
+
+        Per-rank total_prefix_len (= L1+L2 radix hit, decode.py
+        pop_preallocated) is per-rank local state; diverging ACKs are the root
+        cause of the 2026-09-02/03 transfer-mismatch family (offset/TRUNC/
+        MISMATCH paths on the prefill side + the offset-downstream IndexError).
+
+        Protocol (rank-invariant; called exactly once per pop_preallocated
+        invocation AND once per compensation path — retracted early-return and
+        polling else branch — so the gloo collective count stays aligned):
+          1. all_reduce MAX of the local (room, cached_total) pair-list length
+          2. all_gather of the padded pairs (iff max_len > 0; the max is
+             identical on all ranks so the conditional is rank-invariant)
+
+        Graduation: a room graduates (``pfx_sync_min`` set, STICKY) iff present
+        in ALL ranks' waiting sets AND all 8 cached totals >= 0. The sticky min
+        survives the budget skew (rank A preallocs early, B waits for budget:
+        B uses the same agreed min when its budget frees — the ACKs all carry
+        the same value). The clamp: a rank whose own total exceeds the min
+        slices its prefix_match to the min (the divergent radix range is
+        re-received from prefill). Cost: (own-min) extra tokens re-transferred
+        (~40MB per divergent rank per event — trivial vs mooncake RDMA).
+
+        The +1 tick latency (match tick -> graduation tick -> prealloc) is
+        invisible end-to-end: the prefill's bootstrap already serializes on
+        the slowest of the 8 ACKs.
+        """
+        gloo = self.gloo_group
+        # Collect (room, cached_total) for every waiting request in the queue.
+        # The cached total is -1 until the request's radix match has run once.
+        pairs: List[int] = []
+        if not force_empty:
+            for decode_req in self.queue:
+                if not decode_req.waiting_for_input:
+                    continue
+                pairs.append(int(decode_req.req.bootstrap_room))
+                pairs.append(int(decode_req.pfx_sync_cached_total))
+        local = torch.tensor(pairs, dtype=torch.int64)
+        # (1) length sync — ALWAYS (rank-invariant collective count).
+        len_t = torch.tensor([local.numel()], dtype=torch.int64)
+        torch.distributed.all_reduce(
+            len_t, op=torch.distributed.ReduceOp.MAX, group=gloo
+        )
+        max_len = int(len_t.item())
+        if max_len == 0:
+            return
+        # (2) all_gather (iff any rank has data; max is shared post-AR).
+        if local.numel() < max_len:
+            local = torch.cat(
+                [
+                    local,
+                    torch.full((max_len - local.numel(),), -1, dtype=torch.int64),
+                ]
+            )
+        ws = torch.distributed.get_world_size(group=gloo)
+        gathered = [torch.empty(max_len, dtype=torch.int64) for _ in range(ws)]
+        torch.distributed.all_gather(gathered, local, group=gloo)
+        # Local reduce: per-room (presence_count, min_total, all_cached).
+        room_info: Dict[int, List[int]] = {}
+        for rank_t in gathered:
+            for j in range(0, max_len, 2):
+                room = int(rank_t[j].item())
+                if room < 0:
+                    continue  # padding
+                total = int(rank_t[j + 1].item())
+                info = room_info.setdefault(room, [0, 1 << 62, 1])
+                info[0] += 1
+                if total < 0:
+                    info[2] = 0
+                else:
+                    info[1] = min(info[1], total)
+        # Graduation (idempotent: only the not-yet-graduated).
+        for decode_req in self.queue:
+            if not decode_req.waiting_for_input:
+                continue
+            if decode_req.pfx_sync_min is None:
+                info = room_info.get(int(decode_req.req.bootstrap_room))
+                if info is not None and info[0] == ws and info[2]:
+                    decode_req.pfx_sync_min = info[1]
+                    if envs.SGLANG_DEBUG_DIAG.get():
+                        logger.info(
+                            "[PFX-SYNC] room=%s graduated min=%d",
+                            decode_req.req.bootstrap_room,
+                            info[1],
+                        )
+
     def pop_preallocated(
         self, rids_to_check: Optional[List[str]] = None
     ) -> Tuple[List[DecodeRequest], List[DecodeRequest]]:
@@ -1139,6 +1236,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.transfer_queue.drain_pending_pd_hidden_releases()
         self._resolve_pending_reqs()
         self._update_handshake_waiters(rids_to_check)
+        # PFX-SYNC: graduate the requests whose totals are known on all 8 ranks
+        # (the agreed min) before any ACK. Source elimination of the per-rank
+        # radix-hit divergence (see _pfx_sync_collective).
+        self._pfx_sync_collective()
 
         failed_reqs = []
         preallocated_reqs = []
@@ -1184,6 +1285,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
             if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
+                # PFX-SYNC: release the deferred match's radix lock (the
+                # budget-deferred graduated request holds its lock across
+                # ticks; an aborted request must release it here or it leaks).
+                if decode_req.pfx_sync_match is not None:
+                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    decode_req.pfx_sync_match = None
+                    decode_req.pfx_sync_cached_total = -1
                 if not getattr(decode_req.req, "finished_output", False):
                     self.scheduler.output_streamer.stream_output(
                         [decode_req.req],
@@ -1247,8 +1355,58 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 and not decode_req.is_rebootstrap
             )
             if use_decode_radix_cache:
-                # Match prefix against decode's radix cache.
-                prefix_match = self._match_prefix_and_lock(decode_req.req)
+                # ===== PFX-SYNC (2026-09-03 source elimination) =====
+                # Per-rank total_prefix_len diverges (per-rank radix state);
+                # diverging ACKs are the root cause of the transfer-mismatch
+                # family. Gate: no ACK until the cross-rank min is agreed.
+                if decode_req.pfx_sync_min is None:
+                    # Not graduated: the collective hasn't seen all 8 ranks'
+                    # cached totals. Match now (cache + hold lock) and defer;
+                    # the next tick's collective graduates.
+                    if decode_req.pfx_sync_match is None:
+                        decode_req.pfx_sync_match = self._match_prefix_and_lock(
+                            decode_req.req
+                        )
+                        decode_req.pfx_sync_cached_total = (
+                            decode_req.pfx_sync_match.l1_prefix_len
+                            + decode_req.pfx_sync_match.l2_host_hit_length
+                        )
+                    continue  # stay in queue; next tick graduates
+
+                # Graduated: cached match (lock still held) + agreed min.
+                prefix_match = decode_req.pfx_sync_match
+                # Exclude l3 from the prefill promise: query_storage_hit_length is
+                # optimistic (pages may be evicted between query and prefetch), so
+                # the actual load may fall short. By promising only l1+l2, prefill
+                # transfers [l1+l2, fill_len) which covers the l3 range too.
+                # Clamp to the agreed min: the divergent radix range above the min
+                # is re-received from prefill (uniform ACK across all ranks).
+                min_total = decode_req.pfx_sync_min
+                if min_total < (
+                    prefix_match.l1_prefix_len + prefix_match.l2_host_hit_length
+                ):
+                    if min_total < prefix_match.l1_prefix_len:
+                        # Clamp cuts into L1: use only the first min_total
+                        # device-resident tokens; the rest is re-received.
+                        prefix_match.prefix_indices = prefix_match.prefix_indices[
+                            :min_total
+                        ]
+                        prefix_match.l2_host_hit_length = 0
+                    else:
+                        # Clamp cuts into L2: keep l1, shrink l2.
+                        prefix_match.l2_host_hit_length = (
+                            min_total - prefix_match.l1_prefix_len
+                        )
+                    prefix_match.l3_storage_hit_length = 0
+                    logger.info(
+                        "[PFX-SYNC] rid=%s room=%s own_total=%d clamped to "
+                        "agreed min=%d (uniform ACK; divergent range "
+                        "re-received)",
+                        decode_req.req.rid,
+                        decode_req.req.bootstrap_room,
+                        decode_req.pfx_sync_cached_total,
+                        min_total,
+                    )
                 prefix_indices = prefix_match.prefix_indices
                 # prefix_len: tokens already on device (L1 hit).
                 # total_prefix_len: full prefix promised to prefill
@@ -1256,10 +1414,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 # protocol's `decode_prefix_len`. The [prefix_len, total)
                 # gap is filled by HiCache loadback later.
                 prefix_len = prefix_match.l1_prefix_len
-                # Exclude l3 from the prefill promise: query_storage_hit_length is
-                # optimistic (pages may be evicted between query and prefetch), so
-                # the actual load may fall short. By promising only l1+l2, prefill
-                # transfers [l1+l2, fill_len) which covers the l3 range too.
                 total_prefix_len = prefix_match.l1_prefix_len + prefix_match.l2_host_hit_length
 
                 fill_len = self._pre_alloc_fill_len(decode_req.req)
@@ -1298,12 +1452,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
                 > full_allocatable_tokens
             ):
-                if prefix_len > 0:
-                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                # PFX-SYNC: keep the radix lock (NO dec_lock_ref). The
+                # graduated request's cached match (pfx_sync_match) holds the
+                # match lock across the budget wait; releasing it here would
+                # let the radix pages be evicted while the cached match is
+                # still referenced next tick. The lock is released by the
+                # normal request lifecycle (finish/abort) instead.
                 break
             if required_tokens_for_request > full_allocatable_tokens:
-                if prefix_len > 0:
-                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                 break
 
             if uses_swa_tail_prealloc:
@@ -1320,8 +1476,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     )
                     > swa_allocatable_tokens
                 ):
-                    if prefix_len > 0:
-                        self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    # PFX-SYNC: keep the radix lock (see the budget-break
+                    # comment above) — the cached match is reused next tick.
                     break
 
             pd_hidden_dst_indices = None
@@ -1954,8 +2110,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
             logger.info(
-                "[BS-T] prealloc-done rid=%s prefix_len=%s total_prefix=%s",
-                decode_req.req.rid, prefix_len, total_prefix_len,
+                "[BS-T] prealloc-done rid=%s prefix_len=%s total_prefix=%s "
+                "pfx_sync(min=%s own=%s)",
+                decode_req.req.rid,
+                prefix_len,
+                total_prefix_len,
+                decode_req.pfx_sync_min,
+                decode_req.pfx_sync_cached_total,
             )
             decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
 
@@ -3564,6 +3725,12 @@ class SchedulerDisaggregationDecodeMixin:
             # Compensate pop_transferred's _padded_all_reduce_min to keep ranks synced
             from sglang.srt.disaggregation.utils import _padded_all_reduce_min
             _padded_all_reduce_min([], self.disagg_decode_transfer_queue.gloo_group)
+            # PFX-SYNC: compensate _pfx_sync_collective too (pop_preallocated is
+            # skipped on this early-return path; the collective count must stay
+            # rank-invariant — the empty protocol keeps the gloo call aligned).
+            self.disagg_decode_prealloc_queue._pfx_sync_collective(
+                force_empty=True
+            )
             return
 
         if not hasattr(self, "polling_count"):
@@ -3595,6 +3762,11 @@ class SchedulerDisaggregationDecodeMixin:
             # Compensate pop_transferred's _padded_all_reduce_min
             from sglang.srt.disaggregation.utils import _padded_all_reduce_min
             _padded_all_reduce_min([], self.disagg_decode_transfer_queue.gloo_group)
+            # PFX-SYNC: compensate _pfx_sync_collective (the polling-else path
+            # skips pop_preallocated; the collective count must stay aligned).
+            self.disagg_decode_prealloc_queue._pfx_sync_collective(
+                force_empty=True
+            )
             transferred_reqs = []
 
         if self.enable_hisparse:
