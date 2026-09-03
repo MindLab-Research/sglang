@@ -666,19 +666,38 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def evict(self, params: EvictParams) -> EvictResult:
         if self.disable:
             return EvictResult()
+        _diag = envs.SGLANG_DEBUG_DIAG.get()
+        _pc0 = time.perf_counter() if _diag else 0
         start_time = time.perf_counter()
         tracker = {ct: 0 for ct in self.tree_components}
+
+        if _diag:
+            logger.info(
+                f"[HC-DIAG] ts={time.time():.3f} evict_start "
+                f"num_tokens={params.num_tokens}"
+            )
 
         for component in self._components_tuple:
             component.drive_eviction(params=params, tracker=tracker)
 
+        _wc_ms = 0.0
         if (
             self.cache_controller is not None
             and self.cache_controller.write_policy == "write_back"
         ):
+            _wc_t0 = time.perf_counter() if _diag else 0
             self.writing_check(write_back=True)
+            _wc_ms = (time.perf_counter() - _wc_t0) * 1000 if _diag else 0
 
         self.update_eviction_metrics(sum(tracker.values()), start_time)
+        if _diag:
+            _total_ms = (time.perf_counter() - _pc0) * 1000
+            logger.info(
+                f"[HC-DIAG] ts={time.time():.3f} evict_end "
+                f"num_tokens={params.num_tokens} "
+                f"num_evicted={tracker[BASE_COMPONENT_TYPE]} "
+                f"wc_ms={_wc_ms:.1f} total_ms={_total_ms:.1f}"
+            )
         return EvictResult(
             num_tokens_evicted=tracker[BASE_COMPONENT_TYPE],
             swa_num_tokens_evicted=tracker.get(ComponentType.SWA, 0),
@@ -1863,6 +1882,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.cache_controller is None:
             return False
 
+        _diag = envs.SGLANG_DEBUG_DIAG.get()
+        _pc0 = time.perf_counter() if _diag else 0
+        _evict_ms = 0.0
+        _load_ms = 0.0
+
         host_anchor_params = self.inc_host_lock_ref(best_match_node).to_dec_params()
         # Build KV transfer
         kv_xfer = self.components[BASE_COMPONENT_TYPE].build_hicache_transfers(
@@ -1873,6 +1897,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         result = self.inc_lock_ref(best_match_node)
         ancestor_lock_params = result.to_dec_params()
         kv_tokens = len(kv_xfer.host_indices)
+
+        if _diag:
+            logger.info(
+                f"[HC-DIAG] ts={time.time():.3f} load_back_start "
+                f"tokens={kv_tokens} node={best_match_node.id}"
+            )
 
         # Build aux transfers, keyed per component.
         comp_xfers: dict[ComponentType, list] = {}
@@ -1904,7 +1934,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             avail = self.token_to_kv_pool_allocator.available_size()
         if avail < kv_tokens:
             needed = kv_tokens - avail
+            _evict_t0 = time.perf_counter() if _diag else 0
             result = self.evict(EvictParams(num_tokens=needed))
+            if _diag:
+                _evict_ms = (time.perf_counter() - _evict_t0) * 1000
+                logger.info(
+                    f"[HC-DIAG] ts={time.time():.3f} load_back_evict "
+                    f"needed={needed} evicted={result.num_tokens_evicted} "
+                    f"evict_ms={_evict_ms:.1f}"
+                )
             if result.num_tokens_evicted < needed:
                 self.dec_lock_ref(best_match_node, ancestor_lock_params)
                 self.dec_host_lock_ref(best_match_node, host_anchor_params)
@@ -1913,15 +1951,30 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # Load H→D
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
+        _load_t0 = time.perf_counter() if _diag else 0
         device_indices = self.cache_controller.load(
             host_indices=kv_xfer.host_indices,
             node_id=best_match_node.id,
             extra_pools=aux_xfers or None,
         )
+        if _diag:
+            _load_ms = (time.perf_counter() - _load_t0) * 1000
+            logger.info(
+                f"[HC-DIAG] ts={time.time():.3f} load_back_load "
+                f"load_ms={_load_ms:.1f} device_indices_ok={device_indices is not None}"
+            )
 
         self.dec_lock_ref(best_match_node, ancestor_lock_params)
         if device_indices is None:
             self.dec_host_lock_ref(best_match_node, host_anchor_params)
+            if _diag:
+                _total_ms = (time.perf_counter() - _pc0) * 1000
+                logger.warning(
+                    f"[HC-DIAG] ts={time.time():.3f} load_back_FAIL "
+                    f"tokens={kv_tokens} total_ms={_total_ms:.1f} "
+                    f"evict_ms={_evict_ms:.1f} load_ms={_load_ms:.1f} "
+                    f"reason=device_indices_None"
+                )
             return False
 
         # Commit: each component gets only its own transfers
@@ -1947,6 +2000,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             host_anchor_params,
         )
 
+        if _diag:
+            _total_ms = (time.perf_counter() - _pc0) * 1000
+            logger.info(
+                f"[HC-DIAG] ts={time.time():.3f} load_back_end "
+                f"tokens={kv_tokens} total_ms={_total_ms:.1f} "
+                f"evict_ms={_evict_ms:.1f} load_ms={_load_ms:.1f}"
+            )
         return True
 
     def _build_sidecar_transfers(
@@ -2982,14 +3042,40 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # Every rank must enter the all_reduce below; cc can diverge across ranks.
         if cc is not None and write_back:
             # Blocking: wait for all pending write-backs
+            _diag = envs.SGLANG_DEBUG_DIAG.get()
+            _t0 = time.perf_counter() if _diag else 0
+            _ongoing = len(self.ongoing_write_through) if _diag else 0
+            _ack_q = len(cc.ack_write_queue) if _diag else 0
+            if _diag:
+                logger.info(
+                    f"[HC-DIAG] ts={time.time():.3f} writing_check_start "
+                    f"ongoing={_ongoing} ack_q={_ack_q}"
+                )
             while self.ongoing_write_through:
                 for ack in cc.ack_write_queue:
+                    _ack_t0 = time.perf_counter() if _diag else 0
                     ack.finish_event.synchronize()
+                    if _diag:
+                        _ack_ms = (time.perf_counter() - _ack_t0) * 1000
+                        if _ack_ms > 100:
+                            logger.warning(
+                                f"[HC-DIAG] ts={time.time():.3f} writing_check_sync_slow "
+                                f"ack_ms={_ack_ms:.0f} ongoing={len(self.ongoing_write_through)} "
+                                f"ack_q={len(cc.ack_write_queue)}"
+                            )
                     for ack_id in ack.node_ids:
                         if ack_id in self.ongoing_write_through:
                             self._finish_write_through_ack(ack_id)
                 cc.ack_write_queue.clear()
                 assert len(self.ongoing_write_through) == 0
+            if _diag:
+                _total_ms = (time.perf_counter() - _t0) * 1000
+                if _total_ms > 50 or _ongoing > 0:
+                    logger.info(
+                        f"[HC-DIAG] ts={time.time():.3f} writing_check_end "
+                        f"ongoing={_ongoing} ack_q={_ack_q} "
+                        f"elapsed_ms={_total_ms:.1f}"
+                    )
             return
 
         # Every rank must enter the all_reduce below; ongoing_write_through can

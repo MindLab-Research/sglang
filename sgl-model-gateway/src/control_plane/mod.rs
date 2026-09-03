@@ -64,6 +64,12 @@ pub struct ModelView {
     pub state: String,
     pub engine_count: usize,
     pub per_engine: Vec<PerEngineInflight>,
+    /// Failure reason when state == "FAILED" (surfaced from the deployment
+    /// record so callers/UI can see WHY a load failed instead of the entry
+    /// silently disappearing). None for healthy entries and when
+    /// deserializing views from older routers that lack the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -634,6 +640,7 @@ pub async fn get_models(
                         state: "ACTIVE".to_string(),
                         engine_count: 0,
                         per_engine: Vec::new(),
+                        error: None,
                     });
                     entry.engine_count += 1;
                     entry.per_engine.push(PerEngineInflight {
@@ -646,22 +653,26 @@ pub async fn get_models(
     }
 
     // Merge local declarative deployments (this router's own control plane).
-    // FAILED deployments are hidden so a retry is not seen as "already
-    // deployed" by parent routers.
+    // FAILED deployments are INCLUDED (with their error reason) so callers/UI
+    // can see why a load failed instead of the entry silently disappearing —
+    // a vanished entry is indistinguishable from "still loading" and wedges
+    // polling clients forever. Retries are unaffected: the idempotent
+    // fast-path in deploy_model only treats QUEUED/LOADING as in-flight.
     for dep in state.list_deployments() {
-        if dep.state == "FAILED" {
-            continue;
-        }
         let entry = models.entry(dep.name.clone()).or_insert_with(|| ModelView {
             name: dep.name.clone(),
             model_type: dep.model_type.clone(),
             state: dep.state.clone(),
             engine_count: 0,
             per_engine: Vec::new(),
+            error: None,
         });
         // Only update the state when the subtree has no fresher data.
         if entry.engine_count == 0 {
             entry.state = dep.state.clone();
+            if dep.state == "FAILED" {
+                entry.error = dep.error.clone();
+            }
         }
     }
 
@@ -694,6 +705,11 @@ fn merge_model_view(models: &mut HashMap<String, ModelView>, name: String, mv: M
             cur.per_engine.extend(mv.per_engine);
             if cur.state == "ACTIVE" && mv.state != "ACTIVE" {
                 cur.state = mv.state.clone();
+            }
+            // Propagate a sub-tree failure reason (e.g. a FAILED deployment
+            // reported by a child router) so it is not silently dropped here.
+            if cur.error.is_none() {
+                cur.error = mv.error;
             }
         }
         std::collections::hash_map::Entry::Vacant(v) => {

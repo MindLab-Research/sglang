@@ -27,6 +27,7 @@ import argparse
 import logging
 import os
 import threading
+import time
 from collections import OrderedDict
 from typing import Any, Callable, Optional, Set, Tuple
 
@@ -337,12 +338,26 @@ class LRUFileEvictor:
             return "stop", 0
         evict_stem, evict_size = self._lru.popitem(last=False)  # oldest
         if evict_stem in self._pending_writes:
-            # Keep in-flight reservations; their file isn't committed yet.
-            self._lru[evict_stem] = evict_size
-            return "skipped", 0
+            # Pending write — evict the file anyway (it's on disk via os.replace,
+            # the pending flag is just for coordination, not data safety).
+            # The old behaviour was to skip ("skipped"), which caused a deadlock
+            # when ALL LRU entries were pending and storage was full.
+            logger.warning(
+                f"[HC-DIAG] ts={time.time():.3f} l3_evict_force_pending "
+                f"stem={evict_stem[-32:]} size={evict_size}"
+            )
         tensor_path = os.path.join(self.file_path, f"{evict_stem}.bin")
         try:
+            _rm_t0 = time.perf_counter() if envs.SGLANG_DEBUG_DIAG.get() else 0
             os.remove(tensor_path)
+            if envs.SGLANG_DEBUG_DIAG.get():
+                _rm_ms = (time.perf_counter() - _rm_t0) * 1000
+                if _rm_ms > 50:
+                    logger.warning(
+                        f"[HC-DIAG] ts={time.time():.3f} l3_evict_unlink_slow "
+                        f"file={evict_stem[-32:]} size={evict_size} "
+                        f"rm_ms={_rm_ms:.1f}"
+                    )
             freed = evict_size
             if self._on_evict is not None:
                 self._on_evict(evict_stem)
@@ -366,6 +381,15 @@ class LRUFileEvictor:
         so it can't spin once every remaining entry is pending. Caller holds _lock.
         Returns the total disk bytes reclaimed.
         """
+        _diag = envs.SGLANG_DEBUG_DIAG.get()
+        _evicted_count = 0
+        _t0 = time.perf_counter() if _diag else 0
+        if _diag:
+            _pre_bytes = self._total_bytes
+            logger.info(
+                f"[HC-DIAG] ts={time.time():.3f} l3_evict_start "
+                f"total_bytes={self._total_bytes} lru_len={len(self._lru)}"
+            )
         reclaimed = 0
         attempts_left = len(self._lru)
         while self._lru and attempts_left > 0 and should_continue(reclaimed):
@@ -377,7 +401,16 @@ class LRUFileEvictor:
                 continue
             # An entry left the index; reset the skip budget and bank the bytes.
             reclaimed += freed
+            _evicted_count += 1
             attempts_left = len(self._lru)
+        if _diag:
+            _elapsed_ms = (time.perf_counter() - _t0) * 1000
+            logger.info(
+                f"[HC-DIAG] ts={time.time():.3f} l3_evict_end "
+                f"evicted_files={_evicted_count} reclaimed_bytes={reclaimed} "
+                f"pre_bytes={_pre_bytes} post_bytes={self._total_bytes} "
+                f"elapsed_ms={_elapsed_ms:.1f}"
+            )
         return reclaimed
 
     def _evict_locked(self, needed_bytes: int) -> None:

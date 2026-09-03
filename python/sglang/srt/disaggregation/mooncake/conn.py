@@ -1752,6 +1752,14 @@ class MooncakeKVManager(CommonKVManager):
                         kv_chunk.source_event.synchronize()
                         kv_chunk.source_event = None
                     current_status = self.request_status.get(kv_chunk.room)
+                    if envs.SGLANG_DEBUG_DIAG.get():
+                        logger.info(
+                            "[XFER-CHUNK-SKIP] room=%s in_status=%s status=%s last=%s",
+                            kv_chunk.room,
+                            kv_chunk.room in self.request_status,
+                            current_status,
+                            kv_chunk.is_last_chunk,
+                        )
                     if current_status is None or current_status == KVPoll.Failed:
                         if current_status == KVPoll.Failed:
                             self._wake_pd_hidden_ack_waiters(kv_chunk.room)
@@ -1784,6 +1792,17 @@ class MooncakeKVManager(CommonKVManager):
                     if kv_chunk.room in self.transfer_infos
                     else []
                 )
+                if envs.SGLANG_DEBUG_DIAG.get():
+                    _ri = self.transfer_infos.get(kv_chunk.room, {})
+                    _nd = [t for t in _ri.values() if not t.is_dummy]
+                    logger.info(
+                        "[XFER-CHUNK] room=%s reqs=%d non_dummy=%d dcp_ranks=%s last=%s",
+                        kv_chunk.room,
+                        len(_ri),
+                        len(_nd),
+                        sorted({t.dcp_rank for t in _nd}),
+                        kv_chunk.is_last_chunk,
+                    )
                 polls = []
                 dst_ranks_infos = []
                 pd_hidden_expected = 0
@@ -2063,12 +2082,97 @@ class MooncakeKVManager(CommonKVManager):
                                     self._release_or_mark_pd_hidden_done(kv_chunk)
                                 break
 
-                        chunked_dst_kv_indice = req.dst_kv_indices[kv_chunk.index_slice]
+                        # Per-rank offset alignment (2026-09-02 src/dst mismatch
+                        # root fix): decode TP ranks' radix/HiCache L3 hits
+                        # diverge (L3 loadback timing), so each rank's
+                        # send_metadata carries a different decode_prefix_len
+                        # and a DIFFERENT-length dst_kv_indices array (observed
+                        # 20 vs 1 entries for the same room). The sender's
+                        # index_slice is page-offseted from the room-wide MIN
+                        # prefix (req_to_decode_prefix_len, set by
+                        # bootstrap_thread on ACK completion). This rank's dst
+                        # array starts at ITS OWN decode_prefix_len — offset by
+                        # (rank_pfx - min_pfx) / page_size pages.
+                        # Correctness (token-level pairing):
+                        #   src page s ↔ global token [min+s*ps, min+(s+1)*ps)
+                        #   dst page j ↔ rank token [rank_pfx+j*ps, ...)
+                        #   src[offset+j] ↔ dst[j] pairs the SAME token:
+                        #     min + (offset+j)*ps == rank_pfx + j*ps  (defn of offset)
+                        # Overlap = sender's [s,e) ∩ rank's [offset, offset+dst_total):
+                        #   src [src_start-s, src_end-s) ↔ dst [src_start-offset, src_end-offset)
+                        # Empty overlap means this rank's radix already covers the
+                        # whole chunk (skip send; ret=0 path still sends aux+sync
+                        # on last_chunk so polls reach required_dst_info_num).
+                        _rank_pfx = getattr(req, "decode_prefix_len", None)
+                        _room_min = self.req_to_decode_prefix_len.get(
+                            kv_chunk.room
+                        )
+                        _ps_align = kv_chunk.page_size
+                        if envs.SGLANG_DEBUG_DIAG.get():
+                            logger.info(
+                                "[XFER-OFFSET-DBG] room=%s rank_pfx=%s room_min=%s "
+                                "ps=%s rank_pfx_type=%s room_min_type=%s "
+                                "pfx!=min=%s",
+                                kv_chunk.room,
+                                _rank_pfx,
+                                _room_min,
+                                _ps_align,
+                                type(_rank_pfx).__name__,
+                                type(_room_min).__name__,
+                                _rank_pfx != _room_min if _rank_pfx is not None and _room_min is not None else "N/A",
+                            )
+                        if (
+                            _rank_pfx is not None
+                            and _room_min is not None
+                            and _ps_align is not None
+                            and _ps_align > 0
+                            and _rank_pfx > _room_min
+                            and (_rank_pfx - _room_min) % _ps_align == 0
+                        ):
+                            _offset = (_rank_pfx - _room_min) // _ps_align
+                            _s_al, _e_al = (
+                                kv_chunk.index_slice.start,
+                                kv_chunk.index_slice.stop,
+                            )
+                            _dst_total_al = len(req.dst_kv_indices)
+                            _src_start = max(_s_al, _offset)
+                            _src_end = min(_e_al, _offset + _dst_total_al)
+                            _transfer_indices = kv_chunk.prefill_kv_indices[
+                                _src_start - _s_al : _src_end - _s_al
+                            ]
+                            chunked_dst_kv_indice = req.dst_kv_indices[
+                                _src_start - _offset : _src_end - _offset
+                            ]
+                            if envs.SGLANG_DEBUG_DIAG.get() and (
+                                _src_start != _s_al or _src_end != _e_al
+                            ):
+                                logger.info(
+                                    "[XFER-RANK-OFFSET] room=%s rank_pfx=%d "
+                                    "min=%d offset=%d slice=(%d,%d) src=(%d,%d) "
+                                    "dst_len=%d",
+                                    kv_chunk.room,
+                                    _rank_pfx,
+                                    _room_min,
+                                    _offset,
+                                    _s_al,
+                                    _e_al,
+                                    _src_start,
+                                    _src_end,
+                                    len(chunked_dst_kv_indice),
+                                )
+                        else:
+                            chunked_dst_kv_indice = req.dst_kv_indices[
+                                kv_chunk.index_slice
+                            ]
+                            _transfer_indices = kv_chunk.prefill_kv_indices
 
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
-                        _transfer_indices = kv_chunk.prefill_kv_indices
+                        # NOTE: _transfer_indices was already computed by the
+                        # per-rank offset block above (or the fallback else
+                        # branch) — do NOT overwrite it here with the un-sliced
+                        # kv_chunk.prefill_kv_indices.
                         _dst_indices = chunked_dst_kv_indice
 
                         _dcp_size = getattr(req, "dcp_size", 1)
@@ -2080,6 +2184,91 @@ class MooncakeKVManager(CommonKVManager):
                             _dsv4_bcast = self._is_dsv4_kv_transfer()
                             if not _dsv4_bcast:
                                 _n = len(_transfer_indices)
+                                _dst_n = len(_dst_indices)
+                                # Guard: sender-side page index bookkeeping
+                                # (index_slice/curr_idx sized against
+                                # num_kv_indices - start_send_idx) must stay
+                                # aligned with decode's registered dst array
+                                # ([decode_prefix_len, num)). Any mismatch
+                                # (observed 37 vs 9 after a mis-clamped
+                                # start_send_idx) previously raised IndexError
+                                # inside transfer_worker — whose except re-raise
+                                # KILLED the thread permanently: every later
+                                # chunk for that shard queue wedged forever
+                                # (ADD-XFER kept enqueueing, XFER-CHUNK never
+                                # consumed, health 200, requests hang). Fail
+                                # THIS REQUEST instead of the whole queue.
+                                if _n != _dst_n:
+                                    if _dst_n < _n and _dst_n > 0:
+                                        # Per-rank radix divergence truncation
+                                        # (2026-09-03 root fix): decode TP ranks'
+                                        # radix/HiCache L3 hits diverge (L3
+                                        # loadback timing), so this rank's
+                                        # dst_kv_indices is SHORTER than the
+                                        # sender's src (this rank's radix already
+                                        # covers the first (n - dst_n) pages).
+                                        # The sender's src pages [0, n-dst_n)
+                                        # correspond to tokens this rank already
+                                        # has in its radix — only the LAST dst_n
+                                        # pages are needed. Truncate src to its
+                                        # tail (the delta this rank needs) and
+                                        # proceed with the transfer instead of
+                                        # failing the request.
+                                        # Evidence (2026-09-03 00:42):
+                                        #   PD-PFX-MIN prefix_lens=[19456×7, 486400]
+                                        #   src_pages=7407 dst_entries=136
+                                        #   (7407-136=7271 = (486400-19456)/64)
+                                        #   → rank with 486400 radix covers first
+                                        #     7271 pages, needs last 136 only.
+                                        _skip = _n - _dst_n
+                                        if envs.SGLANG_DEBUG_DIAG.get():
+                                            logger.info(
+                                                "[XFER-RADIX-TRUNC] room=%s "
+                                                "src=%d dst=%d skip=%d dcp_rank=%s "
+                                                "radix_divergence_truncating",
+                                                kv_chunk.room,
+                                                _n,
+                                                _dst_n,
+                                                _skip,
+                                                _dcp_rank,
+                                            )
+                                        _transfer_indices = _transfer_indices[
+                                            _skip:
+                                        ]
+                                        _n = len(_transfer_indices)
+                                        # Fall through to DCP mask below with
+                                        # aligned src/dst lengths
+                                    else:
+                                        # dst > src: this rank needs MORE pages
+                                        # than the sender has. This should not
+                                        # happen (sender uses min prefix), but
+                                        # fail loudly if it does.
+                                        logger.error(
+                                            "[XFER-SRC-DST-MISMATCH] room=%s "
+                                            "src_pages=%d dst_entries=%d dcp_rank=%s "
+                                            "index_slice=(%s,%s) dst>src (impossible "
+                                            "with min prefix); failing request",
+                                            kv_chunk.room,
+                                            _n,
+                                            _dst_n,
+                                            _dcp_rank,
+                                            kv_chunk.index_slice.start,
+                                            kv_chunk.index_slice.stop,
+                                        )
+                                        self.record_failure(
+                                            kv_chunk.room,
+                                            f"KV transfer src/dst mismatch dst>src "
+                                            f"(src={_n} dst={_dst_n}) dcp_rank={_dcp_rank}",
+                                        )
+                                        self.update_status(kv_chunk.room, KVPoll.Failed)
+                                        self.sync_status_to_decode_endpoint(
+                                            req.endpoint,
+                                            req.dst_port,
+                                            req.room,
+                                            KVPoll.Failed,
+                                            prefill_unique_rank,
+                                        )
+                                        break
                                 _mask = (_dst_indices % _dcp_size) == _dcp_rank
                                 _orig_len = _n
                                 _transfer_indices = _transfer_indices[_mask]
@@ -2274,10 +2463,32 @@ class MooncakeKVManager(CommonKVManager):
                     self.req_to_decode_prefix_len.pop(kv_chunk.room, None)
 
             except Exception as e:
-                # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
-                raise RuntimeError(
-                    f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
+                # A per-chunk exception must NOT kill the transfer_worker
+                # thread: the thread owns one shard queue exclusively; once it
+                # dies, every later add_transfer_request into that shard wedges
+                # forever (ADD-XFER keeps enqueuing, XFER-CHUNK never consumed,
+                # health stays 200, requests hang — observed 2026-09-02 16:24,
+                # IndexError from a boolean-mask mismatch killed Thread-6 and
+                # froze the whole engine while 3 sibling workers sat idle).
+                # Fail THIS request's room (so the scheduler aborts it cleanly
+                # via poll->Failed) and keep consuming the queue.
+                logger.error(
+                    "[XFER-WORKER-CHUNK-ERROR] room=%s chunk failed, failing "
+                    "request (worker stays alive): %r",
+                    kv_chunk.room,
+                    e,
                 )
+                try:
+                    self.record_failure(
+                        kv_chunk.room,
+                        f"transfer_worker chunk exception: {e!r}",
+                    )
+                    self.update_status(kv_chunk.room, KVPoll.Failed)
+                    if kv_chunk.room in self.transfer_infos:
+                        self.transfer_infos.pop(kv_chunk.room, None)
+                    self.req_to_decode_prefix_len.pop(kv_chunk.room, None)
+                except Exception:
+                    pass
 
     def start_prefill_thread(self):
         def bootstrap_thread():
@@ -2402,14 +2613,41 @@ class MooncakeKVManager(CommonKVManager):
                         # NOTE: after bootstrapping we can mark the req as waiting for input
                         if len(self.transfer_infos[room]) == required_dst_info_num:
                             self.resolve_kv_replica_factor(self.transfer_infos[room])
-                            self.req_to_decode_prefix_len[room] = next(
-                                (
-                                    info.decode_prefix_len
-                                    for info in self.transfer_infos[room].values()
-                                    if info.decode_prefix_len is not None
-                                ),
-                                0,
+                            # Cross-rank MIN decode_prefix_len (2026-09-02 src/dst
+                            # mismatch fix): decode TP ranks independently run
+                            # _match_prefix_and_lock; their radix/HiCache L3 hits
+                            # diverge (L3 loadback timing), so different ranks'
+                            # send_metadata carry different decode_prefix_len and
+                            # DIFFERENT-length dst_kv_indices arrays (observed:
+                            # rank0 20 entries vs rank2 1 entry → prefill sender
+                            # index_slice (num_pages sized from one rank's ACK)
+                            # boolean-mask mismatched the other rank's array).
+                            # The sender's page budget MUST cover the rank that
+                            # needs the MOST data, i.e. the SMALLEST prefix. Using
+                            # `next()` (first ACK) under-sizes the budget when a
+                            # later rank has a smaller prefix. transfer_worker
+                            # per-rank offset (see _dst_indices offset logic) pairs
+                            # src pages with each rank's dst via its own
+                            # decode_prefix_len, so MIN here is always safe: ranks
+                            # with larger prefixes skip their extra prefix pages.
+                            _all_pfx = [
+                                info.decode_prefix_len
+                                for info in self.transfer_infos[room].values()
+                                if info.decode_prefix_len is not None
+                            ]
+                            self.req_to_decode_prefix_len[room] = (
+                                min(_all_pfx) if _all_pfx else 0
                             )
+                            if envs.SGLANG_DEBUG_DIAG.get() and len(
+                                set(_all_pfx)
+                            ) > 1:
+                                logger.info(
+                                    "[PD-PFX-MIN] room=%s prefix_lens=%s min=%d "
+                                    "(cross-rank radix hit divergence)",
+                                    room,
+                                    sorted(_all_pfx),
+                                    self.req_to_decode_prefix_len[room],
+                                )
                             pd_hidden_meta = next(
                                 (
                                     info.spec_metadata
@@ -2589,6 +2827,7 @@ class MooncakeKVManager(CommonKVManager):
         state_indices: Optional[List] = None,
         trace_ctx: Optional[Union[TraceReqContext, TraceNullContext]] = None,
         source_event=None,
+        page_size: int = 0,
         pd_hidden_start: Optional[int] = None,
         pd_hidden_row_len: int = 0,
         pd_hidden_is_last_chunk: bool = False,
@@ -2601,16 +2840,41 @@ class MooncakeKVManager(CommonKVManager):
             bootstrap_room not in self.request_status
             or self.check_status(bootstrap_room) == KVPoll.Failed
         ):
-            logger.debug(
-                "Request with bootstrap_room=%s already failed", bootstrap_room
-            )
+            if envs.SGLANG_DEBUG_DIAG.get():
+                logger.info(
+                    "[ADD-XFER-SKIP] room=%s in_status=%s status=%s",
+                    bootstrap_room,
+                    bootstrap_room in self.request_status,
+                    (
+                        self.request_status.get(bootstrap_room)
+                        if bootstrap_room in self.request_status
+                        else None
+                    ),
+                )
             return
 
         if bootstrap_room not in self.transfer_infos:
             # This means that the current rank is a dummy rank for this request,
             # and it has already been marked as success, so there is no need to
             # add further chunks into the transfer queue.
+            if envs.SGLANG_DEBUG_DIAG.get():
+                logger.info(
+                    "[ADD-XFER-SKIP2] room=%s not in transfer_infos (dummy rank or cleared)",
+                    bootstrap_room,
+                )
             return
+
+        if envs.SGLANG_DEBUG_DIAG.get():
+            _infos = self.transfer_infos[bootstrap_room]
+            _non_dummy = [t for t in _infos.values() if not t.is_dummy]
+            logger.info(
+                "[ADD-XFER] room=%s reqs=%d non_dummy=%d dcp_ranks=%s last=%s",
+                bootstrap_room,
+                len(_infos),
+                len(_non_dummy),
+                sorted({t.dcp_rank for t in _non_dummy}),
+                is_last_chunk,
+            )
 
         # NOTE(shangming): sharding according to the dst_infos to make sure
         # requests with the same dst_sessions will be added into the same
@@ -2631,6 +2895,7 @@ class MooncakeKVManager(CommonKVManager):
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
                 source_event=source_event,
+                page_size=page_size,
                 pd_hidden_start=pd_hidden_start,
                 pd_hidden_row_len=pd_hidden_row_len,
                 pd_hidden_is_last_chunk=pd_hidden_is_last_chunk,
@@ -2734,6 +2999,7 @@ class MooncakeKVSender(CommonKVSender):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
+        page_size: int = 0,
     ):
         kv_indices, index_slice, is_last_chunk, should_skip = (
             self._prepare_send_indices(kv_indices, state_indices)
@@ -2755,6 +3021,7 @@ class MooncakeKVSender(CommonKVSender):
                 state_indices=state_indices,
                 source_event=source_event,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
+                page_size=page_size,
                 pd_hidden_start=(
                     pd_hidden_chunk_meta[0] if pd_hidden_chunk_meta else None
                 ),
@@ -2780,6 +3047,7 @@ class MooncakeKVSender(CommonKVSender):
                 state_indices=state_indices,
                 source_event=source_event,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
+                page_size=page_size,
                 pd_hidden_start=(
                     pd_hidden_chunk_meta[0] if pd_hidden_chunk_meta else None
                 ),

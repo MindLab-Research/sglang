@@ -201,6 +201,21 @@ class HiCacheRestoreGatedKVReceiver:
 
     def poll(self) -> KVPoll:
         poll = self.decode_req.kv_receiver.poll()
+        if self.decode_req.hicache_restore_status == HiCacheRestoreResult.FAILED:
+            # 2026-09-03 fix (NCCL watchdog SIGABRT / batch-divergence crash):
+            # a FAILED restore MUST enter the padded all_reduce as
+            # KVPoll.Failed (=0, the min) so ALL ranks abort this request in
+            # the SAME iteration. Previously FAILED fell through here,
+            # returning the raw poll (Success/Transferring), while
+            # pop_transferred's local `or hicache_restore_status == FAILED`
+            # check aborted the request UNILATERALLY on the failing rank
+            # only. Evidence (2026-09-03 02:10 crash): TP0's L2 load_back
+            # shortfall (l1=26880 l2=323072 new_indices=0) → TP0 aborted
+            # alone → [PADDED-AR] len=19 vs peers' 20 → TP1-7 COMMITted the
+            # request into their running batch → batch membership divergence
+            # → EAGLE verify eagle_sample broadcast (PG2) never completed on
+            # 7 ranks → NCCL 600s watchdog → SIGABRT → whole engine down.
+            return KVPoll.Failed
         if (
             poll == KVPoll.Success
             and self.decode_req.hicache_restore_status == HiCacheRestoreResult.PENDING
