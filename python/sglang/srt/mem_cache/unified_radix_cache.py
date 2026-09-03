@@ -2029,6 +2029,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 )
             return False
 
+        # [read-before-ready fix 2026-09-04] Start the DMA IMMEDIATELY.
+        # cache_controller.load() only appends to load_queue — it does NOT
+        # start the copy. The DMA is only started by start_loading() (which
+        # merges all pending ops, launches on load_stream, and records the
+        # finish_event). Without this call, the DMA sits in the queue until
+        # the NEXT _process_hicache_local_restores Phase C runs — which is
+        # BEFORE init_load_back in the event loop ordering. So the current
+        # step's DMA is never started, wait_all_in_flight in set_hicache_consumer
+        # waits on stale (previously-recorded or never-recorded) events, and
+        # the forward reads in-flight / uninitialized device KV → gradual
+        # garbling under sustained load (first half normal, then increasing
+        # garbage as more load_backs hit un-started DMAs).
+        self.cache_controller.start_loading()
+
         # Commit: each component gets only its own transfers
         kv_xfer.device_indices = device_indices
         self.components[BASE_COMPONENT_TYPE].commit_hicache_transfer(
