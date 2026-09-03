@@ -1474,38 +1474,42 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._update_evictable_leaf_sets(node)
 
     def _remove_leaf_from_parent(self, node: UnifiedTreeNode):
+        # [2026-09-03 fix v2] MUST peek first and only pop on an exact
+        # identity match. The mapping at this key may have been superseded by
+        # a *different live node* (re-insert at the same prefix, _split_node
+        # replacement, or a detached zombie parent whose slot was reused).
+        # Popping unconditionally would detach that live node — silently
+        # cutting a valid subtree from the tree: its KV becomes unmatchable
+        # AND unevictable (the stale-reference guards in _is_device_leaf /
+        # _is_host_leaf discard it from the leaf sets), leaking memory
+        # forever. The earlier `assert v == node` only caught this AFTER the
+        # pop had already removed the live child (crash-on-damage); the
+        # v2-peek fix below never touches the mapping unless it still points
+        # at *node* (same pattern as the stale guards cited above).
         key = node.key.child_key(self.page_size)
-        v = node.parent.children.pop(key, None)
+        v = node.parent.children.get(key)
         if v is None:
-            # Stale node: already removed from parent (e.g. by _split_node
-            # which replaced parent.children[key] with a new_node, or by a
-            # prior _iteratively_delete_tombstone_leaf cascade). The node's
-            # KV has already been freed by the caller, so this is a no-op.
-            import logging
-            logging.getLogger("sglang").warning(
-                "REMOVE_LEAF_STALE node.id=%s already detached from parent %s; skipping",
-                getattr(node, "id", "?"),
-                getattr(node.parent, "id", "?"),
-            )
+            # Already detached (removed by the caller a few lines above, a
+            # _split_node replacement that moved this key, or a prior
+            # tombstone walk iteration). Nothing to do.
             return
         if v is not node:
-            # [2026-09-03 fix] Stale node: the parent's children map has a
-            # different node at this key (e.g. _split_node replaced it, or a
-            # prior eviction cascade already restructured the tree). The node
-            # being removed is stale — its device/host data has already been
-            # freed by the caller, so this is a no-op. Previously this was
-            # `assert v == node` which crashed all 8 TP ranks when a zombie
-            # node (evicted=True, backuped=False from a failed L2 write_back)
-            # was later processed by host eviction and found stale in the tree.
-            import logging
-            logging.getLogger("sglang").error(
-                "REMOVE_LEAF_MISMATCH node.id=%s v.id=%s node.parent.id=%s "
-                "node.evicted=%s node.backuped=%s — skipping stale removal",
+            # Stale reference: a different live node occupies this key. The
+            # node being removed was detached earlier — typical chain: L2
+            # write_back failure fallback removed it from the tree while a
+            # host-tier child still referenced it via .parent; a later
+            # re-insert created a new node at the same key; the orphaned
+            # child's eviction tombstone walk then reaches this zombie
+            # parent. The live child MUST stay; removal is a no-op.
+            logger.warning(
+                "REMOVE_LEAF_MISMATCH node.id=%s v.id=%s parent.id=%s "
+                "node.evicted=%s node.backuped=%s — stale node, live child kept",
                 getattr(node, "id", "?"), getattr(v, "id", None),
                 getattr(node.parent, "id", "?"),
                 node.evicted, node.backuped,
             )
             return
+        node.parent.children.pop(key)
 
     def _evict_component_and_detach_lru(
         self,
