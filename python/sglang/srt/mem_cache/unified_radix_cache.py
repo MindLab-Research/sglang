@@ -1765,6 +1765,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 return 0
 
         device_value = node.component_data[BASE_COMPONENT_TYPE].value
+        # [DCP rotation fix 2026-09-03] Store first device slot for load_back
+        # rotation check. The DCP host backup/load uses _dcp_owner_localize to
+        # filter by (device_slot // 64) % dcp == rank. Backup uses the ORIGINAL
+        # device slots' ownership; load uses the NEW allocation's ownership.
+        # When the two allocations start at different offsets within a DCP
+        # virtual page (page_size = 64 * dcp), the owner patterns differ →
+        # the loading rank reads phantom data from its own host pool →
+        # cross-request KV corruption (2026-09-03 garbling root cause).
+        # Storing device_value[0] lets load_back verify the rotation matches.
+        if device_value is not None and device_value.numel() > 0:
+            node.component_data[BASE_COMPONENT_TYPE].metadata["dcp_bk_dev0"] = int(
+                device_value[0].item()
+            )
         kv_xfer = PoolTransfer(name=PoolName.KV, device_indices=device_value)
 
         # Build aux transfers, keyed per component.
@@ -1952,10 +1965,37 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
         _load_t0 = time.perf_counter() if _diag else 0
+
+        # [DCP rotation fix 2026-09-03] Compute the expected first-slot offset
+        # within a DCP virtual page from the backup's original device_value[0].
+        # The backup stored it in the root-most evicted node's metadata during
+        # write_backup. The load's new allocation must start at the same offset
+        # within a virtual page, otherwise _dcp_owner_localize filters by a
+        # different owner pattern → phantom host pool reads → KV corruption.
+        _dcp_expected_offset = None
+        _alloc_ps = getattr(self.token_to_kv_pool_allocator, "page_size", 64)
+        if _alloc_ps > 64:  # DCP active (page_size = 64 * dcp_size)
+            _nodes = kv_xfer.nodes_to_load or ()
+            if _nodes:
+                _first_node = _nodes[0]  # root-most evicted node
+                _bk_dev0 = _first_node.component_data[
+                    BASE_COMPONENT_TYPE
+                ].metadata.get("dcp_bk_dev0")
+                if _bk_dev0 is not None:
+                    _dcp_expected_offset = _bk_dev0 % _alloc_ps
+                else:
+                    # [DCP rotation fix gap] No backup rotation metadata —
+                    # either the backup predates the fix (pre-restart L3
+                    # files) or the node was loaded from L3 into a fresh tree.
+                    # Without the original device_value[0] we cannot verify
+                    # the rotation → skip load_back (re-prefill, correct).
+                    _dcp_expected_offset = -1  # sentinel: always mismatch
+
         device_indices = self.cache_controller.load(
             host_indices=kv_xfer.host_indices,
             node_id=best_match_node.id,
             extra_pools=aux_xfers or None,
+            dcp_expected_offset=_dcp_expected_offset,
         )
         if _diag:
             _load_ms = (time.perf_counter() - _load_t0) * 1000

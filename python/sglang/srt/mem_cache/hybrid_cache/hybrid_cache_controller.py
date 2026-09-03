@@ -455,6 +455,7 @@ class HybridCacheController(BaseHiCacheController):
         priority: Optional[int] = None,
         node_id: int = -1,
         extra_pools: Optional[list[PoolTransfer]] = None,
+        dcp_expected_offset: Optional[int] = None,
     ) -> Optional[torch.Tensor]:
         need_load_kv = host_indices.numel() > 0
 
@@ -469,6 +470,37 @@ class HybridCacheController(BaseHiCacheController):
             device_indices = full_allocator.alloc(len(host_indices))
             if device_indices is None:
                 return None
+
+        # [DCP rotation fix 2026-09-03] Check ownership rotation mismatch
+        # between the backup's device allocation and the load's new allocation.
+        # The DCP host backup/load uses _dcp_owner_localize to filter by
+        # (device_slot // 64) % dcp == rank. Backup used the ORIGINAL device
+        # slots' ownership; load uses the NEW allocation's ownership. When the
+        # two allocations start at different offsets within a DCP virtual page
+        # (page_size = 64 * dcp_size), the owner patterns differ → the loading
+        # rank reads phantom data from its own host pool → KV corruption.
+        # Fix: verify the new allocation's first slot has the same offset
+        # within a virtual page as the backup's. If not, free and return None
+        # (load_back degrades to cache miss — re-prefill is correct).
+        if (
+            dcp_expected_offset is not None
+            and device_indices is not None
+            and device_indices.numel() > 0
+        ):
+            _alloc_ps = getattr(full_allocator, "page_size", 64)
+            if _alloc_ps > 64:  # DCP active
+                _actual_offset = int(device_indices[0].item()) % _alloc_ps
+                if _actual_offset != dcp_expected_offset:
+                    if need_load_kv:
+                        full_allocator.free(device_indices)
+                    logger.warning(
+                        f"[DCP-ROT-MISMATCH] backup_offset={dcp_expected_offset} "
+                        f"load_offset={_actual_offset} alloc_ps={_alloc_ps} "
+                        f"first_slot={int(device_indices[0].item())} "
+                        f"tokens={len(host_indices)} — load_back skipped "
+                        f"(owner pattern mismatch would cause phantom reads)"
+                    )
+                    return None
 
         pool_transfers = self._resolve_pool_transfers_allocation(
             extra_pools,
