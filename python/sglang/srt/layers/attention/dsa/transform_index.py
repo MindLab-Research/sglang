@@ -48,8 +48,17 @@ def transform_index_page_table_decode_kernel(
     topk_indices_ptr: torch.Tensor,
     result_ptr: torch.Tensor,
     page_size: tl.constexpr,
-    page_table_row_stride: tl.constexpr,
+    page_table_row_stride,
 ):
+    # [2026-09-04 fix] page_table_row_stride changed from tl.constexpr to
+    # runtime param. This stride varies per batch (depends on page_table
+    # tensor shape). As tl.constexpr, every new stride value triggers Triton
+    # JIT recompilation. Under sustained load with varying batch sizes, 8 ranks
+    # hit cache-miss recompilation simultaneously → Triton compilation lock
+    # contention → collective divergence → GPU hang (health 200, 0 progress).
+    # Runtime param eliminates JIT recompilation entirely.
+    # (Same fix as commit 4f9a27c601 which modified the kernels/ copy but
+    # missed the srt/ copy that is actually imported at runtime.)
     TOPK: tl.constexpr = 2048
     req_id = tl.program_id(0)
     page_table_ptr = page_table_ptr + req_id * page_table_row_stride
@@ -70,12 +79,12 @@ def transform_index_page_table_prefill_kernel(
     topk_indices_ptr: torch.Tensor,
     cu_seqlens_q_ptr: torch.Tensor,
     result_ptr: torch.Tensor,
-    page_table_stride_0: tl.constexpr,
-    page_table_stride_1: tl.constexpr,
-    topk_indices_stride_0: tl.constexpr,
-    topk_indices_stride_1: tl.constexpr,
-    result_stride_0: tl.constexpr,
-    result_stride_1: tl.constexpr,
+    page_table_stride_0,
+    page_table_stride_1,
+    topk_indices_stride_0,
+    topk_indices_stride_1,
+    result_stride_0,
+    result_stride_1,
     PAGE_TABLE_IS_EXPANDED: tl.constexpr,
     TOPK: tl.constexpr,
     BLOCK_Q: tl.constexpr,
