@@ -473,21 +473,28 @@ class TpModelWorker(BaseTpWorker):
 
     def set_hicache_consumer(self, consumer_index: int):
         if self.hicache_layer_transfer_counter is not None:
-            if consumer_index < 0:
-                # PD-decode HiCache read-before-ready fix: decode running
-                # batches never set hicache_consumer_index (only prefill's
-                # get_new_batch_prefill does), so set_consumer(-1) would
-                # leave wait_until() a no-op. Meanwhile load_back commits tree
-                # node value before the DMA executes, so requests matching a
-                # load_back-committed node can read in-flight slots with no
-                # gate at all. Instead of no-op'ing, make the forward stream
-                # wait on ALL in-flight load events once per forward —
-                # completed/never-recorded events pass instantly.
-                self.hicache_layer_transfer_counter.wait_all_in_flight(
-                    self.model_runner.forward_stream
-                )
-                return
-            self.hicache_layer_transfer_counter.set_consumer(consumer_index)
+            # [read-before-ready fix v3] ALWAYS call wait_all_in_flight,
+            # regardless of consumer_index. This is a GPU-side wait
+            # (stream.wait_event — CPU is NOT blocked, unlike v2's
+            # load_stream.synchronize() which caused GPU kernel hangs).
+            #
+            # Why always: load_back() calls start_loading() which uses
+            # a different event slot than Phase C's start_loading(). If
+            # consumer_index >= 0, set_consumer only tracks ONE slot
+            # (Phase C's). load_back's slot is NOT tracked → forward
+            # reads stale data → garbling. wait_all_in_flight covers
+            # ALL slots, including load_back's.
+            #
+            # Why GPU-side: stream.wait_event makes the forward STREAM
+            # wait on the GPU. CPU is free to process previous results,
+            # pop new requests, etc. (overlap preserved). v2's
+            # load_stream.synchronize() blocked CPU → disrupted overlap
+            # → timing-dependent GPU kernel hang after 3h 50min.
+            self.hicache_layer_transfer_counter.wait_all_in_flight(
+                self.model_runner.forward_stream
+            )
+            if consumer_index >= 0:
+                self.hicache_layer_transfer_counter.set_consumer(consumer_index)
 
     def register_hisparse_coordinator(self, coordinator):
         self.model_runner.hisparse_coordinator = coordinator
