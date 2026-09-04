@@ -93,14 +93,35 @@ and [fault-triage.md](references/fault-triage.md) (search `2P3D`).
 
 ### 当前部署形态
 
+- **1100 = standalone MoL 单机引擎（2026-09-01 起，公网 18777 流量的实际承载）**：
+  引擎 1100:30100（v15_patched，TP8 + EAGLE5 + LoRA L0-L3 VE + HiCache write_back file；
+  恢复脚本 `/root/start_standalone_mol.sh`，含 HiCache 三件套 env + /tmp/hicache symlink 断言）。
+  上层栈在 **1101**（**2026-09-02 15:00 端口迁移后**）：**router 30001**（smg，
+  `--worker-urls http://10.0.58.38:30100` cache_aware，prometheus 29004，
+  log `/root/smg_router_mol_30001.log`，worker=1100 引擎）→ gateway 31001
+  （`--worker-urls http://127.0.0.1:30001`，**必须留 31001：proxy 上游固定，proxy 不可动**）
+  → proxy 31000（mol_harness）→ 公网 18777。
+  ⛔ **1101 端口被同事服务占用（2026-09-02 15:00 起）**：30000+29001=他的 pd-disaggregation
+  router（→10.0.58.34:30100/10.0.58.36:30200），30100+8998=他的引擎——**都不要动**；
+  他曾把我们的 30000 router+31001 gateway SIGTERM（401 根因=我方 gateway 误接他的 30000）。
+  ⛔ **`/root/start_mol_1p2d_stack.sh` 的 router 和 gateway 分支都不能再跑**（都指 30000=他的
+  router）；恢复命令：router=`smg launch --host 0.0.0.0 --port 30001 --api-key sk-glm52-pd
+  --worker-urls http://10.0.58.38:30100 --policy cache_aware --max-concurrent-requests 64
+  --health-check-timeout-secs 300 --disable-circuit-breaker --request-timeout-secs 3600
+  --log-level info --prometheus-port 29004`；gateway=`smg launch --host 127.0.0.1 --port 31001
+  --prometheus-port 29002 --policy manual --assignment-mode min_load --worker-urls
+  http://127.0.0.1:30001 --api-key sk-glm52-pd --max-idle-secs 1800 --request-timeout-secs
+  86400 --disable-circuit-breaker`。
+  2026-09-02 事故与恢复见 fault-triage.md `mol-1100-standalone-enospc`（ENOSPC）+ 本条（端口冲突）。
 - **1102+1104 = 1P1D 4-LoRA 集群**（2026-08-19 起，`/root/start_1p1d_lora.sh` 双端）：
   prefill 1102:30100（TP8 + CP interleave + VE + L0-L3，mem-fraction 0.85，**无 HiCache/layersplit**）；
   decode 1104:30200（TP8 + DCP=4 + EAGLE5 + VE，0.90）；router 1102:30000
   （`/opt/sglang-venv/bin/sglang-router`，cache_aware，key `sk-glm52-pd`）。
   验证过 base+L0-L3 全通、bench L2（8K/1K×16 并发）TPOT p50 17.5ms。
-- **1101+1100/1103 = 老 2P3D**（/opt/sglang-venv 旧代码）：1101 的 prefill 配置
+- **1101+1103 = 老 2P3D 残余**（/opt/sglang-venv 旧代码）：1101 的 prefill 配置
   （HiCache ratio=1 + layersplit）在 B300 上**必然 OOM**（需求恒定 ~268GB，与
-  mem-fraction 无关）——1101 反复崩的根因；勿照抄其参数。
+  mem-fraction 无关）——1101 反复崩的根因；勿照抄其参数。1100 已于 09-01 改为
+  standalone MoL（见上），不再是 2P3D decode 节点。
 
 ### 2026-08-19 关键修复（本地 git，已部署 1102/1104）
 
