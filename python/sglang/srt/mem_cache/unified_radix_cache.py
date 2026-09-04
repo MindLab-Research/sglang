@@ -2042,20 +2042,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # garbling under sustained load (first half normal, then increasing
         # garbage as more load_backs hit un-started DMAs).
         self.cache_controller.start_loading()
-        # [read-before-ready fix v2] Block until the host→device DMA is
-        # 100% complete before making the node visible to matches.
-        # start_loading() launches the DMA on load_stream and records the
-        # finish_event, but the DMA runs asynchronously. Without this
-        # synchronize, the tree value is committed (visible to matches)
-        # while the DMA is still in-flight. Although the scheduler is
-        # single-threaded and wait_all_in_flight (in set_hicache_consumer)
-        # gates the forward, the PREFETCH THREAD (separate thread) can
-        # commit tree values between our commit and wait_all_in_flight,
-        # and a concurrent match in the next step could read the
-        # in-flight DMA data → gradual garbling in long outputs.
-        # Same pattern as writing_check(write_back=True) for the backup
-        # path. Cost: ~1ms per step (negligible).
-        self.cache_controller.load_stream.synchronize()
+        # [read-before-ready fix v3] Do NOT call load_stream.synchronize()
+        # here — it blocks the CPU and disrupts the overlap scheduler
+        # pipeline, causing timing-dependent GPU kernel hangs. Instead,
+        # rely on wait_all_in_flight (in set_hicache_consumer) which
+        # makes the forward STREAM wait for the DMA on the GPU side
+        # (no CPU blocking). start_loading() starts the DMA and records
+        # the finish_event; wait_all_in_flight gates the forward stream
+        # on that event. This is the correct async sync pattern: CPU is
+        # never blocked, GPU handles synchronization via stream events.
+        # v2's synchronize() caused 3h 50min stable run then GPU kernel
+        # hang (all 8 ranks stuck at copy_done.synchronize(), GPU 100%).
 
         # Commit: each component gets only its own transfers
         kv_xfer.device_indices = device_indices
