@@ -920,6 +920,39 @@ class MooncakeKVManager(CommonKVManager):
             ]
         assert layers_params is not None
 
+        if state_type == StateType.DSA and layers_params:
+            # IndexShare aliases every shared layer's destination buffer to the
+            # preceding full layer. Prefill CP still exposes one source buffer
+            # per logical layer, so sending all logical layers would schedule
+            # overlapping writes and let an unused shared-layer source overwrite
+            # its owner's index cache. Keep only the first logical occurrence of
+            # each destination pointer. For a PP/CP slice, seed pointers owned by
+            # earlier layers so a slice beginning on a shared layer skips it.
+            start_layer = self.kv_args.prefill_start_layer
+            end_layer = getattr(self.kv_args, "prefill_end_layer", None)
+            main_layer_count = (
+                min(len(layers_params), end_layer - start_layer + 1)
+                if end_layer is not None
+                else len(layers_params)
+            )
+            dst_has_full_layer_domain = (
+                len(dst_data_ptrs) >= start_layer + main_layer_count
+            )
+            seen_dst_ptrs = (
+                set(dst_data_ptrs[:start_layer]) if dst_has_full_layer_domain else set()
+            )
+            owner_layers_params = []
+            for local_layer_id, layer_params in enumerate(layers_params):
+                if local_layer_id >= main_layer_count:
+                    owner_layers_params.append(layer_params)
+                    continue
+                dst_ptr = layer_params[1]
+                if dst_ptr in seen_dst_ptrs:
+                    continue
+                seen_dst_ptrs.add(dst_ptr)
+                owner_layers_params.append(layer_params)
+            layers_params = owner_layers_params
+
         def set_transfer_blocks(
             src_ptr: int, dst_ptr: int, item_len: int
         ) -> List[Tuple[int, int, int]]:
