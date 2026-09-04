@@ -235,6 +235,23 @@ class DecodeHiCacheTransferMixin:
             self.tree_cache.release_aborted_request(decode_req.req.rid)
         if decode_req.hicache_restored_node is not None:
             self.tree_cache.dec_lock_ref(decode_req.hicache_restored_node)
+            # [abort host lock fix 2026-09-04] load_back() calls
+            # inc_host_lock_ref to protect host slots from eviction while
+            # the H→D DMA is in flight. On ACK success, the ack handler
+            # (line 3191) pops ongoing_load_back and calls
+            # dec_host_lock_ref. But on ABORT, this path only called
+            # dec_lock_ref (device) — the host lock was LEAKED, keeping
+            # host slots locked forever. Worse, if the node was later
+            # force-evicted (e.g. _reclaim_full_host_duplicates ignoring
+            # the stale host_lock_ref), the host slots would be freed
+            # while an in-flight DMA was still reading → KV corruption
+            # → accept rate degradation → toolcall format errors.
+            node_id = decode_req.hicache_restored_node.id
+            ongoing = self.tree_cache.ongoing_load_back.pop(node_id, None)
+            if ongoing is not None:
+                self.tree_cache.dec_host_lock_ref(
+                    ongoing.node, ongoing.host_lock_params
+                )
             decode_req.hicache_restored_node = None
 
     def _try_hicache_queue_load_back(self, dr: DecodeRequest) -> bool:
