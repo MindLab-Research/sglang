@@ -1033,15 +1033,31 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
 
         # Gather the per-request last-position indexer top-k as the next loop's
-        # seed (select_index already picks the last accepted position per req).
+        # seed.  The indexer (forward_mha.py) publishes per-request seeds into
+        # the LEADING bs rows of the capture buffer (seed_buf[:bs]), NOT at
+        # token-row positions.  select_index maps to the last token row of
+        # each request (e.g. [5, 11, 17] for 3 reqs × 6 tokens), which reads
+        # stale/garbage rows, not the seeds.  Read the leading bs rows.
         dsa_seed_topk_indices = None
         if self.seed_dsa_topk_from_draft_extend:
             if can_cuda_graph:
                 dsa_extend_topk_capture = self.cuda_graph_runner_for_draft_extend.buffers.dsa_seed_topk_capture
             else:
                 dsa_extend_topk_capture = forward_batch.spec_info.dsa_seed_topk_capture
-            # Fancy indexing returns a fresh tensor (detached from the buffer).
-            dsa_seed_topk_indices = dsa_extend_topk_capture[select_index]
+            try:
+                _bs = batch.batch_size() if callable(batch.batch_size) else batch.batch_size
+                if _bs > 0 and _bs <= dsa_extend_topk_capture.shape[0]:
+                    dsa_seed_topk_indices = dsa_extend_topk_capture[:_bs].clone()
+                else:
+                    logger.warning(
+                        "[DSA-SEED] fallback to select_index: bs=%d cap_rows=%d",
+                        _bs,
+                        dsa_extend_topk_capture.shape[0],
+                    )
+                    dsa_seed_topk_indices = dsa_extend_topk_capture[select_index]
+            except Exception as e:
+                logger.warning("[DSA-SEED] error, fallback to select_index: %s", e)
+                dsa_seed_topk_indices = dsa_extend_topk_capture[select_index]
 
         # Reorganize the spec info for the next batch
         draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
