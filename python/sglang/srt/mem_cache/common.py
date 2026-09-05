@@ -158,10 +158,20 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         return
 
     effective_kv_committed_len = req.effective_kv_committed_len()
+    # [decode-radix fix 2026-09-05] Only insert the prefill/input segment into
+    # the radix tree. Inserting decode-generated output tokens is wasted per-
+    # batch churn (agent harness rarely reuses assistant output as a prefix)
+    # and was correlated with batch-finish-window garbling + accept collapse.
+    # Cap kv_len_to_handle at input length so the tree key stays within
+    # origin_input_ids; after the first insert this is a no-op (radix match
+    # reuses the existing path). Prefill side: output_ids is empty, so the
+    # clamp is a no-op there.
+    _input_len = len(req.origin_input_ids)
+    _insert_len = min(effective_kv_committed_len, _input_len)
     tree_cache.cache_finished_req(
         req,
         is_insert=is_insert and not getattr(req, "skip_radix_cache_insert", False),
-        kv_len_to_handle=effective_kv_committed_len,
+        kv_len_to_handle=_insert_len,
     )
 
     # StreamingSession.cache_finished_req handles speculative tail trim
