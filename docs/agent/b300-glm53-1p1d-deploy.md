@@ -13,7 +13,7 @@
 | b300-1 | 13.124.32.173 | 172.31.33.86(旧) | 宕机中（原 router 公网入口 :30000 曾开放） | — | — |
 
 - SSH：`ssh -i ~/.ssh/b300-spot.pem ubuntu@<ip>`（无 root，sudo 可用；`/nvme` → `/opt/dlami/nvme` symlink）
-- 镜像：`b200routeraca.azurecr.io/mindverse/sglang:v0.5.15.post1-cuda13-b200`（含 sglang-router/smg/引擎一体）
+- 镜像：`b200routeraca.azurecr.io/mindverse/sglang:v0.5.15.post1-cuda13-b200-pd-fix`（含 sglang-router/smg/引擎一体）
 - 模型：`/nvme/models/GLM-5.3`（704G，两台都有；GlmMoeDsaForCausalLM，78 层）
 - 代码 overlay：`/opt/dlami/nvme/sglang-overlay-v15/sglang`（rsync 本地 `python/sglang/`，:ro 挂载到容器 `/sgl-workspace/sglang/python/sglang`）
 - mooncake engine patch：`/tmp/engine-patched.so` :ro 挂载到 `/usr/local/lib/python3.12/dist-packages/mooncake/engine.so`
@@ -54,7 +54,7 @@ docker create --name glm53-prefill --gpus all --runtime=nvidia --network host --
   -e SGLANG_DISAGGREGATION_QUEUE_SIZE=64 -e SGLANG_DISAGGREGATION_THREAD_POOL_SIZE=256 \
   -e SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=/root/hicache -e SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE=200G \
   -e SGLANG_HICACHE_FILE_BACKEND_MIN_FREE_SPACE=10G \
-  b200routeraca.azurecr.io/mindverse/sglang:v0.5.15.post1-cuda13-b200 \
+  b200routeraca.azurecr.io/mindverse/sglang:v0.5.15.post1-cuda13-b200-pd-fix \
   -m sglang.launch_server \
   --model-path /nvme/models/GLM-5.3 --served-model-name glm53 --host 0.0.0.0 --port 30100 --tp 8 \
   --kv-cache-dtype fp8_e4m3 --enable-cache-report --page-size 64 \
@@ -88,7 +88,7 @@ GLM-5.3 用 checkpoint 内置 MTP，**无 --speculative-draft-model-path**。启
 ```
 docker run -d --name glm53-router --network host --privileged --ipc=host --entrypoint python3 \
   -v /nvme/models:/nvme/models:ro \
-  b200routeraca.azurecr.io/mindverse/sglang:v0.5.15.post1-cuda13-b200 \
+  b200routeraca.azurecr.io/mindverse/sglang:v0.5.15.post1-cuda13-b200-pd-fix \
   -m sglang_router.launch_router --pd-disaggregation \
   --prefill http://172.31.47.105:30100 30011 --decode http://172.31.45.101:30002 \
   --host 0.0.0.0 --port 31000 --api-key <见仓库根 secrets.env MOL_API_KEY_B300_1P1D> \
