@@ -6,6 +6,7 @@ from enum import IntEnum
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
+from torch import distributed as dist
 
 from sglang.kernels.ops.speculative.spec_tree import (
     sgl_build_tree_kernel_efficient_triton,
@@ -566,6 +567,52 @@ def eagle_prepare_for_verify(
     return verify_forward_batch, can_run_cuda_graph
 
 
+class EagleBatchDivergence(RuntimeError):
+    """Raised when decode ranks disagree on the current batch's request count.
+
+    Guards the tp_group.broadcast(predict/accept_index/num_correct_drafts, src=0)
+    in eagle_sample (below) from wedging NCCL: a transient decode schedule-batch
+    divergence (one rank carrying a different req set than its TP peers, e.g. a
+    request one rank already finished/removed while peers still hold it) makes
+    the leading (batch) dim of those tensors differ across ranks -> the NCCL
+    collective blocks forever -> 600s watchdog -> Fatal Aborted -> decode
+    crashes and the whole PD pair goes dark. Detect rank-invariantly (all ranks
+    compute the same global max/min via scalar all_reduce over the tp group) and
+    raise on ALL ranks so the batch is skipped instead of wedging NCCL.
+    Mirror of DSpark's DSParkBatchDivergence + _assert_batch_bs_rank_invariant
+    (GLM-5.3's EAGLE verify path historically lacked this guard).
+    """
+
+
+def _assert_eagle_batch_bs_rank_invariant(
+    tp_group, bs: int, device: torch.device
+) -> None:
+    """Rank-invariant guard for eagle_sample's TP broadcast (mirror DSpark).
+
+    The broadcast at the end of eagle_sample requires predict / accept_index /
+    num_correct_drafts to share IDENTICAL leading (batch) dims on every rank in
+    the tp group. A transient decode schedule-batch divergence makes that dim
+    differ -> NCCL wedge (600s watchdog SIGABRT). Detect rank-invariantly and
+    raise on ALL ranks so the batch is skipped. Frequency: one decode step ->
+    two tiny scalar all_reduces; negligible vs the per-step TP collectives.
+    """
+    if tp_group.world_size <= 1:
+        return
+    bmax = torch.tensor([bs], dtype=torch.int32, device=device)
+    bmin = torch.tensor([bs], dtype=torch.int32, device=device)
+    torch.distributed.all_reduce(
+        bmax, op=dist.ReduceOp.MAX, group=tp_group.device_group
+    )
+    torch.distributed.all_reduce(
+        bmin, op=dist.ReduceOp.MIN, group=tp_group.device_group
+    )
+    if int(bmax.item()) != int(bmin.item()):
+        raise EagleBatchDivergence(
+            f"decode batch_size divergence: local_bs={bs} "
+            f"group_bs=[{int(bmin.item())},{int(bmax.item())}]"
+        )
+
+
 def eagle_sample(
     verify_input: EagleVerifyInput,
     batch: ScheduleBatch,
@@ -755,6 +802,15 @@ def eagle_sample(
             else get_tp_group()
         )
         if tp_group.world_size > 1:
+            # [batch-divergence guard 2026-09-05] decode ranks can transiently
+            # disagree on the current batch's request count (one rank finished/
+            # removed a req while peers still hold it) -> bs differs across ranks
+            # -> predict/accept_index/num_correct_drafts leading dim differs ->
+            # the broadcasts below wedge NCCL (600s watchdog -> SIGABRT -> whole
+            # PD pair dark). Detect rank-invariantly (all ranks compute the same
+            # global max/min via scalar all_reduce) and raise on ALL ranks so the
+            # batch is skipped instead of wedging. Mirror DSpark.
+            _assert_eagle_batch_bs_rank_invariant(tp_group, bs, device)
             tp_group.broadcast(predict, src=0)
             tp_group.broadcast(accept_index, src=0)
             tp_group.broadcast(num_correct_drafts, src=0)
