@@ -107,6 +107,10 @@ from sglang.srt.entrypoints.openai.serving_transcription import (
     OpenAIServingTranscription,
 )
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
+from sglang.srt.entrypoints.router_registration import (
+    deregister_from_router,
+    register_with_router,
+)
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -413,6 +417,9 @@ async def lifespan(fast_api_app: FastAPI):
         # Start the HTTP server
         yield
     finally:
+        # Deregister from the sgl-model-gateway router (best-effort; a no-op
+        # when --router was not set or registration never succeeded).
+        deregister_from_router()
         if sidecar is not None:
             try:
                 sidecar.stop()
@@ -2291,6 +2298,12 @@ def _wait_and_warmup(
 
     # The server is ready for requests
     logger.info("The server is fired up and ready to roll!")
+
+    # Auto-register with the sgl-model-gateway router once healthy
+    # (--router). Blocking-with-retry, but the server keeps serving even
+    # when registration never succeeds.
+    if server_args.router is not None:
+        register_with_router(server_args)
 
     if server_args.delete_ckpt_after_loading:
         delete_directory(server_args.model_path)
