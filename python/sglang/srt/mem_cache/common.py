@@ -180,7 +180,19 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     if req.req_pool_idx is None and req.kv is None:
         return
 
-    start_p, end_p = effective_kv_committed_len, req.kv.kv_allocated_len
+    # [decode-radix output-leak fix 2026-09-07] 8cd8707855 clamped the tree's
+    # claim (kv_len_to_handle) to the input segment but left this free's start
+    # at the unclamped committed length — the output pages (P(I), P(C)] were
+    # freed by neither the tree's tail free ([floor_pg(I), I) releases only the
+    # boundary page P(I)) nor this free ([ceil(C), alloc) starts past them) —
+    # a permanent device-pool leak of ~max(0, |output|-pg) tokens per finished
+    # request (measured +19~22K tokens/min at matched running/prealloc states
+    # on the b300 spot; 105min = 21.3% of the pool; see
+    # docs/agent/decode-radix-output-churn-kv-pollution.md §6). Clamp start_p
+    # to the same boundary so the output region falls into this free — mirrors
+    # #22373's strip_thinking_cache semantics where effective_kv_committed_len
+    # itself returns min(committed, input_len).
+    start_p, end_p = _insert_len, req.kv.kv_allocated_len
     _release_overallocated_kv_indices(req, start_p, end_p, tree_cache)
 
     # If the prefix cache doesn't manage mamba states, we must free them here.
@@ -201,14 +213,28 @@ def _release_overallocated_kv_indices(
     req: Req, start_p: int, end_p: int, tree_cache: BasePrefixCache
 ) -> None:
     global_server_args = get_server_args()
-    page_size = global_server_args.page_size
+    # [decode-radix output-leak fix 2026-09-07] Align to the TREE/allocator's
+    # page granularity (DCP: flag_page x dcp, e.g. 64x4=256), not the flag's
+    # page (64). A flag-aligned start can land mid-page on DCP, overlapping the
+    # boundary page that cache_finished_req's page-granular tail free already
+    # released ([floor_pg(I), I) frees page P(I) whole) — a double free on
+    # paths without a free_group wrapper (retract/release_req; the finish paths
+    # are group-wrapped and dedup via free_group_end's torch.unique, but the
+    # retract path frees immediately). The tree's page boundary is structurally
+    # disjoint from the tail free's boundary page (floor vs ceil of the same
+    # boundary). Non-DCP deployments: tree page == flag page, unchanged
+    # behavior.
+    page_size = getattr(tree_cache, "page_size", None) or global_server_args.page_size
     spec_algo = global_server_args.speculative_algorithm
 
     # strip_thinking_cache intentionally reports output tokens as overallocated
-    # so they fall into the free path below (#22373).
+    # so they fall into the free path below (#22373). The decode-radix output
+    # clamp (8cd8707855 + this fix) does the same: start_p is the tree's claim
+    # boundary (input segment), so start_p < end_p is legitimate — only
+    # start_p > end_p (claim beyond allocation) is an accounting error.
     if spec_algo is None and not global_server_args.strip_thinking_cache:
         assert (
-            start_p == end_p
+            start_p <= end_p
         ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv.kv_allocated_len=}"
 
     if page_size > 1:

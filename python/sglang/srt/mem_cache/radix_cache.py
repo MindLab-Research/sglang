@@ -452,13 +452,17 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
                 req.req_pool_idx, req.cache_protected_len : kv_len_to_handle
             ]
             self.token_to_kv_pool_allocator.free(kv_indices)
-            # The paged allocator frees whole pages. Any overallocated tail
-            # (speculative/draft tokens beyond kv_len_to_handle) lives in the
-            # same trailing page and is already released by the page-level free
-            # above. Mark it committed so release_kv_cache skips the duplicate
-            # overallocated free (which would double-free that page).
-            if req.kv is not None:
-                req.kv.kv_allocated_len = kv_len_to_handle
+            # [decode-radix output-leak fix 2026-09-07] Do NOT clamp
+            # kv_allocated_len to kv_len_to_handle: with the input-segment
+            # clamp (8cd8707855) kv_len_to_handle stops at the input boundary,
+            # so that clamp would make release_kv_cache's overallocated free
+            # ([ceil_pg(I), alloc)) empty and leak the output pages (P(I), P(C)]
+            # — the same bug fixed in release_kv_cache's start_p. The original
+            # double-free protection (the trailing page overlap with the
+            # overallocated free) is now structural: the page-level free above
+            # releases up to page P(I), and the overallocated free is
+            # tree-page-aligned (starts at P(I)+1 via the ceil in
+            # _release_overallocated_kv_indices), so the two never overlap.
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
