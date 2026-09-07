@@ -1,7 +1,7 @@
 #!/bin/bash
 # =====================================================================
 # b300 GLM-5.3 PD — router 启动脚本 (最终版 v2 image)
-# image: v0.5.15.post1-cuda13-b200-glm53-final-v2 (无需挂载 mooncake/代码)
+# image: v0.5.15.post1-cuda13-b200-glm53-final-v3 (无需挂载 mooncake/代码)
 # 运行节点: prefill 节点 (B300 spot prefill, 内网 172.31.47.105)
 #
 # ⛔ 启动前提: PD 双端 (decode+prefill) 已 ready (fired up and ready)
@@ -14,7 +14,7 @@ set -euo pipefail
 
 ROUTER_API_KEY="${GLM53_ROUTER_API_KEY:?must set GLM53_ROUTER_API_KEY (真值见 secrets.env)}"
 
-IMAGE="b200routeraca.azurecr.io/mindverse/sglang:v0.5.15.post1-cuda13-b200-glm53-final-v2"
+IMAGE="b200routeraca.azurecr.io/mindverse/sglang:v0.5.15.post1-cuda13-b200-glm53-final-v3"
 CONTAINER_NAME="glm53-router"
 
 PREFILL_URL="http://172.31.47.105:30100"

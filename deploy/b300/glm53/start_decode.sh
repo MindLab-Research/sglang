@@ -1,7 +1,7 @@
 #!/bin/bash
 # =====================================================================
 # b300 GLM-5.3 PD — decode 启动脚本 (最终版 v2 image, 无需挂载 mooncake/代码)
-# image: v0.5.15.post1-cuda13-b200-glm53-final-v2
+# image: v0.5.15.post1-cuda13-b200-glm53-final-v3
 #   - b200 完整 mooncake 包内置 (engine.so 8ea08f1e + ep_*.so 绑定)
 #   - HEAD 代码内置 (conn.py=e79f3463, 含 DCP 修复)
 #   - 只需挂载数据目录 (models/hicache/cache)
@@ -10,7 +10,7 @@
 # =====================================================================
 set -euo pipefail
 
-IMAGE="b200routeraca.azurecr.io/mindverse/sglang:v0.5.15.post1-cuda13-b200-glm53-final-v2"
+IMAGE="b200routeraca.azurecr.io/mindverse/sglang:v0.5.15.post1-cuda13-b200-glm53-final-v3"
 CONTAINER_NAME="sglang-decode"
 BOOTSTRAP_PORT="30011"
 MODEL_PATH="/nvme/models/GLM-5.3"

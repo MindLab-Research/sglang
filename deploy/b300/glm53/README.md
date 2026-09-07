@@ -5,11 +5,11 @@
 
 ---
 
-## 1. 最终 image（v2，无需挂载）
+## 1. 最终 image（v3 = v2 + decode-radix leak 修复 4da29b8f87，无需挂载）
 
 ```
-b200routeraca.azurecr.io/mindverse/sglang:v0.5.15.post1-cuda13-b200-glm53-final-v2
-digest: sha256:2f97fe6347c1b3dede538994085ab0a59e1991fe2c13f62061e31122695a6003
+b200routeraca.azurecr.io/mindverse/sglang:v0.5.15.post1-cuda13-b200-glm53-final-v3
+digest: sha256:bef3f085373042e83aedd9e29e0d5050a49607e5417a78f05d898d0937324ae3
 ```
 
 **v2 内置内容（已验证）**：
