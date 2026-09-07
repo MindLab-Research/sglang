@@ -1,46 +1,36 @@
 #!/bin/bash
 # =====================================================================
-# GLM-5.3 b300 PD 集群 - decode 端还原脚本
-# 最终正确 image: b200routeraca.azurecr.io/mindverse/sglang:v0.5.15.post1-cuda13-b200-glm53-final
-#
-# 100% 还原当前运行状态:
-#   - image 内置 HEAD 代码 (conn.py=e79f3463) + 正确 engine.so (cf881774)
-#   - image 自带正确 engine.so, 因此【不再挂载任何 engine.so】
-#   - 也不再挂载 overlay (sglang 代码已在 image 内)
-#   - 仅挂载数据/缓存目录
-#
-# 注意: decode 在 decode 节点运行 (本脚本==decode 节点)
+# b300 GLM-5.3 PD — decode 启动脚本 (最终版 v2 image, 无需挂载 mooncake/代码)
+# image: v0.5.15.post1-cuda13-b200-glm53-final-v2
+#   - b200 完整 mooncake 包内置 (engine.so 8ea08f1e + ep_*.so 绑定)
+#   - HEAD 代码内置 (conn.py=e79f3463, 含 DCP 修复)
+#   - 只需挂载数据目录 (models/hicache/cache)
+#   - env 用 b200_aligned.env (对齐 b200 2p2d 生产)
+# 运行节点: decode 节点 (B300 spot decode, 内网 172.31.45.101)
 # =====================================================================
 set -euo pipefail
 
-# 部署节点 IP (按实际环境修改)
-DECODE_IP="172.31.45.101"
-BOOTSTRAP_PORT="30011"
-
-IMAGE="b200routeraca.azurecr.io/mindverse/sglang:v0.5.15.post1-cuda13-b200-glm53-final"
+IMAGE="b200routeraca.azurecr.io/mindverse/sglang:v0.5.15.post1-cuda13-b200-glm53-final-v2"
 CONTAINER_NAME="sglang-decode"
-
-# 模型/缓存路径
+BOOTSTRAP_PORT="30011"
 MODEL_PATH="/nvme/models/GLM-5.3"
 HICACHE_DIR="/root/hicache"
-DEEPGEMM_CACHE="/root/.cache/deep_gemm"
-TVMFFI_CACHE="/root/.cache/tvm-ffi"
 
-echo "=== 停止已存在的 decode 容器 ==="
+echo "=== 停止已存在的 decode ==="
 docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
 sleep 2
 
-echo "=== 启动 decode ==="
+echo "=== 启动 decode (v2 image, 无需挂载 mooncake/代码) ==="
 docker run -d --name "$CONTAINER_NAME" \
   --network host --runtime nvidia --gpus all --privileged --ipc=host \
   --security-opt label=disable --shm-size 67108864 \
   -w /sgl-workspace/sglang \
   --entrypoint python3 \
-  --env-file "$(dirname "$0")/decode.env" \
-  -v "$MODEL_PATH:/nvme/models" \
+  --env-file "$(dirname "$0")/b200_aligned.env" \
+  -v "/nvme/models:/nvme/models" \
   -v "/nvme/hicache:$HICACHE_DIR" \
-  -v "/nvme/sglang-cache/deep_gemm:$DEEPGEMM_CACHE" \
-  -v "/nvme/sglang-cache/tvm-ffi:$TVMFFI_CACHE" \
+  -v "/nvme/sglang-cache/deep_gemm:/root/.cache/deep_gemm" \
+  -v "/nvme/sglang-cache/tvm-ffi:/root/.cache/tvm-ffi" \
   "$IMAGE" \
   -m sglang.launch_server \
   --model-path "$MODEL_PATH" \
@@ -67,5 +57,5 @@ docker run -d --name "$CONTAINER_NAME" \
   --hicache-write-policy write_back --hicache-mem-layout page_first \
   --hicache-storage-backend file --file-storage-path "$HICACHE_DIR"
 
-echo "Decode started, container: $CONTAINER_NAME"
-echo "等待 ready... 检查: docker logs $CONTAINER_NAME 2>&1 | grep 'fired up and ready'"
+echo "Decode started: $CONTAINER_NAME"
+echo "验证: docker logs $CONTAINER_NAME 2>&1 | grep 'fired up and ready'"

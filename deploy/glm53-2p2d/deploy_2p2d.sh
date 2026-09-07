@@ -73,6 +73,7 @@ common_env=(
   -e SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE=200G
   -e SGLANG_HICACHE_FILE_BACKEND_MIN_FREE_SPACE=10G
   -e SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=/root/hicache
+  -e SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE=0
 )
 
 common_volumes=(
@@ -178,6 +179,9 @@ case "${1:-}" in
       --port 30200 --mem-fraction-static 0.88 \
       --skip-server-warmup --cuda-graph-max-bs-decode 64 \
       --max-running-requests 64 \
+      --enable-hierarchical-cache --hicache-ratio 1 \
+      --hicache-write-policy write_back --hicache-mem-layout page_first \
+      --hicache-storage-backend mooncake \
       --speculative-algorithm EAGLE --speculative-num-steps 5 \
       --speculative-eagle-topk 1 --speculative-num-draft-tokens 6 \
       --disaggregation-mode decode --dcp-size 8 \
