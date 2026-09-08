@@ -14,7 +14,7 @@
 //! aggregates chunks incrementally.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -26,7 +26,7 @@ use dashmap::DashMap;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{Notify, RwLock, Semaphore};
 
 // ---------------------------------------------------------------------------
 // Data model
@@ -104,6 +104,7 @@ pub enum TaskStatus {
     Running,
     Completed,
     Failed,
+    Cancelled,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -135,19 +136,23 @@ impl Job {
         let mut failed = 0usize;
         let mut queued = 0usize;
         let mut running = 0usize;
+        let mut cancelled = 0usize;
         for t in tasks.iter() {
             match t.status {
                 TaskStatus::Completed => done += 1,
                 TaskStatus::Failed => failed += 1,
                 TaskStatus::Queued => queued += 1,
                 TaskStatus::Running => running += 1,
+                TaskStatus::Cancelled => cancelled += 1,
             }
         }
-        if done + failed == total {
-            if failed == 0 {
+        if done + failed + cancelled == total {
+            if failed == 0 && cancelled == 0 {
                 "completed"
-            } else if done == 0 {
+            } else if done == 0 && cancelled == 0 {
                 "failed"
+            } else if done == 0 && failed == 0 {
+                "cancelled"
             } else {
                 "partial"
             }
@@ -174,6 +179,16 @@ pub struct JobManager {
     request_timeout: Duration,
     jobs: DashMap<String, Arc<Job>>,
     seq: AtomicU64,
+    /// Per-task cancellation flags (task_id -> requested). Live only; not
+    /// persisted (a restart marks interrupted tasks Failed anyway).
+    cancel_flags: DashMap<String, Arc<AtomicBool>>,
+    /// Per-task generated-token progress (task_id -> tokens so far). Live only.
+    progress_tokens: DashMap<String, Arc<AtomicU64>>,
+    /// Per-task live partial result: the latest aggregated sample snapshot for
+    /// a running task, so download endpoints can return "output so far" even
+    /// while the job is still generating. Live only (final results are
+    /// persisted to task_{index}.json on completion).
+    partial_results: DashMap<String, Arc<tokio::sync::RwLock<TaskResult>>>,
 }
 
 impl JobManager {
@@ -203,6 +218,9 @@ impl JobManager {
             request_timeout: Duration::from_secs(request_timeout_secs.max(60)),
             jobs: DashMap::new(),
             seq: AtomicU64::new(0),
+            cancel_flags: DashMap::new(),
+            progress_tokens: DashMap::new(),
+            partial_results: DashMap::new(),
         })
     }
 
@@ -273,8 +291,11 @@ impl JobManager {
             if let Some(arr) = doc["tasks"].as_array() {
                 for t in arr {
                     if let Ok(mut task) = serde_json::from_value::<Task>(t.clone()) {
-                        // completed tasks whose result file exists stay done
-                        if task.status == TaskStatus::Completed {
+                        // completed/cancelled tasks whose result file exists
+                        // stay in their terminal state with result restored.
+                        if task.status == TaskStatus::Completed
+                            || task.status == TaskStatus::Cancelled
+                        {
                             let rf = self
                                 .job_dir(&job_id)
                                 .join(format!("task_{:04}.json", task.index));
@@ -408,6 +429,32 @@ impl JobManager {
             Ok(p) => p,
             Err(_) => return,
         };
+        // If this task was cancelled while it was still queued, the cancel
+        // handler already marked it Cancelled — do not start (or overwrite).
+        {
+            let tasks = job.tasks.read().await;
+            if let Some(t) = tasks.iter().find(|t| t.task_id == task_id) {
+                if t.status == TaskStatus::Cancelled {
+                    return;
+                }
+            }
+        }
+        // Register live cancel flag + token progress before the run so the
+        // cancel endpoint and status polling can see them immediately.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let progress = Arc::new(AtomicU64::new(0));
+        self.cancel_flags.insert(task_id.clone(), cancel.clone());
+        self.progress_tokens.insert(task_id.clone(), progress.clone());
+        // Live partial result: download endpoints may read this while the task
+        // is still running to return "output so far" (completed samples + the
+        // in-flight sample snapshot). Removed when the task finishes.
+        let live = Arc::new(tokio::sync::RwLock::new(TaskResult {
+            task_id: task_id.clone(),
+            index,
+            samples: Vec::new(),
+        }));
+        self.partial_results.insert(task_id.clone(), live.clone());
+
         self.set_task_status(&job, &task_id, TaskStatus::Running)
             .await;
 
@@ -416,17 +463,41 @@ impl JobManager {
         let mut first_err: Option<String> = None;
 
         for _ in 0..n {
-            match self.run_one_sample(&req).await {
-                Ok(s) => samples.push(s),
+            if cancel.load(Ordering::Relaxed) {
+                break; // cancelled between samples: keep what we have
+            }
+            // Reserve the live slot for this sample so a mid-flight download
+            // sees the partial snapshot (updated by aggregate_sse).
+            {
+                let mut g = live.write().await;
+                g.samples.push(SampleResult::default());
+            }
+            match self
+                .run_one_sample(&req, &cancel, &progress, Some(&live))
+                .await
+            {
+                Ok(s) => {
+                    {
+                        let mut g = live.write().await;
+                        if let Some(cur) = g.samples.last_mut() {
+                            *cur = s.clone();
+                        }
+                    }
+                    samples.push(s);
+                }
                 Err(e) => {
+                    if cancel.load(Ordering::Relaxed) {
+                        break; // cancelled mid-sample: keep partial samples
+                    }
                     first_err.get_or_insert(e);
                     break; // stop this task's remaining samples on error
                 }
             }
         }
 
+        let cancelled = cancel.load(Ordering::Relaxed);
         if let Some(err) = first_err {
-            if samples.is_empty() {
+            if samples.is_empty() && !cancelled {
                 let mut tasks = job.tasks.write().await;
                 if let Some(t) = tasks.iter_mut().find(|t| t.task_id == task_id) {
                     t.status = TaskStatus::Failed;
@@ -434,10 +505,18 @@ impl JobManager {
                 }
                 drop(tasks);
                 tracing::warn!("jobs: task {} failed: {}", task_id, err);
+                self.cancel_flags.remove(&task_id);
+                self.progress_tokens.remove(&task_id);
+                self.partial_results.remove(&task_id);
                 return;
             }
-            // partial samples: keep them, note the error in a trailing sample
-            tracing::warn!("jobs: task {} partial failure: {}", task_id, err);
+            // partial samples (or cancelled mid-flight): keep them
+            tracing::warn!(
+                "jobs: task {} partial failure (cancelled={}): {}",
+                task_id,
+                cancelled,
+                err
+            );
         }
 
         let result = TaskResult {
@@ -445,12 +524,18 @@ impl JobManager {
             index,
             samples,
         };
-        let finished = !result.samples.is_empty();
+        // A cancelled job keeps the same downloadable result shape as a
+        // completed one — persist whatever samples were generated before the
+        // cancel so clients can download partial tokens + logprobs.
+        let finished = !result.samples.is_empty() || cancelled;
         self.persist_task_result(&job.job_id, &result);
         {
             let mut tasks = job.tasks.write().await;
             if let Some(t) = tasks.iter_mut().find(|t| t.task_id == task_id) {
-                if finished {
+                if cancelled {
+                    t.status = TaskStatus::Cancelled;
+                    t.result = Some(result);
+                } else if finished {
                     t.status = TaskStatus::Completed;
                     t.result = Some(result);
                 } else {
@@ -459,12 +544,32 @@ impl JobManager {
                 }
             }
         }
-        tracing::info!("jobs: task {} done (finished={})", task_id, finished);
+        // Refresh job.json so cancel state survives a router restart.
+        self.persist_job(&job);
+        tracing::info!(
+            "jobs: task {} done (cancelled={}, finished={})",
+            task_id,
+            cancelled,
+            finished
+        );
+        self.cancel_flags.remove(&task_id);
+        self.progress_tokens.remove(&task_id);
+        self.partial_results.remove(&task_id);
     }
 
     /// Convert one OpenAI-style request to native /generate and aggregate the
-    /// SSE stream into a single sample result.
-    async fn run_one_sample(&self, req: &TaskRequest) -> Result<SampleResult, String> {
+    /// SSE stream into a single sample result. `cancel` (when set) stops the
+    /// stream at the next chunk boundary and returns whatever was aggregated so
+    /// far; `progress` is updated with the running generated-token count;
+    /// `live` (task-level partial result) receives periodic snapshots of the
+    /// in-flight sample so download endpoints can stream partial output.
+    async fn run_one_sample(
+        &self,
+        req: &TaskRequest,
+        cancel: &Arc<AtomicBool>,
+        progress: &Arc<AtomicU64>,
+        live: Option<&Arc<tokio::sync::RwLock<TaskResult>>>,
+    ) -> Result<SampleResult, String> {
         let mut gen_body = json!({
             "text": req.prompt,
             "sampling_params": {
@@ -505,7 +610,7 @@ impl JobManager {
             return Err(format!("generate returned {status}: {}", truncate(&body, 500)));
         }
 
-        let agg = aggregate_sse(resp).await?;
+        let agg = aggregate_sse(resp, cancel, progress, live).await?;
         Ok(agg)
     }
 
@@ -518,6 +623,18 @@ impl JobManager {
     pub fn remove_job(&self, job_id: &str) -> bool {
         let removed = self.jobs.remove(job_id).is_some();
         if removed {
+            // Clean up live per-task flags/progress for this job.
+            let job = self.jobs.get(job_id).map(|e| e.value().clone());
+            if let Some(job) = job {
+                let tasks = job.tasks.try_read();
+                if let Ok(tasks) = tasks {
+                    for t in tasks.iter() {
+                        self.cancel_flags.remove(&t.task_id);
+                        self.progress_tokens.remove(&t.task_id);
+                        self.partial_results.remove(&t.task_id);
+                    }
+                }
+            }
             let dir = self.job_dir(job_id);
             let _ = std::fs::remove_dir_all(dir);
         }
@@ -534,6 +651,31 @@ fn truncate(s: &str, max: usize) -> &str {
         &s[..max]
     } else {
         s
+    }
+}
+
+/// Snapshot of the current aggregation state, used to serve "output so far"
+/// for a running task. Derives the aligned per-token logprob views exactly
+/// like the final result does (so a mid-flight download and the completed
+/// result share the same shape).
+fn snapshot_live_sample(text: &str, ids: &[i64], entries: &[Value]) -> SampleResult {
+    let lps: Vec<f64> = entries
+        .iter()
+        .map(|e| e.get(0).and_then(|v| v.as_f64()).unwrap_or_default())
+        .collect();
+    let tops: Vec<Value> = entries
+        .iter()
+        .map(|e| e.get(2).cloned().unwrap_or(Value::Null))
+        .collect();
+    SampleResult {
+        output_text: text.to_string(),
+        output_ids: ids.to_vec(),
+        output_token_logprobs: lps,
+        output_logprob_entries: entries.to_vec(),
+        output_top_logprobs: tops,
+        finish_reason: None,
+        prompt_tokens: None,
+        completion_tokens: Some(ids.len() as u64),
     }
 }
 
@@ -557,7 +699,12 @@ fn atomic_write(path: &Path, doc: &Value) {
 // chunks, so it works regardless of the backend's chunking convention).
 // ---------------------------------------------------------------------------
 
-async fn aggregate_sse(resp: reqwest::Response) -> Result<SampleResult, String> {
+async fn aggregate_sse(
+    resp: reqwest::Response,
+    cancel: &std::sync::atomic::AtomicBool,
+    progress: &std::sync::atomic::AtomicU64,
+    live: Option<&Arc<tokio::sync::RwLock<TaskResult>>>,
+) -> Result<SampleResult, String> {
     let mut stream = resp.bytes_stream();
     use futures_util::StreamExt;
 
@@ -568,11 +715,36 @@ async fn aggregate_sse(resp: reqwest::Response) -> Result<SampleResult, String> 
     let mut entries: Vec<Value> = Vec::new();
     let mut final_meta: Option<Value> = None;
     let mut saw_done = false;
+    let mut cancelled = false;
+    let mut last_live_snap: Option<std::time::Instant> = None;
+
+    // Poll cancel every ~150ms so a long gap between SSE chunks (or a
+    // stalled upstream) still reacts promptly to a job-cancel request.
+    let mut cancel_poll = tokio::time::interval(Duration::from_millis(150));
+    cancel_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
-        let chunk = tokio::time::timeout(Duration::from_secs(300), stream.next())
-            .await
-            .map_err(|_| "SSE idle timeout (300s without data)".to_string())?;
+        if cancel.load(Ordering::Relaxed) {
+            cancelled = true;
+            break; // keep whatever was aggregated before the cancel
+        }
+        // 300s idle timeout guards a stalled upstream; cancel poll (150ms)
+        // still wins via the select below so cancels react promptly.
+        let next_chunk = tokio::time::timeout(Duration::from_secs(300), stream.next());
+        tokio::pin!(next_chunk);
+        let chunk = tokio::select! {
+            c = &mut next_chunk => match c {
+                Ok(c) => c,
+                Err(_) => return Err("SSE idle timeout (300s without data)".to_string()),
+            },
+            _ = cancel_poll.tick() => {
+                if cancel.load(Ordering::Relaxed) {
+                    cancelled = true;
+                    break;
+                }
+                continue;
+            }
+        };
         match chunk {
             Some(Ok(bytes)) => {
                 buf.extend_from_slice(&bytes);
@@ -593,6 +765,23 @@ async fn aggregate_sse(resp: reqwest::Response) -> Result<SampleResult, String> 
                             continue;
                         };
                         process_chunk(&v, &mut text, &mut ids, &mut entries, &mut final_meta);
+                        progress.store(ids.len() as u64, Ordering::Relaxed);
+                        // Throttled live snapshot: expose "output so far" for a
+                        // running task (~every 500ms) without hot-loop writes.
+                        if let Some(live) = live {
+                            let now = std::time::Instant::now();
+                            if last_live_snap
+                                .map(|t: std::time::Instant| now.duration_since(t) >= Duration::from_millis(500))
+                                .unwrap_or(true)
+                            {
+                                let snap = snapshot_live_sample(&text, &ids, &entries);
+                                let mut g = live.write().await;
+                                if let Some(cur) = g.samples.last_mut() {
+                                    *cur = snap;
+                                }
+                                last_live_snap = Some(now);
+                            }
+                        }
                     }
                 }
             }
@@ -658,6 +847,10 @@ async fn aggregate_sse(resp: reqwest::Response) -> Result<SampleResult, String> 
             });
         out.prompt_tokens = meta["prompt_tokens"].as_u64();
         out.completion_tokens = meta["completion_tokens"].as_u64();
+    } else if cancelled {
+        // A cancel cut the stream before the final meta arrived: surface it so
+        // clients can tell a partial (cancelled) sample from a truncated one.
+        out.finish_reason = Some("cancelled".to_string());
     }
     Ok(out)
 }
@@ -817,18 +1010,28 @@ pub async fn get_job_status(
     let tasks = job.tasks.read().await;
     let mut done = 0;
     let mut failed = 0;
+    let mut cancelled = 0;
+    let mut queued = 0;
+    let mut running = 0;
     let mut total_tokens = 0u64;
     let mut task_views = Vec::with_capacity(tasks.len());
     for t in tasks.iter() {
         match t.status {
             TaskStatus::Completed => done += 1,
             TaskStatus::Failed => failed += 1,
-            _ => {}
+            TaskStatus::Cancelled => cancelled += 1,
+            TaskStatus::Queued => queued += 1,
+            TaskStatus::Running => running += 1,
         }
         let mut token_count = 0u64;
         if let Some(r) = &t.result {
             for s in &r.samples {
                 token_count += s.output_ids.len() as u64;
+            }
+        } else {
+            // running task: report live generated-token progress
+            if let Some(p) = mgr.progress_tokens.get(&t.task_id) {
+                token_count = p.load(Ordering::Relaxed);
             }
         }
         total_tokens += token_count;
@@ -843,7 +1046,14 @@ pub async fn get_job_status(
     Json(json!({
         "job_id": job.job_id,
         "status": status,
-        "progress": {"done": done, "failed": failed, "total": tasks.len()},
+        "progress": {
+            "done": done,
+            "failed": failed,
+            "cancelled": cancelled,
+            "running": running,
+            "queued": queued,
+            "total": tasks.len(),
+        },
         "total_output_tokens": total_tokens,
         "tasks": task_views,
     }))
@@ -858,15 +1068,27 @@ pub async fn get_job_result(
         return err(StatusCode::NOT_FOUND, "job not found");
     };
     let status = job.aggregate_status().await;
-    if status == "queued" || status == "running" {
-        return err(
-            StatusCode::CONFLICT,
-            &format!("job still {status}; poll /v1/control/jobs/{{job_id}} first"),
-        );
-    }
+    // Allow download at any time: completed tasks contribute their persisted
+    // result, running tasks contribute their live partial snapshot (output
+    // text + token ids + logprobs generated so far). The `status` field tells
+    // the client whether this is final (completed/partial/cancelled/failed) or
+    // still in flight.
     let tasks = job.tasks.read().await;
-    let results: Vec<&TaskResult> =
-        tasks.iter().filter_map(|t| t.result.as_ref()).collect();
+    let mut results: Vec<TaskResult> = Vec::new();
+    for t in tasks.iter() {
+        if let Some(r) = &t.result {
+            results.push(r.clone());
+        } else if let Some(live) = mgr.partial_results.get(&t.task_id) {
+            let snap = live.read().await;
+            let any = snap
+                .samples
+                .iter()
+                .any(|s| !s.output_ids.is_empty() || !s.output_text.is_empty());
+            if any {
+                results.push(snap.clone());
+            }
+        }
+    }
     Json(json!({
         "job_id": job.job_id,
         "status": status,
@@ -889,10 +1111,33 @@ pub async fn get_task_result(
     };
     match &t.result {
         Some(r) => Json(r.clone()).into_response(),
-        None => err(
-            StatusCode::CONFLICT,
-            t.error.as_deref().unwrap_or("task not finished"),
-        ),
+        None => {
+            // Running task: serve the live partial snapshot (output so far,
+            // with token ids + logprobs) instead of a 409.
+            if let Some(live) = mgr.partial_results.get(&t.task_id) {
+                let snap = live.read().await;
+                let any = snap.samples.iter().any(|s| {
+                    !s.output_ids.is_empty() || !s.output_text.is_empty()
+                });
+                if any {
+                    return Json(snap.clone()).into_response();
+                }
+            }
+            // A cancelled task that never produced samples still downloads in
+            // the same shape as a completed one (empty samples array).
+            if t.status == TaskStatus::Cancelled {
+                let empty = TaskResult {
+                    task_id: task_id.clone(),
+                    index: t.index,
+                    samples: Vec::new(),
+                };
+                return Json(empty).into_response();
+            }
+            err(
+                StatusCode::CONFLICT,
+                t.error.as_deref().unwrap_or("task not finished"),
+            )
+        }
     }
 }
 
@@ -905,6 +1150,50 @@ pub async fn delete_job(
     } else {
         err(StatusCode::NOT_FOUND, "job not found")
     }
+}
+
+/// Cancel a running/queued job. Queued tasks flip to `cancelled` immediately;
+/// running tasks set their live cancel flag and stop at the next SSE chunk,
+/// persisting whatever tokens (with logprobs) were already generated — the
+/// downloadable result shape is identical to a completed job.
+pub async fn cancel_job(
+    State(mgr): State<Arc<JobManager>>,
+    AxumPath(job_id): AxumPath<String>,
+) -> Response {
+    let Some(job) = mgr.get_job(&job_id) else {
+        return err(StatusCode::NOT_FOUND, "job not found");
+    };
+    // Flip live cancel flags for running tasks so their SSE loop stops at the
+    // next chunk boundary and persists partial tokens+logprobs.
+    let running_task_ids: Vec<String> = {
+        let tasks = job.tasks.read().await;
+        tasks
+            .iter()
+            .filter(|t| t.status == TaskStatus::Running)
+            .map(|t| t.task_id.clone())
+            .collect()
+    };
+    for tid in &running_task_ids {
+        if let Some(flag) = mgr.cancel_flags.get(tid) {
+            flag.value().store(true, Ordering::Relaxed);
+        }
+    }
+    // Queued tasks never started: mark cancelled directly (no result file).
+    {
+        let mut tasks = job.tasks.write().await;
+        for t in tasks.iter_mut() {
+            if t.status == TaskStatus::Queued {
+                t.status = TaskStatus::Cancelled;
+            }
+        }
+    }
+    mgr.persist_job(&job);
+    Json(json!({
+        "job_id": job.job_id,
+        "status": job.aggregate_status().await,
+        "running_cancelled": running_task_ids.len(),
+    }))
+    .into_response()
 }
 
 pub async fn list_jobs(State(mgr): State<Arc<JobManager>>) -> Response {
@@ -969,5 +1258,60 @@ mod tests {
         merge_values(&mut acc, a.as_array().unwrap());
         merge_values(&mut acc, b.as_array().unwrap());
         assert_eq!(acc.len(), 2, "non-prefix data must be appended");
+    }
+
+    #[test]
+    fn cancelled_status_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&TaskStatus::Cancelled).unwrap(),
+            "\"cancelled\""
+        );
+        let back: TaskStatus =
+            serde_json::from_str("\"cancelled\"").unwrap();
+        assert_eq!(back, TaskStatus::Cancelled);
+    }
+
+    #[test]
+    fn aggregate_status_counts_cancelled() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mk = |s: TaskStatus| Task {
+                task_id: "t".into(),
+                index: 0,
+                request: TaskRequest {
+                    prompt: "x".into(),
+                    max_tokens: None,
+                    temperature: None,
+                    top_p: None,
+                    n: 1,
+                    lora_path: None,
+                    model: None,
+                    stream: None,
+                    logprobs: None,
+                    stream_options: None,
+                },
+                status: s,
+                error: None,
+                result: None,
+            };
+            let job = Job {
+                job_id: "j".into(),
+                created_at_unix: 0,
+                tasks: Arc::new(RwLock::new(vec![
+                    mk(TaskStatus::Cancelled),
+                    mk(TaskStatus::Cancelled),
+                ])),
+            };
+            assert_eq!(job.aggregate_status().await, "cancelled");
+            let job2 = Job {
+                job_id: "j2".into(),
+                created_at_unix: 0,
+                tasks: Arc::new(RwLock::new(vec![
+                    mk(TaskStatus::Completed),
+                    mk(TaskStatus::Cancelled),
+                ])),
+            };
+            assert_eq!(job2.aggregate_status().await, "partial");
+        });
     }
 }
