@@ -345,13 +345,50 @@ class LoRAManager:
             # keep metadata for displayed messages
             self.lora_refs[lora_ref.lora_id] = lora_ref
             self.num_pinned_loras += int(lora_ref.pinned)
+
+            # Shape pre-flight: mount the adapter into the memory pool NOW so a
+            # rank / target-module / base-model mismatch returns HTTP 400 at load
+            # time instead of crashing the scheduler on the first inference batch
+            # that touches it (prepare_lora_batch -> load_lora_weight_to_buffer).
+            # On success the adapter stays resident (equivalent to having just
+            # been used by a request); on failure everything registered above is
+            # rolled back before the error is returned.
+            self._preflight_mount_lora(lora_ref)
         except Exception as e:
+            self._rollback_failed_lora_load(lora_ref)
             return self.create_lora_update_result(
                 success=False,
                 error_message=str(e),
             )
 
         return self.create_lora_update_result(success=True)
+
+    def _preflight_mount_lora(self, lora_ref: LoRARef) -> None:
+        """Mount a freshly-loaded adapter into the memory pool to validate that
+        every weight fits its pre-allocated buffer slice (rank / target-module /
+        base-model compatibility). Raises on mismatch so the caller's except turns
+        it into success=False (HTTP 400) instead of a scheduler-killing assertion
+        on the first inference batch that touches the adapter."""
+        memory_pool = getattr(self, "memory_pool", None)
+        if memory_pool is None:
+            # Memory pool not initialized yet (engine still booting): nothing to
+            # validate against; the inference-time check stays as the fallback.
+            return
+        self.fetch_new_loras({lora_ref.lora_id})
+
+    def _rollback_failed_lora_load(self, lora_ref: LoRARef) -> None:
+        """Undo any partial state left by a failed load (pool slot + registries)."""
+        uid = lora_ref.lora_id
+        memory_pool = getattr(self, "memory_pool", None)
+        if memory_pool is not None and uid in memory_pool.uid_to_buffer_id:
+            try:
+                memory_pool.remove_lora(uid)
+            except Exception:
+                logger.exception("Failed to remove LoRA %s from memory pool", uid)
+        self.loras.pop(uid, None)
+        self.configs.pop(uid, None)
+        if self.lora_refs.pop(uid, None) is not None:
+            self.num_pinned_loras -= int(lora_ref.pinned)
 
     def validate_new_adapter(self, lora_config: LoRAConfig, lora_ref: LoRARef):
         """
@@ -984,7 +1021,13 @@ class LoRAManager:
 
             self.lora_refs[lora_ref.lora_id] = lora_ref
             self.num_pinned_loras += int(lora_ref.pinned)
+
+            # Shape pre-flight (see _load_lora_adapter): fail with HTTP 400 here
+            # on rank/target-module/base-model mismatch instead of crashing the
+            # scheduler at inference time.
+            self._preflight_mount_lora(lora_ref)
         except Exception as e:
+            self._rollback_failed_lora_load(lora_ref)
             return self.create_lora_update_result(
                 success=False,
                 error_message=str(e),
