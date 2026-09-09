@@ -595,7 +595,12 @@ impl JobManager {
         let mut builder = self
             .client
             .post(&url)
-            .timeout(self.request_timeout)
+            // No request-level total deadline: a long generation that keeps
+            // producing SSE chunks must not be cut off at a fixed wall-clock
+            // limit (e.g. 3600s) just because it took longer than that. The
+            // only time-based guard is the per-chunk idle timeout in
+            // `aggregate_sse` (no-new-data window), so a live stream runs
+            // indefinitely while the engine keeps emitting tokens.
             .json(&gen_body);
         if let Some(key) = &self.api_key {
             builder = builder.bearer_auth(key);
@@ -610,7 +615,7 @@ impl JobManager {
             return Err(format!("generate returned {status}: {}", truncate(&body, 500)));
         }
 
-        let agg = aggregate_sse(resp, cancel, progress, live).await?;
+        let agg = aggregate_sse(resp, cancel, progress, live, self.request_timeout).await?;
         Ok(agg)
     }
 
@@ -704,6 +709,7 @@ async fn aggregate_sse(
     cancel: &std::sync::atomic::AtomicBool,
     progress: &std::sync::atomic::AtomicU64,
     live: Option<&Arc<tokio::sync::RwLock<TaskResult>>>,
+    idle_timeout: Duration,
 ) -> Result<SampleResult, String> {
     let mut stream = resp.bytes_stream();
     use futures_util::StreamExt;
@@ -728,14 +734,16 @@ async fn aggregate_sse(
             cancelled = true;
             break; // keep whatever was aggregated before the cancel
         }
-        // 300s idle timeout guards a stalled upstream; cancel poll (150ms)
-        // still wins via the select below so cancels react promptly.
-        let next_chunk = tokio::time::timeout(Duration::from_secs(300), stream.next());
+        // No-new-data idle timeout guards a genuinely stalled upstream; cancel
+        // poll (150ms) still wins via the select below so cancels react
+        // promptly.  As long as the engine keeps emitting chunks, this timer
+        // resets every chunk — a live stream never hits a wall-clock deadline.
+        let next_chunk = tokio::time::timeout(idle_timeout, stream.next());
         tokio::pin!(next_chunk);
         let chunk = tokio::select! {
             c = &mut next_chunk => match c {
                 Ok(c) => c,
-                Err(_) => return Err("SSE idle timeout (300s without data)".to_string()),
+                Err(_) => return Err(format!("SSE idle timeout ({}s without data)", idle_timeout.as_secs())),
             },
             _ = cancel_poll.tick() => {
                 if cancel.load(Ordering::Relaxed) {

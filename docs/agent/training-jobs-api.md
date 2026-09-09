@@ -23,7 +23,7 @@
 | 认证 | `Authorization: Bearer sk-control-pd-2026` |
 | 路径前缀 | `/v1/control/jobs` |
 | 并发上限 | 64（同 job 的任务共享，多个 job 同时提交也在 64 内排队） |
-| 单请求超时 | 3600 秒（env `SMG_JOBS_REQUEST_TIMEOUT_SECS` 可调） |
+| 请求超时 | **仅空闲超时**（env `SMG_JOBS_REQUEST_TIMEOUT_SECS` 可调，默认 3600s，建议 7200+）：引擎每吐一段新内容就重置计时器，**只要持续出内容就永不超时**；仅当整整该时长无任何数据才判定上游卡死断开。**无固定 wall-clock 总 deadline** |
 | 结果保留 | 48 小时（磁盘持久化，router 重启自动恢复） |
 | 单 job 任务数上限 | 4096 |
 
