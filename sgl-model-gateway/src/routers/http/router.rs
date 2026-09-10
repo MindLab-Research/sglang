@@ -381,7 +381,22 @@ impl Router {
         // Recursive tree: prefer a registered child (sub-router / engine /
         // pd_cluster) that declares it can serve this model. Fall back to the
         // local worker registry when no child matches.
+        // A draining model must not take new requests: the control plane waits for
+        // its in-flight count to reach zero (mark_model_draining +
+        // wait_inflight_zero) and with a single backend there is nowhere else to
+        // route, so without this the wait can only end in its 1800s timeout.
+        if self.control_plane.is_model_draining(model) {
+            return error::service_unavailable(
+                "model_draining",
+                format!("model {model} is draining; new requests are rejected"),
+            );
+        }
+
         if let Some(child) = self.control_plane.child_for_model(model_id) {
+            // Pair with the request_finished below: this path used to only ever
+            // decrement, so inflight_of() stayed 0 forever and every drain
+            // completed instantly — i.e. it never drained anything.
+            self.control_plane.request_started(model);
             let response = self
                 .proxy_to_child(&child, headers, serialized, route, is_stream)
                 .await;
