@@ -982,16 +982,27 @@ class LoRAMemoryPool:
             if uid not in self.uid_to_buffer_id:
                 buffer_id = get_available_buffer_slot()
                 lora_adapter = lora_adapters.get(uid, None)
-                self.load_lora_weight_to_buffer(
-                    uid,
-                    buffer_id,
-                    lora_adapter,
-                    lora_modules,
-                    lora_embed_tokens_module,
-                    lora_lm_head_module,
-                )
+                # Register the slot BEFORE loading weights so a mid-load failure
+                # (e.g. shape mismatch) can cleanly roll the slot back via
+                # remove_lora instead of leaving a half-written orphan slot whose
+                # uid is unknown to the caller's rollback logic.
                 self.uid_to_buffer_id[uid] = buffer_id
                 self.buffer_id_to_uid[buffer_id] = uid
+                try:
+                    self.load_lora_weight_to_buffer(
+                        uid,
+                        buffer_id,
+                        lora_adapter,
+                        lora_modules,
+                        lora_embed_tokens_module,
+                        lora_lm_head_module,
+                    )
+                except Exception:
+                    # Zero the slot buffers and clear bookkeeping, then re-raise
+                    # so load_lora_adapter's pre-flight turns this into a clean
+                    # HTTP 400 instead of a poisoned pool entry.
+                    self.remove_lora(uid)
+                    raise
                 logger.info(
                     f"[LORA-ASSIGN] uid={uid} -> slot={buffer_id} "
                     f"map_now={self.uid_to_buffer_id}"
@@ -1106,9 +1117,10 @@ class LoRAMemoryPool:
                 # to avoid contamination from the residual weight of the evicted adapters.
                 buffer_view.zero_()
             else:
-                assert (
-                    buffer_view.shape == weight.shape
-                ), f"LoRA buffer shape {buffer_view.shape} does not match weight shape {weight.shape}."
+                if buffer_view.shape != weight.shape:
+                    raise ValueError(
+                        f"LoRA buffer shape {buffer_view.shape} does not match weight shape {weight.shape}."
+                    )
                 copy_weight_into_buffer(buffer_view, weight)
 
         if uid is None:
@@ -1423,10 +1435,11 @@ class LoRAMemoryPool:
                             expected_shape = target_buffer[
                                 buffer_id, 0, : lora_rank * c, :
                             ].shape
-                            assert representative_weight.shape == expected_shape, (
-                                f"LoRA buffer shape {expected_shape} does not match "
-                                f"weight shape {representative_weight.shape}."
-                            )
+                            if representative_weight.shape != expected_shape:
+                                raise ValueError(
+                                    f"LoRA buffer shape {expected_shape} does not match "
+                                    f"weight shape {representative_weight.shape}."
+                                )
                         # Place each stacked component at max_rank-spaced
                         # positions so the kernel's [:max_r] / [max_r:2*max_r]
                         # slicing is correct.

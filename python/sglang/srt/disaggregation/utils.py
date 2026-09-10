@@ -328,18 +328,45 @@ class ReqToMetadataIdxAllocator:
     ):
         self.size = size
         self.free_slots = deque(list(range(size)))
+        # [metadata-index-allocation guard 2026-09-05] ReqToMetadataIdxAllocator
+        # is shared by BOTH DecodePreallocQueue and DecodeTransferQueue on the
+        # decode side. These run on different threads (transfer-worker poll loop
+        # vs scheduler event loop), so concurrent alloc()/free() on this
+        # lock-free deque can hand the SAME metadata_buffer_index to two in-flight
+        # requests -> one request reads another's bootstrap_room -> decode aborts
+        # it as "metadata buffer index collision" (Context corruption detected)
+        # -> AbortReq -> router loses the worker -> 503. Thread-safety: guard all
+        # alloc/free with a lock; free() also de-dups so a double-free (same idx
+        # released by both an abort path and the remove loop) cannot re-queue the
+        # same index twice, which would let two requests alias one slot.
+        self._lock = threading.Lock()
+        self._in_use = set()
 
-    def available_size(self):
-        return len(self.free_slots)
+    def available_size(self) -> int:
+        with self._lock:
+            return len(self.free_slots)
 
     def alloc(self) -> Optional[int]:
-        if len(self.free_slots) == 0:
-            return None
+        with self._lock:
+            if len(self.free_slots) == 0:
+                return None
+            idx = self.free_slots.popleft()
+            # The deque should never hand out an in-use index; a collision here
+            # means a prior double-free re-queued it. Sanity-drop duplicates.
+            while idx in self._in_use and len(self.free_slots) > 0:
+                idx = self.free_slots.popleft()
+            self._in_use.add(idx)
+            return idx
 
-        return self.free_slots.popleft()
-
-    def free(self, free_index: int):
-        self.free_slots.append(free_index)
+    def free(self, free_index: int) -> None:
+        with self._lock:
+            if free_index not in self._in_use:
+                # Double-free (or free of an idx not currently allocated):
+                # dropping it keeps the slot out of the free list so it cannot
+                # be aliased to two requests. This is the corruption guard.
+                return
+            self._in_use.discard(free_index)
+            self.free_slots.append(free_index)
 
 
 class PDHiddenRowPool:

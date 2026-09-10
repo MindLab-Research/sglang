@@ -249,9 +249,26 @@ class DecodeHiCacheTransferMixin:
             node_id = decode_req.hicache_restored_node.id
             ongoing = self.tree_cache.ongoing_load_back.pop(node_id, None)
             if ongoing is not None:
-                self.tree_cache.dec_host_lock_ref(
-                    ongoing.node, ongoing.host_lock_params
-                )
+                if (
+                    getattr(ongoing, "rid", None) is not None
+                    and ongoing.rid != decode_req.req.rid
+                ):
+                    # [L2 race fix 2026-09-05] Foreign entry: another
+                    # request's in-flight load-back for a shared node. Put it
+                    # back — releasing its host lock here would evict host
+                    # slots mid-DMA for the owning request (KV corruption).
+                    self.tree_cache.ongoing_load_back[node_id] = ongoing
+                    logger.warning(
+                        "[HC-LOADBACK-FOREIGN-CLEANUP] rid=%s node=%d owns rid=%s, "
+                        "skip host-lock release",
+                        decode_req.req.rid,
+                        node_id,
+                        ongoing.rid,
+                    )
+                else:
+                    self.tree_cache.dec_host_lock_ref(
+                        ongoing.node, ongoing.host_lock_params
+                    )
             decode_req.hicache_restored_node = None
 
     def _try_hicache_queue_load_back(self, dr: DecodeRequest) -> bool:
@@ -285,6 +302,42 @@ class DecodeHiCacheTransferMixin:
             cow_mamba=False,
             include_req=True,
         )
+
+        # [L2 concurrent-restore race fix 2026-09-05] Same-node dedup at the
+        # scheduler level. If another request is already restoring this exact
+        # host node, defer (stay PENDING): next tick's rematch sees the
+        # committed device value and this request shares the restored slots
+        # via the normal L1 path. Without this, two requests racing on the
+        # same node both run load_back → the second commit overwrites the
+        # tree device value and ongoing_load_back[node.id] (dropping the
+        # first request's lock params → dangling KV slots → accept-rate
+        # collapse 0.26→0.00-0.09 under replay load with shared prefixes).
+        dedup_node_id = getattr(rematch.best_match_node, "id", None)
+        if (
+            dedup_node_id is not None
+            and dedup_node_id in self.tree_cache.ongoing_load_back
+        ):
+            logger.warning(
+                "[HC-LOADBACK-DEDUP] rid=%s node=%d in-flight rid=%s, defer to next tick",
+                dr.req.rid,
+                dedup_node_id,
+                self.tree_cache.ongoing_load_back[dedup_node_id].rid,
+            )
+            return False  # stays PENDING; retried next tick
+
+        # [diag] L1 drift: rematch found a different device boundary than the
+        # original match (usually benign — another request's same-node commit
+        # landed in between; count these to correlate with accept dips).
+        rematch_l1_len = len(rematch.device_indices)
+        if rematch_l1_len != pm.l1_prefix_len:
+            logger.warning(
+                "[HC-RESTORE-L1-DRIFT] rid=%s old_l1=%d rematch_l1=%d host_hit=%d",
+                dr.req.rid,
+                pm.l1_prefix_len,
+                rematch_l1_len,
+                rematch.host_hit_length,
+            )
+
         new_indices, restored_node = self.tree_cache.init_load_back(
             InitLoadBackParams(
                 best_match_node=rematch.best_match_node,
@@ -393,6 +446,31 @@ class DecodeHiCacheTransferMixin:
         self.tree_cache.dec_lock_ref(prefix_match.last_device_node)
         self.tree_cache.inc_lock_ref(decode_req.hicache_restored_node)
         restored_len = len(decode_req.hicache_restored_kv_indices)
+
+        # [L2 race fix 2026-09-05] restore-range invariants: the write slice
+        # must be exactly covered by the source indices and must start at the
+        # L1 boundary recorded on THIS match. Any mismatch means source/
+        # destination ranges are in different coordinate systems (old-match
+        # vs rematch drift) — the req_to_token mapping would then point at
+        # wrong KV slots (silent corruption, no transfer error). Log at ERROR
+        # so it is greppable: HC-RESTORE-RANGE.
+        restore_end = prefix_match.l1_prefix_len + restored_len
+        if (
+            len(prefix_match.prefix_indices) != prefix_match.l1_prefix_len
+            or restore_end - prefix_match.l1_prefix_len != restored_len
+            or restored_len < 0
+        ):
+            logger.error(
+                "[HC-RESTORE-RANGE] rid=%s l1=%d prefix_indices=%d restored_len=%d "
+                "restore_end=%d cache_protected_len=%d — source/dst range "
+                "mismatch, req_to_token mapping is suspect",
+                decode_req.req.rid,
+                prefix_match.l1_prefix_len,
+                len(prefix_match.prefix_indices),
+                restored_len,
+                restore_end,
+                getattr(decode_req.req, "cache_protected_len", 0),
+            )
 
         # With total_prefix_len = l1+l2 (PD covers l3), _pre_alloc wrote PD
         # indices at req_to_token[l1+l2 : fill_len]. L2 load_back may load

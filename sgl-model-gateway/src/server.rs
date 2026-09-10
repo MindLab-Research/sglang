@@ -837,6 +837,10 @@ pub fn build_app(
             get(crate::control_plane::jobs::get_job_result),
         )
         .route(
+            "/v1/control/jobs/{job_id}/cancel",
+            post(crate::control_plane::jobs::cancel_job),
+        )
+        .route(
             "/v1/control/jobs/{job_id}/tasks/{task_id}/result",
             get(crate::control_plane::jobs::get_task_result),
         )

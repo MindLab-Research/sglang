@@ -41,6 +41,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import (
+    EagleBatchDivergence,
     TreeMaskMode,
     build_tree_kernel_efficient,
     eagle_prepare_for_verify,
@@ -662,11 +663,35 @@ def run_eagle_verify(
     # Sample
     maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
     maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
-    (
-        predict,
-        accept_lens,
-        accept_index,
-    ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
+    try:
+        (
+            predict,
+            accept_lens,
+            accept_index,
+        ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
+    except EagleBatchDivergence as e:
+        # [batch-divergence guard 2026-09-05] decode ranks disagree on the
+        # current batch's request count -> eagle_sample's tp_group.broadcast
+        # would wedge NCCL (600s watchdog SIGABRT -> whole engine down). Skip
+        # this batch on EVERY rank (the exception is raised rank-invariantly)
+        # instead of wedging. Mirrors DSpark's DSParkBatchDivergence catch
+        # returning an idle result.
+        logging.getLogger(__name__).error(
+            f"[EAGLE-BATCH-DIVERGE] {e}; returning idle result to skip batch "
+            "(avoid NCCL hang / decode crash)"
+        )
+        idle = GenerationBatchResult(
+            logits_output=None,
+            next_token_ids=torch.empty((0,), dtype=torch.int64, device=device),
+            accept_lens=torch.empty((0,), dtype=torch.int32, device=device),
+            next_draft_input=EagleDraftInput(
+                bonus_tokens=torch.empty((0,), dtype=torch.int32, device=device)
+            ),
+            can_run_cuda_graph=False,
+            speculative_num_draft_tokens=num_draft_tokens,
+            new_seq_lens=torch.empty((0,), dtype=torch.int64, device=device),
+        )
+        return idle
     new_seq_lens = batch.seq_lens + accept_lens
     clear_unaccepted_c128 = getattr(
         token_to_kv_pool_allocator.get_kvcache(),

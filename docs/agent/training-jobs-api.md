@@ -23,7 +23,7 @@
 | 认证 | `Authorization: Bearer sk-control-pd-2026` |
 | 路径前缀 | `/v1/control/jobs` |
 | 并发上限 | 64（同 job 的任务共享，多个 job 同时提交也在 64 内排队） |
-| 单请求超时 | 3600 秒（env `SMG_JOBS_REQUEST_TIMEOUT_SECS` 可调） |
+| 请求超时 | **仅空闲超时**（env `SMG_JOBS_REQUEST_TIMEOUT_SECS` 可调，默认 3600s，建议 7200+）：引擎每吐一段新内容就重置计时器，**只要持续出内容就永不超时**；仅当整整该时长无任何数据才判定上游卡死断开。**无固定 wall-clock 总 deadline** |
 | 结果保留 | 48 小时（磁盘持久化，router 重启自动恢复） |
 | 单 job 任务数上限 | 4096 |
 
@@ -35,9 +35,10 @@
 |---|---|---|
 | POST | `/v1/control/jobs` | 提交任务（数组或对象包裹） |
 | GET | `/v1/control/jobs` | 列出所有 job（简况） |
-| GET | `/v1/control/jobs/{job_id}` | 轮询单个 job 状态 |
-| GET | `/v1/control/jobs/{job_id}/result` | 下载整个 job 结果 |
-| GET | `/v1/control/jobs/{job_id}/tasks/{task_id}/result` | 下载单个任务结果 |
+| GET | `/v1/control/jobs/{job_id}` | 轮询单个 job 状态（含实时进度 token 数） |
+| GET | `/v1/control/jobs/{job_id}/result` | 下载整个 job 结果（终态/已取消均可） |
+| GET | `/v1/control/jobs/{job_id}/tasks/{task_id}/result` | 下载单个任务结果（取消任务返回空 samples） |
+| POST | `/v1/control/jobs/{job_id}/cancel` | 取消 job（排队任务立即 `cancelled`，运行中任务保留已生成 token） |
 | DELETE | `/v1/control/jobs/{job_id}` | 删除 job（内存+磁盘） |
 
 所有接口都需要 Bearer 认证（control key）。
@@ -160,12 +161,12 @@ curl -H 'Authorization: Bearer sk-control-pd-2026' \
 {
   "job_id": "job_1787282349702_001_6026",
   "status": "running",
-  "progress": {"done": 3, "failed": 0, "total": 10},
+  "progress": {"done": 3, "failed": 0, "cancelled": 0, "running": 1, "queued": 6, "total": 10},
   "total_output_tokens": 8231,
   "tasks": [
     {"task_id": "..._t0000", "index": 0, "status": "completed", "token_count": 2048, "error": null},
-    {"task_id": "..._t0001", "index": 1, "status": "running",   "token_count": 0,    "error": null},
-    {"task_id": "..._t0002", "index": 2, "status": "failed",    "token_count": 0,    "error": "generate returned 400: ..."}
+    {"task_id": "..._t0001", "index": 1, "status": "running",   "token_count": 512,   "error": null},
+    {"task_id": "..._t0002", "index": 2, "status": "failed",    "token_count": 0,     "error": "generate returned 400: ..."}
   ]
 }
 ```
@@ -177,12 +178,43 @@ curl -H 'Authorization: Bearer sk-control-pd-2026' \
 | `queued` | 已接收，未开始（并发满时排队） |
 | `running` | 至少一个任务执行中 |
 | `completed` | 全部任务成功 |
-| `partial` | 部分成功部分失败 |
+| `partial` | 部分成功部分失败/部分取消 |
 | `failed` | 全部失败 |
+| `cancelled` | 全部任务被取消（`POST .../cancel` 后） |
 
-task status：`queued` / `running` / `completed` / `failed`。
+task status：`queued` / `running` / `completed` / `failed` / `cancelled`。
 
-**轮询建议**：每 5-10 秒一次；`status` 进入终态（completed/partial/failed）后即可下载。
+- `token_count`：已完成任务为结果累计 token 数；**运行中任务为实时已生成 token 数**（后端 SSE 增量更新），可用于进度展示
+- `total_output_tokens`：所有已完成/取消任务的结果 token + 运行中任务实时 token 之和
+
+**轮询建议**：每 5-10 秒一次；`status` 进入终态（completed/partial/failed/cancelled）后即可下载。
+
+---
+
+## 4.5 取消任务
+
+```bash
+curl -X POST -H 'Authorization: Bearer sk-control-pd-2026' \
+  http://8.213.214.14:18888/v1/control/jobs/{job_id}/cancel
+```
+
+**语义**：
+- 排队中（`queued`）的任务立即置为 `cancelled`（从未开始，无结果文件）
+- 运行中（`running`）的任务在下一个 SSE chunk 边界停止，**已生成的 token ids + logprobs 会被保留并持久化**（结果结构与完成任务的完全一致，`finish_reason: "cancelled"`），可正常下载
+- 已完成/失败的任务不受影响
+- 取消后 job 状态为 `cancelled` 或 `partial`（视是否全部取消），result 端点可正常下载
+
+响应：
+
+```json
+{
+  "job_id": "job_1787282349702_001_6026",
+  "status": "running",
+  "running_cancelled": 1
+}
+```
+
+（`running_cancelled` = 本次取消动作所标记的运行中任务数；轮询 status 确认收敛到终态。）
 
 ---
 
@@ -324,6 +356,8 @@ requests.delete(f"{BASE}/v1/control/jobs/{job_id}", headers=HEADERS)
 | n>1 中途失败 | 已完成 samples 保留，job 正常 completed | 检查 error 日志 |
 | router 重启 | running/queued 任务标记 `failed`（"interrupted by router restart"），completed 结果保留 | 重新提交失败部分 |
 | SSE 中断（已有部分数据） | 保留已生成部分并 completed | 如需严格完整可检查 finish_reason |
+| 取消运行中任务 | task `status=cancelled`，已生成 tokens/logprobs 保留（`finish_reason: "cancelled"`） | 结果结构与 completed 完全一致，可正常下载 |
+| 取消排队任务 | task `status=cancelled`，从未开始 | 下载单任务返回空 samples 数组（200），格式与完成一致 |
 
 **失败任务重试**：当前无自动重试；重新提交仅含失败任务的子数组即可（prompt 原样重用）。
 

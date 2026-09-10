@@ -286,11 +286,19 @@ class _OngoingWriteThrough(NamedTuple):
 
 
 class _OngoingLoadBack(NamedTuple):
-    """Tracks an in-flight H→D load-back operation."""
+    """Tracks an in-flight H→D load-back operation.
+
+    rid records the request that owns this load-back. Under concurrent
+    requests matching the SAME host node (shared 44k-token prefixes under
+    replay load), the dict key node.id can collide across requests; rid
+    disambiguates abort-cleanup vs ack ownership so one request never
+    releases another request's host lock.
+    """
 
     node: UnifiedTreeNode
     lock_params: DecLockRefParams
     host_lock_params: DecLockRefParams
+    rid: Optional[str] = None
 
 
 class _OngoingPrefetch(NamedTuple):
@@ -1907,6 +1915,24 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.cache_controller is None:
             return False
 
+        # [L2 concurrent-restore race fix 2026-09-05] Two requests matching
+        # the SAME host node would both run load_back: the second commit
+        # overwrites the tree device value AND ongoing_load_back[node.id]
+        # (dropping the first request's lock params → dangling KV slots →
+        # accept-rate collapse 0.26→0.00-0.09 under replay load with shared
+        # prefixes). Node-level dedup: if a load_back for this node is
+        # already in flight, defer. The in-flight committer's tree value
+        # becomes visible to the next rematch, and this request then shares
+        # the restored device slots via the normal L1 path.
+        if best_match_node.id in self.ongoing_load_back:
+            logger.warning(
+                "[HC-LOADBACK-DEDUP] node=%d rid=%s in-flight rid=%s, defer",
+                best_match_node.id,
+                getattr(req, "rid", None),
+                self.ongoing_load_back[best_match_node.id].rid,
+            )
+            return False
+
         _diag = envs.SGLANG_DEBUG_DIAG.get()
         _pc0 = time.perf_counter() if _diag else 0
         _evict_ms = 0.0
@@ -2071,11 +2097,29 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
 
         self._update_evictable_leaf_sets(best_match_node)
-        self.ongoing_load_back[best_match_node.id] = _OngoingLoadBack(
-            best_match_node,
-            self.inc_lock_ref(best_match_node).to_dec_params(),
-            host_anchor_params,
-        )
+        # [L2 race fix 2026-09-05] rid ownership + overwrite invariant check.
+        # load_back() entry dedup should have defered any same-node request, so
+        # reaching here with an existing entry means a race window escaped the
+        # guard (e.g. a non-rematch caller). Overwriting would drop the first
+        # request's lock params (host lock leak → premature eviction of host
+        # slots mid-DMA → KV corruption). Log loudly; keep the FIRST owner.
+        prev_entry = self.ongoing_load_back.get(best_match_node.id)
+        if prev_entry is not None:
+            logger.error(
+                "[HC-LOADBACK-OVERWRITE] node=%d prev_rid=%s new_rid=%s — "
+                "keeping FIRST owner, second load_back state dropped "
+                "(lock accounting may leak for new_rid)",
+                best_match_node.id,
+                prev_entry.rid,
+                getattr(req, "rid", None),
+            )
+        else:
+            self.ongoing_load_back[best_match_node.id] = _OngoingLoadBack(
+                best_match_node,
+                self.inc_lock_ref(best_match_node).to_dec_params(),
+                host_anchor_params,
+                rid=getattr(req, "rid", None),
+            )
 
         if _diag:
             _total_ms = (time.perf_counter() - _pc0) * 1000
@@ -3188,9 +3232,24 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             ack = cc.ack_load_queue.pop(0)
             ack.finish_event.synchronize()
             for ack_id in ack.node_ids:
-                node, lock_params, host_lock_params = self.ongoing_load_back.pop(ack_id)
-                self.dec_lock_ref(node, lock_params)
-                self.dec_host_lock_ref(node, host_lock_params)
+                # [L2 race fix 2026-09-05] Idempotent ack consumption: the
+                # same node's load_back may have been aborted/cleaned by its
+                # owning request (c23f23fa03 path) before this ack arrives,
+                # or ownership was retained by the FIRST owner under the
+                # same-node dedup guard. Bare pop() would raise KeyError and
+                # kill the scheduler; log loudly and skip (locks belong to
+                # the surviving owner entry and are NOT released here).
+                entry = self.ongoing_load_back.pop(ack_id, None)
+                if entry is None:
+                    logger.warning(
+                        "[HC-LOADBACK-ACK-MISSING] node_id=%s ack has no "
+                        "ongoing entry (consumed by abort/overwrite); skip "
+                        "lock release",
+                        ack_id,
+                    )
+                    continue
+                self.dec_lock_ref(entry.node, entry.lock_params)
+                self.dec_host_lock_ref(entry.node, entry.host_lock_params)
 
             if self.metrics_collector is not None:
                 self.metrics_collector.increment_load_back_num_tokens(ack.num_tokens)
@@ -3740,7 +3799,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 E(
                     f"[Ongoing] write_through node {nid} lock_ref={n.component_data[FCT].lock_ref}"
                 )
-        for nid, (n, _, _) in self.ongoing_load_back.items():
+        for nid, _olb in self.ongoing_load_back.items():
+            n = _olb.node
             if n not in all_node_set:
                 E(f"[Ongoing] load_back node {nid} not in tree")
             elif n.component_data[FCT].lock_ref <= 0:
