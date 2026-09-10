@@ -363,6 +363,21 @@ impl ControlPlaneState {
         }
     }
 
+    /// True while a model is draining.
+    ///
+    /// The data plane refuses new requests for such a model (see
+    /// ``routers::http::router``): ``wait_inflight_zero`` can only finish if no
+    /// new work keeps arriving, otherwise it always runs into
+    /// ``DRAIN_TIMEOUT_SECS``.
+    pub fn is_model_draining(&self, name: &str) -> bool {
+        self.deployments
+            .read()
+            .unwrap()
+            .get(name)
+            .map(|d| d.state == "DRAINING")
+            .unwrap_or(false)
+    }
+
     pub fn routing_config(&self) -> RoutingConfig {
         self.routing_config.read().unwrap().clone()
     }
@@ -645,7 +660,11 @@ pub async fn get_models(
                     entry.engine_count += 1;
                     entry.per_engine.push(PerEngineInflight {
                         engine_id: unit.id.clone(),
-                        inflight: m.inflight,
+                        // Report the live counter: the engine's /v1/models body
+                        // only carries the id/parent and leaves inflight at 0, so
+                        // this view used to claim "nothing in flight" always —
+                        // exactly while a drain was waiting for it.
+                        inflight: state.inflight_of(&m.name),
                     });
                 }
             }
