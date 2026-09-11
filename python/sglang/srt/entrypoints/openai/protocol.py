@@ -336,7 +336,7 @@ class CompletionRequest(BaseModel):
     stream_options: Optional[StreamOptions] = None
     suffix: Optional[str] = None
     temperature: float = 1.0
-    top_p: float = 1.0
+    top_p: float = 0.95
     user: Optional[str] = None
     return_hidden_states: bool = False
     return_routed_experts: bool = False
@@ -830,7 +830,7 @@ class ChatCompletionRequest(BaseModel):
     # OpenAI/SGLang default sampling parameters
     _DEFAULT_SAMPLING_PARAMS = {
         "temperature": 1.0,
-        "top_p": 1.0,
+        "top_p": 0.95,
         "top_k": -1,
         "min_p": 0.0,
         "repetition_penalty": 1.0,
@@ -1499,8 +1499,8 @@ class ResponsesRequest(BaseModel):
 
     # Default sampling parameters
     _DEFAULT_SAMPLING_PARAMS = {
-        "temperature": 0.7,
-        "top_p": 1.0,
+        "temperature": 1.0,
+        "top_p": 0.95,
         "top_k": -1,
         "min_p": 0.0,
         "repetition_penalty": 1.0,
