@@ -519,6 +519,14 @@ impl JobManager {
             );
         }
 
+        // A cancelled task marks its samples so downstream consumers can tell a
+        // partial (cancelled) result from a naturally finished one.
+        if cancelled {
+            for s in samples.iter_mut() {
+                s.finish_reason = Some("cancelled".to_string());
+            }
+        }
+
         let result = TaskResult {
             task_id: task_id.clone(),
             index,
