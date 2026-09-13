@@ -56,9 +56,9 @@ send_kv_chunk
    → TCP 小块(每 rank 每层 ~41 token)传输效率崩塌。对照组:Q1 全量 672K 连续
    → 每层 1 个 730MB 大块 → 6.3GB/s。**小块 vs 大块的 mooncake TCP 吞吐差 ~2700×**
    (2.3MB/s vs 6.3GB/s)是最后未定量的一点。
-2. **decode scheduler tick 检测延迟**:py-spy 实锤 idle 时 decode MainThread 连续
-   快照卡 `fast_barrier`(≥3s)和 `process_batch_result_decode.synchronize`(4s,
-   verify 672K 的 GPU 等待)→ tick 周期被 8-rank collective + GPU 等待拉长 →
+2. **decode scheduler tick 检测延迟**：在主请求处理期间用 py-spy 连续快照（**须有在飞请求，见 AGENTS.md §8 诊断铁律**）可见 decode MainThread 停留在
+   `fast_barrier`(≥3s) 与 `process_batch_result_decode.synchronize`(4s, verify 672K 的 GPU 等待)
+   → 这是**单个 tick 被 8-rank collective + GPU 等待拉长**（正常慢 tick，**不是卡死**）→
    Success 状态的感知延迟最多 1 个慢 tick。
 
 ## 修复(commit 记录)

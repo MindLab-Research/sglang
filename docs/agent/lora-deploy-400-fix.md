@@ -43,10 +43,18 @@
   `handle_recv` 无类型检查，IPC 流上无关消息可能被误计为结果。注入
   `expected_type=resp_type` 过滤 + 丢弃告警日志。
 
-### 4. 事件循环卡死（decode，独立事故）
-12:11 训练侧首次 OSS 部署把 decode 事件循环卡死（pop_transferred all_reduce
-悬死），后续所有 LoRA 请求排在死循环后永不处理（表现为"加载慢"假象）。
-**处置：重启 decode 恢复**。判据：py-spy 8 rank 全停在同一 collective。
+### 4. 事件循环冻结（decode，独立事故）
+12:11 训练侧首次 OSS 部署把 decode 事件循环卡住（pop_transferred all_reduce
+悬死），后续所有 LoRA 请求排在它后面永不处理（表现为"加载慢"假象）。
+**处置：重启 decode 恢复**。
+
+⛔ **判据必须带前提（2026-09-13 更正）**：`py-spy` 抓到 rank 停在 `all_reduce` /
+`_padded_all_reduce_min` **本身不是卡死证据** —— **空闲服务里每个线程都停在
+semaphore/collective 等待是正常待命态**。判定"卡住"必须同时满足：
+1. **有在飞请求**（客户端已发出、未返回），且可见停滞（TTFT/TPOT 无进展、请求超时）；
+2. **时间维度**：多次快照（间隔 ≥10s）同一批 rank 停在**同一** collective，且期间无任何请求完成；
+3. 有旁证：NCCL/gloo watchdog 超时、`PADDED-AR` 计数跨 rank 不一致、日志停止推进。
+只满足"threads 在 all_reduce"这一条 → **不得下结论**。
 
 ## 训练任务接口（新增，smg `control_plane/jobs.rs`）
 

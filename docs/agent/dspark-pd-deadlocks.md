@@ -21,9 +21,17 @@
 
 ## 死锁形态识别（py-spy）
 
-- **health 200 + 请求全超时 + 0 crash** = collective wedge（非 crash）。py-spy 看 scheduler_TP* 主线程：
+⛔ **前提（2026-09-13 更正，血泪）**：**空闲服务里线程停在 semaphore / collective
+里是正常待命态**，py-spy 单次快照看到 `all_reduce` / `_padded_all_reduce_min` /
+`recv_requests` **什么都不能证明**。只有在"**有在飞请求且可见停滞**"（客户端超时、
+TTFT/TPOT 无进展、日志不推进）时，py-spy 形态才有判读价值；且必须**多次快照
+（≥2 次、间隔 ≥10s）确认同一批 rank 停在同一 collective 且期间零请求完成**。
+
+- **health 200 + 请求全超时 + 0 crash**（有在飞请求） = collective wedge（非 crash）。py-spy 看 scheduler_TP* 主线程：
   - 部分 rank 在 `_padded_all_reduce_min` vs 部分在 broadcast → 同 group 异构互配
   - 全部 rank 在同一 gloo 点 → 该 group 内调用次数错位（某 rank 多/少调了一次）
+- 反例（**曾经据此误判**）：服务**空闲**时，6 rank 在 `_padded_all_reduce_min`、
+  2 rank 在 `recv_requests` —— 这是**正常轮询**，不是死锁。
 - 修复原则（AGENTS.md 已有）：**collective 必须 rank-invariant**——次数、时序对 receiver 异常和 per-rank 队列状态免疫
 
 ## 非 collective 型：hidden pool 耗尽 → 个别请求永久卡死（2026-08-18，commit `1c9e1c3275`）

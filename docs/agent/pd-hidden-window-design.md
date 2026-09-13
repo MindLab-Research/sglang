@@ -163,7 +163,7 @@ charge_set(rid, pd_hidden_window_rows)
 
 ## 8. v1.1 补遗：2026-08-18 16:13 冻结事故与协议约束（重要）
 
-**事故**：W=8192 首个长请求（U=743401）触发双端事件循环冻结（health 200、零 crash、请求永久卡死）。py-spy：prefill 8 rank 卡在 `pop_bootstrapped → _padded_all_reduce_min`（7v1 行号错位）；decode 7 rank 卡 iteration barrier、TP1 卡 nvtx enter。
+**事故**：W=8192 首个长请求（U=743401）触发双端事件循环冻结（health 200、零 crash、请求永久卡死）。py-spy（**有在飞请求停滞期间**）：prefill 8 rank 卡在 `pop_bootstrapped → _padded_all_reduce_min`（7v1 行号错位）；decode 7 rank 卡 iteration barrier、TP1 卡 nvtx enter。
 
 **根因（日志实锤）**：
 ```
