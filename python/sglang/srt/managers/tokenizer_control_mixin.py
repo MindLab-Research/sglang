@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import os
 import hashlib
 import logging
 import time
@@ -121,6 +123,23 @@ _COMMUNICATOR_SPECS = [
     ("dumper_control", DumperControlReqOutput),
     ("scale_elastic_ep", ScaleElasticEPReqOutput),
 ]
+
+
+# ---------------------------------------------------------------------------
+# Bounded LoRA updates — a stuck backend must never wedge the control path
+# ---------------------------------------------------------------------------
+# `lora_update_lock` serializes LoRA load/unload; the work underneath waits for
+# the backend (weight download + tensor load, scheduler ack) and for in-flight
+# requests to drain. Any of those can stick (bad URL, backend never acks,
+# requests never drain) — and an op that never returns holds the lock forever,
+# indefinitely queueing every later LoRA update while inference keeps working.
+# Production hit exactly that (2026-09-13): an adapter deploy never completed
+# (gateway timed out at 2160s) because an earlier op was wedged on a bad URL.
+# Every wait below is bounded; on timeout the lock is released and the request
+# fails fast, so one bad request can no longer poison the LoRA control path.
+LORA_UPDATE_TIMEOUT_SECS = float(
+    os.environ.get("SGLANG_LORA_UPDATE_TIMEOUT_SECS", "900")
+)
 
 
 class TokenizerControlMixin:
@@ -542,6 +561,32 @@ class TokenizerControlMixin:
 
         return success, message
 
+    @contextlib.asynccontextmanager
+    async def _lora_update_guard(self: TokenizerManager, op: str):
+        """Take `lora_update_lock` with a timeout and always release it."""
+        timeout = LORA_UPDATE_TIMEOUT_SECS
+        try:
+            await asyncio.wait_for(self.lora_update_lock.acquire(), timeout=timeout)
+        except asyncio.TimeoutError:
+            raise TimeoutError(
+                f"{op}: another LoRA update has held lora_update_lock for more than "
+                f"{timeout:.0f}s (stuck backend); failing fast instead of queueing forever"
+            )
+        try:
+            yield
+        finally:
+            self.lora_update_lock.release()
+
+    async def _lora_wait_bounded(self: TokenizerManager, op: str, awaitable):
+        """Bound a single backend wait inside a LoRA update."""
+        timeout = LORA_UPDATE_TIMEOUT_SECS
+        try:
+            return await asyncio.wait_for(awaitable, timeout=timeout)
+        except asyncio.TimeoutError:
+            raise TimeoutError(
+                f"{op}: backend did not respond within {timeout:.0f}s; aborted and released the lock"
+            )
+
     async def _unload_lora_adapter_locked(
         self: TokenizerManager,
         obj: UnloadLoRAAdapterReqInput,
@@ -557,8 +602,14 @@ class TokenizerControlMixin:
 
         # Initiate the actual unloading operation at the backend processes only after all
         # ongoing requests using this LoRA adapter are finished.
-        await self.lora_registry.wait_for_unload(lora_id)
-        result = (await self.update_lora_adapter_communicator(obj))[0]
+        await self._lora_wait_bounded(
+            "unload_lora_adapter", self.lora_registry.wait_for_unload(lora_id)
+        )
+        result = (
+            await self._lora_wait_bounded(
+                "unload_lora_adapter", self.update_lora_adapter_communicator(obj)
+            )
+        )[0]
 
         return result
 
@@ -586,7 +637,7 @@ class TokenizerControlMixin:
                 obj.lora_path,
             )
 
-            async with self.lora_update_lock:
+            async with self._lora_update_guard("load_lora_adapter"):
                 # Generate new uniquely identifiable LoRARef object.
                 new_adapter = LoRARef(
                     lora_name=obj.lora_name,
@@ -596,7 +647,11 @@ class TokenizerControlMixin:
 
                 # Trigger the actual loading operation at the backend processes.
                 obj.lora_id = new_adapter.lora_id
-                result = (await self.update_lora_adapter_communicator(obj))[0]
+                result = (
+                    await self._lora_wait_bounded(
+                        "load_lora_adapter", self.update_lora_adapter_communicator(obj)
+                    )
+                )[0]
 
                 # Register the LoRA adapter only after loading is successful.
                 if result.success:
@@ -634,7 +689,7 @@ class TokenizerControlMixin:
                         del result.loaded_adapters[lru_lora_name]
 
                 return result
-        except ValueError as e:
+        except (ValueError, asyncio.TimeoutError, TimeoutError) as e:
             return LoadLoRAAdapterReqOutput(
                 success=False,
                 error_message=str(e),
@@ -661,14 +716,18 @@ class TokenizerControlMixin:
                 obj.lora_name,
             )
 
-            async with self.lora_update_lock:
+            async with self._lora_update_guard("load_lora_adapter_from_tensors"):
                 new_adapter = LoRARef(
                     lora_name=obj.lora_name,
                     lora_path="__tensor__",
                     pinned=obj.pinned,
                 )
                 obj.lora_id = new_adapter.lora_id
-                result = (await self.update_lora_adapter_communicator(obj))[0]
+                result = (
+                    await self._lora_wait_bounded(
+                        "load_lora_adapter", self.update_lora_adapter_communicator(obj)
+                    )
+                )[0]
 
                 if result.success:
                     await self.lora_registry.register(new_adapter)
@@ -704,7 +763,7 @@ class TokenizerControlMixin:
                         del result.loaded_adapters[lru_lora_name]
 
                 return result
-        except ValueError as e:
+        except (ValueError, asyncio.TimeoutError, TimeoutError) as e:
             return LoadLoRAAdapterFromTensorsReqOutput(
                 success=False,
                 error_message=str(e),
@@ -737,9 +796,9 @@ class TokenizerControlMixin:
                 obj.lora_name,
             )
 
-            async with self.lora_update_lock:
+            async with self._lora_update_guard("unload_lora_adapter"):
                 return await self._unload_lora_adapter_locked(obj)
-        except ValueError as e:
+        except (ValueError, asyncio.TimeoutError, TimeoutError) as e:
             return UnloadLoRAAdapterReqOutput(success=False, error_message=str(e))
 
     async def get_weights_by_name(
