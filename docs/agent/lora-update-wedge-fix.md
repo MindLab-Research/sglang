@@ -78,3 +78,33 @@ await self.lora_registry.wait_for_unload(lora_id)                    # ← 等�
 - ⛔ **引擎侧任何"等后端/等请求"都必须有超时**：缺上界 = 一次坏输入换永久卡死。
 - ✅ PD 重启必须**配对**（prefill+decode）；网关(smg)与引擎一同重启可消除 registry 脏状态。
 - 判"卡死"必须带前提（AGENTS.md §8 诊断铁律）：**有在飞请求 + 停滞**才算；空闲线程等待是正常态。
+
+---
+
+## 7. 第二种失败模式（同一晚遇到）：权重 URL 被 TOS 拒 → curl 22 → 400
+
+**症状**：adapter 部署 `FAILED`，error=`load failed on launch-pd; check weights exist on all cluster`；
+引擎日志里 rank 仍逐个 `downloading lora → loading completes`（部分 rank 命中本地缓存而成功）。
+
+**判据（3 分钟出结论，不要猜）**：
+1. **直接打引擎**拿原始 error（smg 只记 status，不记 body）：
+   ```bash
+   curl -s -m 600 -X POST http://10.0.0.75:30100/load_lora_adapter -H 'Content-Type: application/json' \
+     -d "{\"lora_name\":\"<URL>\",\"lora_path\":\"<URL>\"}"
+   # → {"success":false,"error_message":"Command '['curl','-sfL','--retry','8',…]' returned non-zero exit status 22"}
+   ```
+   `curl exit 22` = `-f` 模式下服务端返回 4xx/5xx。
+2. **从 smg 日志取【完整】URL**（不截断）后**绕过我们全部代码**直接 GET：
+   ```bash
+   grep -m1 "load_lora_adapter request sent" /root/smg_glm53mol.log | grep -oE "model=https://[^ ]+" | sed 's/^model=//' | xargs -I{} curl -s -o /dev/null -w '%{http_code}\n' --max-time 60 -r 0-1023 {}
+   ```
+   实测得到 **403 + `<Code>AuthorizationQueryParametersError</Code>`**（签名/查询参数非法，不是过期：
+   `X-Amz-Date` + `Expires=86400` 仍在有效期内）。
+
+**归因**：smg `resolve_model_path()` 是**原样透传**、引擎 `curl -o <dest> <lora_path>` **不做任何参数加工**
+（`grep x-id|GetObject` 两侧皆 0）→ 直接 curl 同样 403 ⇒ **URL 本身被 TOS 拒，非本仓库代码问题**；
+训练侧需重新生成 URL（注意 `x-id=GetObject` 这类 SDK 后加、未参与签名的参数会让 TOS 报
+`AuthorizationQueryParametersError`）。
+
+**我们侧可改进（待定）**：smg 的 `load_lora_adapter rejected by engine` 日志应带上引擎响应体
+（现在只有 `status=400`，导致必须手工直连引擎才能拿到 `curl 22` 这条关键信息）。
