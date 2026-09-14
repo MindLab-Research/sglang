@@ -46,6 +46,63 @@ const DRAIN_POLL_INTERVAL_SECS: u64 = 1;
 /// engines can take many minutes per load; 35min is generous but finite —
 /// without it a hung engine load wedges the deployment in LOADING forever.
 const LOAD_TIMEOUT_SECS: u64 = 2100;
+/// Hard cap for the engine-side unload issued by DELETE. A hung engine (seen on
+/// a PD decode engine asked to unload an unknown name: no reply at all, versus
+/// a 2ms 400 from prefill) must not keep a registry entry alive forever.
+const UNLOAD_TIMEOUT_SECS: u64 = 15;
+
+// ---------------------------------------------------------------------------
+// Model reference resolution (alias support for DELETE)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, PartialEq)]
+enum AliasResolution<'a> {
+    Found(&'a str),
+    Ambiguous(Vec<String>),
+    NotFound,
+}
+
+/// Resolve an operator-supplied model reference to a registered deployment name.
+///
+/// Operators copy whatever is at hand — the registered name, the full weights
+/// URL (usually carrying a signed query string), or just the adapter uuid.
+/// The registry only ever matched the exact name, so every other form returned
+/// `not_deployed` and the entry could never be released. Accept, in order:
+///   1. exact registered name
+///   2. exact path (weights URL, query string included or stripped)
+///   3. unique substring of name/path — e.g. the adapter uuid, or the derived
+///      `lora-<uuid>-v<uuid>` name when the caller passes the bare uuid
+fn resolve_alias<'a>(candidates: &'a [(String, String)], given: &str) -> AliasResolution<'a> {
+    let given = given.trim();
+    if given.is_empty() {
+        return AliasResolution::NotFound;
+    }
+    // 1. exact name
+    if let Some((name, _)) = candidates.iter().find(|(n, _)| n == given) {
+        return AliasResolution::Found(name);
+    }
+    // Signed URLs differ between loads but the path before `?` is stable.
+    let strip = |s: &str| s.split('?').next().unwrap_or(s).to_string();
+    let needle = strip(given);
+    // 2. exact path (ignoring the query string)
+    if let Some((name, _)) = candidates.iter().find(|(_, p)| strip(p) == needle) {
+        return AliasResolution::Found(name);
+    }
+    // 3. unique substring (uuid / derived name fragment)
+    let mut hits: Vec<&String> = Vec::new();
+    for (n, p) in candidates.iter() {
+        if n.contains(&needle) || strip(p).contains(&needle) {
+            if !hits.contains(&n) {
+                hits.push(n);
+            }
+        }
+    }
+    match hits.len() {
+        0 => AliasResolution::NotFound,
+        1 => AliasResolution::Found(hits[0]),
+        _ => AliasResolution::Ambiguous(hits.into_iter().cloned().collect()),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Engine adapter primitives
@@ -618,8 +675,34 @@ async fn execute_deploy(
 
 pub async fn delete_model(
     State(state): State<Arc<ControlPlaneState>>,
-    axum::extract::Path(name): axum::extract::Path<String>,
+    axum::extract::Path(given): axum::extract::Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // Operators copy whatever they have at hand: the registered name, the full
+    // weights URL (usually with a signed query string), or just the adapter
+    // uuid. The registry used to match the exact name only, so anything else
+    // came back `not_deployed` and the entry could never be released — accept
+    // all three forms instead.
+    let candidates: Vec<(String, String)> = state
+        .list_deployments()
+        .into_iter()
+        .map(|d| (d.name, d.path))
+        .collect();
+    let name = match resolve_alias(&candidates, &given) {
+        AliasResolution::Found(n) => n.to_string(),
+        AliasResolution::Ambiguous(v) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({ "error": "ambiguous_model_reference", "candidates": v })),
+            )
+        }
+        AliasResolution::NotFound => {
+            return (StatusCode::NOT_FOUND, Json(json!({ "error": "not_deployed" })));
+        }
+    };
+    if name != given {
+        tracing::info!(given = %given, resolved = %name, "delete_model: resolved alias");
+    }
+
     let deployment = state.get_deployment(&name);
     let Some(dep) = deployment else {
         return (StatusCode::NOT_FOUND, Json(json!({ "error": "not_deployed" })));
@@ -630,8 +713,17 @@ pub async fn delete_model(
     // Fast paths: a deployment that never reached ACTIVE cannot carry
     // traffic, so there is nothing to drain — waiting DRAIN_TIMEOUT_SECS
     // here is what used to hang DELETE for half an hour.
-    let needs_drain = !matches!(dep.state.as_str(), "QUEUED" | "LOADING" | "FAILED");
-    if needs_drain {
+    //
+    // DRAINING is also in the fast path: a previous DELETE (or a swap) already
+    // marked it and waited once. Re-waiting turned every retry into another
+    // 30-minute block and left the entry stuck in DRAINING forever when the
+    // caller gave up. In-flight == 0 (nothing routed to it any more) is
+    // likewise immediately releasable.
+    let needs_drain = !matches!(
+        dep.state.as_str(),
+        "QUEUED" | "LOADING" | "FAILED" | "DRAINING"
+    );
+    if needs_drain && state.inflight_of(&name) > 0 {
         // Drain first, then unload on the deployment's engine.
         state.mark_model_draining(&name);
         let drained = wait_inflight_zero(&state, &name).await;
@@ -647,10 +739,33 @@ pub async fn delete_model(
 
     // Unload even for FAILED/LOADING states: the engine may hold a partial
     // load (unload of a non-existent adapter is a harmless 400).
+    //
+    // Bounded on purpose: a *hung* engine (observed on a PD decode engine asked
+    // to unload an unknown name — no reply at all, versus a 2ms 400 from
+    // prefill) must not block releasing the registry entry. A timed-out unload
+    // is logged and ignored: the entry is still removed, which is the whole
+    // point of DELETE for a stuck/orphaned adapter.
     if let Some(engine_id) = &dep.engine_id {
         let children = state.list_children();
         if let Some(unit) = children.iter().find(|u| &u.id == engine_id) {
-            unload_model_on_unit(unit, &dep.path).await;
+            match tokio::time::timeout(
+                Duration::from_secs(UNLOAD_TIMEOUT_SECS),
+                unload_model_on_unit(unit, &dep.path),
+            )
+            .await
+            {
+                Ok(true) => {}
+                Ok(false) => tracing::warn!(
+                    model = %name,
+                    "delete_model: engine unload reported failure (ignored)"
+                ),
+                Err(_) => tracing::warn!(
+                    model = %name,
+                    engine = %engine_id,
+                    timeout_s = UNLOAD_TIMEOUT_SECS,
+                    "delete_model: engine unload timed out (ignored)"
+                ),
+            }
         }
     }
     state.remove_deployment(&name);
@@ -659,4 +774,70 @@ pub async fn delete_model(
         StatusCode::OK,
         Json(json!({ "status": "removed", "model": name })),
     )
+}
+
+#[cfg(test)]
+mod alias_tests {
+    use super::{resolve_alias, AliasResolution};
+
+    fn cands() -> Vec<(String, String)> {
+        vec![
+            ("glm52-fp8-official".to_string(), "glm52-fp8-official".to_string()),
+            (
+                "https://tos.example/adapters-v1/01a099cf-51a4-7190-9b41-fdf0010c1c0e/01a099cf-51a4-7190-9b41-fdf0010c1c0e.tar.zst?X-Amz-Signature=deadbeef".to_string(),
+                "https://tos.example/adapters-v1/01a099cf-51a4-7190-9b41-fdf0010c1c0e/01a099cf-51a4-7190-9b41-fdf0010c1c0e.tar.zst?X-Amz-Signature=deadbeef".to_string(),
+            ),
+            (
+                "lora-01a09a15-19e2-76f0-97ce-e15a183f6542-v01a09a15-19e2-76f0-97ce-e15a183f6542".to_string(),
+                "https://tos.example/adapters-v1/01a09a15-19e2-76f0-97ce-e15a183f6542/01a09a15-19e2-76f0-97ce-e15a183f6542.tar.zst?X-Amz-Signature=cafebabe".to_string(),
+            ),
+        ]
+    }
+
+    #[test]
+    fn exact_name_wins() {
+        assert_eq!(resolve_alias(&cands(), "glm52-fp8-official"), AliasResolution::Found("glm52-fp8-official"));
+    }
+
+    #[test]
+    fn url_without_query_resolves() {
+        let url = "https://tos.example/adapters-v1/01a099cf-51a4-7190-9b41-fdf0010c1c0e/01a099cf-51a4-7190-9b41-fdf0010c1c0e.tar.zst";
+        match resolve_alias(&cands(), url) {
+            AliasResolution::Found(n) => assert!(n.starts_with("https://tos.example")),
+            other => panic!("expected exact-path match, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn url_with_stale_signature_resolves_by_path() {
+        // Fresh load carries a *different* signature than the registered one.
+        let fresh = "https://tos.example/adapters-v1/01a099cf-51a4-7190-9b41-fdf0010c1c0e/01a099cf-51a4-7190-9b41-fdf0010c1c0e.tar.zst?X-Amz-Signature=0123456789";
+        match resolve_alias(&cands(), fresh) {
+            AliasResolution::Found(n) => assert!(n.contains("01a099cf")),
+            other => panic!("expected path match ignoring query, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unique_uuid_fragment_resolves() {
+        match resolve_alias(&cands(), "01a099cf-51a4-7190-9b41-fdf0010c1c0e") {
+            AliasResolution::Found(n) => assert!(n.contains("01a099cf")),
+            other => panic!("expected uuid match, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ambiguous_fragment_is_reported() {
+        // "tos.example/adapters-v1" is a substring of two entries.
+        match resolve_alias(&cands(), "adapters-v1") {
+            AliasResolution::Ambiguous(v) => assert_eq!(v.len(), 2),
+            other => panic!("expected ambiguity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_is_not_found() {
+        assert_eq!(resolve_alias(&cands(), "01a0ffff-0000-0000-0000-000000000000"), AliasResolution::NotFound);
+        assert_eq!(resolve_alias(&cands(), ""), AliasResolution::NotFound);
+    }
 }

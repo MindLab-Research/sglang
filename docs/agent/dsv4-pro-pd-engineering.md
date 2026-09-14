@@ -201,7 +201,7 @@ PD 分离引入的异步 poll 循环与集合通信交错，产生一族"health 
 per-rank 清理耗时不同：快 rank 进入下一轮 `recv_requests` 的 **broadcast**、
 慢 rank 还在 `pop_transferred` 的 **all_reduce**——两者共用 `attn_tp_cpu_group`，
 gloo FIFO 把异构 collective 互相匹配 → 8 rank 全卡死。
-py-spy：TP0/TP3 卡 `_padded_all_reduce_min`，TP5 卡 broadcast。
+py-spy（**当时有在飞请求停滞**，见 AGENTS.md §8 诊断铁律）：TP0/TP3 卡 `_padded_all_reduce_min`，TP5 卡 broadcast。
 修复：`torch.distributed.new_group(backend="gloo")` 专用组给
 DecodeTransferQueue/DecodePreallocQueue/PrefillBootstrapQueue——poll 序列与
 broadcast/barrier 序列隔离，跨组时序漂移无害。

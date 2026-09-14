@@ -291,3 +291,39 @@ curl -X POST http://10.0.0.75:30100/unload_lora_adapter -H "Authorization: Beare
 - 槽位：`max-loaded-loras 3`（base 不计入，只计 LoRA）
 - 引擎注册 key = path；runtime 请求带 `lora_path` 直接命中，decode 对未知 path 报 "never been loaded"
 - 代码：`sgl-model-gateway/src/control_plane/deploy.rs`、`server.rs:882`；引擎侧 `python/sglang/srt/managers/io_struct.py`
+
+---
+
+## 7. smg DELETE 的别名兼容 + 两个实测坑（2026-09-13）
+
+### 7.1 DELETE 现在接受三种引用（以前只有注册名能用）
+```bash
+CK=$SMG_CONTROL_KEY; BASE=http://127.0.0.1:31000
+# ① 注册名
+curl -X DELETE -H "Authorization: Bearer $CK" "$BASE/v1/control/models/lora-<uuid>-v<uuid>"
+# ② 权重 URL（带签名 / 不带签名 / 签名已过期都能按 path 匹配）
+curl -X DELETE -H "Authorization: Bearer $CK" "$BASE/v1/control/models/https://tos-mint-ckpt…/adapters-v1/<uuid>/<uuid>.tar.zst"
+# ③ 只给 adapter uuid（唯一命中时）
+curl -X DELETE -H "Authorization: Bearer $CK" "$BASE/v1/control/models/<uuid>"
+```
+- 同一 adapter 被 URL 名与派生名各注册一次时，按 uuid 删会命中两条 → **409 `ambiguous_model_reference` + `candidates`**，用候选里的名字再删一次。
+- **路由是 catch-all `{*name}`**：URL 里带 `/`，单段 `{name}` 根本进不了 handler（旧版表现为路由级 404 / 0.7ms）。
+- 附带加固：`DRAINING` 或 `inflight==0` 的条目走快路径（不再每次重试白等 `DRAIN_TIMEOUT_SECS=1800s`）；引擎 unload 加 **15s 上限**（引擎挂死不再阻塞 registry 释放）。
+
+### 7.2 坑一：decode 引擎对 unload 请求**完全不响应**
+实测同一条 `POST /unload_lora_adapter {"lora_name": "<未知 URL>"}`：
+- prefill(30100)：**400，2ms**（"LoRA with name … not found"，正常）
+- decode(30200)：**无任何响应**（10s/12s/15s 均超时，HTTP 000）
+
+⇒ 旧版 smg 的 deploy client 超时 3600s ⇒ **DELETE 阻塞最多 1 小时**；调用方先断开 → 任务被取消 → 条目**永久停在 DRAINING**（生产上真实发生过，两条 DELETE 尝试都没清掉）。这是**引擎侧 bug**，尚未修；smg 侧已用 15s 上限兜住。
+
+### 7.3 坑二：⛔ 验证 LoRA 注册/删除**绝不要用远端 URL 探针**
+为验证"用 URL 删除"，曾注册一个 fake URL（`…/adapters-v1/01a0dead-beef-…tar.zst`）——**引擎会真去下载它**：8 个 TP rank **逐个**跑
+`curl -sfL --retry 8 --retry-delay 3 --retry-all-errors --connect-timeout 10`，把引擎的加载路径串行占满，**期间 `/health_generate`=000、经 smg 的 chat 超时**（`/health`、`/v1/models`、`/metrics` 仍 200，极易误判成"引擎正常"）。
+
+```bash
+# ✅ 正确做法：用本地不存在的路径（秒失败，不触发下载重试）
+curl -X POST …/v1/control/models -d '{"name":"probe","type":"lora","path":"/nonexistent/probe.tar.zst"}'
+# ❌ 错误做法：远端 fake URL（会触发 8 rank × curl --retry 8 的串行下载）
+```
+判据：`tail -f <prefill log> | grep -E "downloading lora|loading completes"` 看 rank 逐个推进；恢复时间 ≈ rank 数 × 单次下载重试时长（约 30s/rank）。

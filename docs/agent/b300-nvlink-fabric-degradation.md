@@ -47,7 +47,9 @@
 ```
 历时累计（`uptime≈3.9天`，机器从未重启，只重启过容器，dmesg 跨多天累计）。
 
-### 3.3 py-spy 实锤 decode 卡在 GPU 组内通信（非网络）
+### 3.3 py-spy 显示 decode 停在 GPU 组内通信（非网络）
+
+> ⛔ **前提（2026-09-13 更正）**：本节结论成立是因为**同时**具备：有在飞请求停滞 + NVLink/Xid 事件 + TCP 层干净。**单凭 py-spy 快照不得下"卡死"结论** —— 空闲服务里线程停在 collective/semaphore 是正常待命态。详见 `AGENTS.md` §8 诊断铁律。
 ```
 decode pid=951 (MainThread active+gil):
     all_reduce (torch/distributed/distributed_c10d.py:3068)

@@ -227,7 +227,13 @@ curl -H 'Authorization: Bearer sk-control-pd-2026' \
   http://8.213.214.14:18888/v1/control/jobs/{job_id}/result -o result.json
 ```
 
-job 未完成时返回 `409 Conflict`（提示先轮询）。
+**任何时候都可以下载**（运行中也可以）：
+
+- 已完成/已取消的任务 → 给出**持久化结果**；
+- 运行中的任务 → 给出**内存里的实时 partial 快照**（截至当前已生成的 `output_text` + `output_ids` + 逐 token logprobs），可用它做 partial rollout 的"先训已生成 prefix"；
+- 响应里的 `status` 字段标明这批结果是终态（`completed` / `partial` / `cancelled` / `failed`）还是仍在跑（`running` / `queued`）。尚无任何 token 的运行中任务不会出现在 `results` 里。
+
+⚠️ 返回 `409 Conflict` 的是**单个任务**端点（下面 5.2）：该任务未完成时才会 409。**整个 job 的 result 不再 409。**
 
 ### 5.2 单个任务
 
@@ -235,6 +241,8 @@ job 未完成时返回 `409 Conflict`（提示先轮询）。
 curl -H 'Authorization: Bearer sk-control-pd-2026' \
   http://8.213.214.14:18888/v1/control/jobs/{job_id}/tasks/{task_id}/result -o task.json
 ```
+
+任务未完成时返回 `409 Conflict`（提示先轮询 status）；已取消的任务返回空 `samples`。
 
 ### 5.3 结果结构（核心）
 

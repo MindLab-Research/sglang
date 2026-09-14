@@ -884,7 +884,12 @@ pub fn build_app(
                 .post(control_plane::deploy::deploy_model),
         )
         .route(
-            "/v1/control/models/{name}",
+            // Catch-all (`{*name}`): the LoRA delete API is also driven by
+            // weights URLs, which contain '/'. A single-segment `{name}` never
+            // matched them, so DELETE returned a router-level 404 in 0.7ms and
+            // the entry could not be released. delete_model resolves the
+            // captured reference (name / URL / adapter uuid) itself.
+            "/v1/control/models/{*name}",
             delete(control_plane::deploy::delete_model),
         )
         .route("/v1/control/units", get(control_plane::get_units))

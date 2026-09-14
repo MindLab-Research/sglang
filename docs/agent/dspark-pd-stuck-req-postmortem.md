@@ -165,7 +165,7 @@ ACK` 计数都是 0——**痕迹早已滚出日志窗口**（日志轮转/时�
 | 维度 | collective 死锁（前五案） | 本案（hidden pool wedge） |
 |---|---|---|
 | 影响范围 | 全部请求 | 个别请求起，逐步扩大 |
-| py-spy 形态 | 8 rank 卡同一/错位 collective | 一切正常，请求在队列里 spin |
+| py-spy 形态（**须在有在飞请求且停滞时判定**，空闲态线程等待=正常） | 8 rank 卡同一/错位 collective | 一切正常，请求在队列里 spin |
 | 日志 | health 200 + 请求全超时 | health 200 + 个别请求超时 |
 | 根因类型 | collective 序列跨 rank 错位 | 资源生命周期 + 时序倒置 |
 | 修复域 | gloo 组/poll 异常安全 | 纯资源管理（decode 本地） |
