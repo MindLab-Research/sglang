@@ -512,6 +512,82 @@ impl JobManager {
         Err(format!("could not tokenize the source prompt: {last_err}"))
     }
 
+    /// Mark a task failed before any sample was produced (pre-flight failures:
+    /// adapter missing, input resolution error).
+    async fn fail_task_preflight(&self, job: &Arc<Job>, task_id: &str, err: String) {
+        {
+            let mut tasks = job.tasks.write().await;
+            if let Some(t) = tasks.iter_mut().find(|t| t.task_id == task_id) {
+                t.status = TaskStatus::Failed;
+                t.error = Some(err.clone());
+            }
+        }
+        tracing::warn!("jobs: task {} pre-flight failed: {}", task_id, err);
+        self.persist_job(job);
+    }
+
+    /// Verify that every engine has the adapter loaded.
+    ///
+    /// PD caveat this guards against: an adapter that is missing on one engine
+    /// makes the request hang in `KVPoll.Bootstrapping` until the 600s bootstrap
+    /// timeout (decode cannot allocate KV / send KV indices without it), and the
+    /// engines deliberately refuse to reload adapters inside a request. Failing
+    /// the task here turns a 10-minute silent stall into an actionable error.
+    async fn ensure_lora_loaded(&self, lora_path: &str) -> Result<(), String> {
+        if self.engine_urls.is_empty() {
+            // Nothing to check against: keep working (the engine fails fast on
+            // its own now) rather than blocking every adapter task.
+            return Ok(());
+        }
+        let mut missing: Vec<String> = Vec::new();
+        for url in &self.engine_urls {
+            match self.engine_has_lora(url, lora_path).await {
+                Ok(true) => {}
+                Ok(false) => missing.push(url.clone()),
+                Err(e) => return Err(format!("could not verify adapter on {url}: {e}")),
+            }
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "LoRA adapter is not loaded on {} of {} engine(s): {}. A PD request for a \
+             missing adapter hangs until the bootstrap timeout (600s). Load it on every \
+             engine first:\n  POST <engine>/load_lora_adapter \
+             {{\"lora_name\": \"{lora_path}\", \"lora_path\": \"{lora_path}\"}}\n\
+             and resubmit afterwards.",
+            missing.len(),
+            self.engine_urls.len(),
+            missing.join(", ")
+        ))
+    }
+
+    /// Does `base`'s `/v1/models` list `lora_path`? (Engines register an adapter
+    /// under the path they were given.)
+    async fn engine_has_lora(&self, base: &str, lora_path: &str) -> Result<bool, String> {
+        let url = format!("{}/v1/models", base.trim_end_matches('/'));
+        let mut builder = self.client.get(&url).timeout(Duration::from_secs(10));
+        if let Some(key) = &self.api_key {
+            builder = builder.bearer_auth(key);
+        }
+        let resp = builder.send().await.map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            return Err(format!("status {}", resp.status()));
+        }
+        let doc: Value = resp.json().await.map_err(|e| e.to_string())?;
+        let has = doc
+            .get("data")
+            .and_then(|d| d.as_array())
+            .map(|arr| {
+                arr.iter().any(|m| {
+                    m.get("id").and_then(|v| v.as_str()) == Some(lora_path)
+                        || m.get("root").and_then(|v| v.as_str()) == Some(lora_path)
+                })
+            })
+            .unwrap_or(false);
+        Ok(has)
+    }
+
     /// Source tasks a resume reference selects, in submission order.
     async fn select_resume_sources(
         &self,
@@ -843,20 +919,27 @@ impl JobManager {
                 }
             }
         }
+        // Pre-flight the adapter before anything is registered. In PD an
+        // adapter that is missing on any engine makes the request hang in
+        // KVPoll.Bootstrapping until the 600s bootstrap timeout (the decode
+        // engine cannot allocate KV / send its KV indices until it has the
+        // adapter, and the engines no longer reload implicitly inside a
+        // request). Fail the task immediately with the exact remediation
+        // instead of burning the timeout.
+        if let Some(lora_path) = req.lora_path.clone() {
+            if let Err(err) = self.ensure_lora_loaded(&lora_path).await {
+                self.fail_task_preflight(&job, &task_id, err).await;
+                return;
+            }
+        }
+
         // Resolve the exact token input before anything is registered: a
         // `continue_from` task may need an engine tokenizer call, and a failure
         // here must fail the task without producing a (misleading) sample.
         let input_ids = match self.resolve_input_ids(&req).await {
             Ok(ids) => ids,
             Err(err) => {
-                let mut tasks = job.tasks.write().await;
-                if let Some(t) = tasks.iter_mut().find(|t| t.task_id == task_id) {
-                    t.status = TaskStatus::Failed;
-                    t.error = Some(err.clone());
-                }
-                drop(tasks);
-                tracing::warn!("jobs: task {} input resolution failed: {}", task_id, err);
-                self.persist_job(&job);
+                self.fail_task_preflight(&job, &task_id, err).await;
                 return;
             }
         };
