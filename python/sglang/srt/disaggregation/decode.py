@@ -725,7 +725,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 error_msg = f"Could not fetch prefill parallel info from {bootstrap_addr} after {count} attempts"
                 logger.error(error_msg)
                 for decode_req in reqs:
-                    decode_req.kv_receiver.abort()
+                    decode_req.kv_receiver.abort() if decode_req.kv_receiver is not None else None
                 del self._ensure_retry_count[bootstrap_addr]
                 del self._ensure_last_attempt_time[bootstrap_addr]
             else:

@@ -1992,8 +1992,11 @@ class DeepseekV2AttentionMLA(
 
     def rebuild_cp_kv_cache(self, latent_cache, forward_batch, k_nope, k_pe):
         # support allgather+rerrange
-        latent_cache[..., : self.kv_lora_rank] = k_nope.squeeze(1)
-        latent_cache[..., self.kv_lora_rank :] = k_pe.squeeze(1)
+        # Fix (2026-08-20): clone inputs to break view-alias with latent_cache.
+        # PyTorch rejects slice write when k_nope/k_pe share memory with latent_cache
+        # (CP path: "unsupported operation: input tensor and written-to tensor refer to a single memory location").
+        latent_cache[..., : self.kv_lora_rank] = k_nope.squeeze(1).clone()
+        latent_cache[..., self.kv_lora_rank :] = k_pe.squeeze(1).clone()
         latent_cache_output = cp_all_gather_rerange_output(
             latent_cache.contiguous(),
             self.cp_size,

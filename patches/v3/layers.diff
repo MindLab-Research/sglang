@@ -1,0 +1,120 @@
+46a47,55
+>         if hasattr(self.base_layer, "reduce_results"):
+>             self.reduce_results = self.base_layer.reduce_results
+>         # Alias remaining base-layer parameters onto the wrapper so
+>         # `named_parameters(remove_duplicate=True)` yields them at the outer
+>         # path — weight loaders (e.g. FusedMoE's `w13_weight_packed`) lookup
+>         # names without the `.base_layer.` segment.
+>         for _name, _param in base_layer.named_parameters(recurse=False):
+>             if not hasattr(self, _name):
+>                 setattr(self, _name, _param)
+213,214c222,224
+<         # Apply LoRA if configured
+<         if self.set_lora:
+---
+>         # Apply LoRA if configured. Skip if no batch_info (DP-attention idle
+>         # forward): the base path is correct because no real tokens need LoRA.
+>         if self.set_lora and self.lora_backend.batch_info is not None:
+379,380c389,390
+<         # Apply LoRA if set
+<         if self.set_lora:
+---
+>         # Apply LoRA if set. Skip in DP-attention idle forward (batch_info unset).
+>         if self.set_lora and self.lora_backend.batch_info is not None:
+469c479
+<         if self.set_lora:
+---
+>         if self.set_lora and self.lora_backend.batch_info is not None:
+482a493,496
+>         # See RowParallelLinearWithLoRA.slice_lora_a_weights for why base_layer.tp_rank
+>         # is authoritative: DP-attention makes output_partition_sizes attn_tp-local while
+>         # the caller passes global tp_rank.
+>         local_tp_rank = getattr(self.base_layer, "tp_rank", tp_rank)
+484,485c498,499
+<         start_idx = tp_rank * shard_size
+<         end_idx = (tp_rank + 1) * shard_size
+---
+>         start_idx = local_tp_rank * shard_size
+>         end_idx = (local_tp_rank + 1) * shard_size
+578a593,595
+>         # base_layer.tp_rank is authoritative under DP-attention: the caller passes
+>         # the global tp_rank but output_partition_sizes is attn_tp-local.
+>         local_tp_rank = getattr(self.base_layer, "tp_rank", tp_rank)
+584c601
+<             start_idx = tp_rank * part_size
+---
+>             start_idx = local_tp_rank * part_size
+650a668,670
+>         # See RowParallelLinearWithLoRA.slice_lora_a_weights for why base_layer.tp_rank
+>         # is authoritative under DP-attention.
+>         local_tp_rank = getattr(base_layer, "tp_rank", tp_rank)
+652c672
+<         q_start_idx = q_proj_shard_size * tp_rank
+---
+>         q_start_idx = q_proj_shard_size * local_tp_rank
+655c675
+<         kv_shard_id = tp_rank // num_kv_head_replicas
+---
+>         kv_shard_id = local_tp_rank // num_kv_head_replicas
+737c757,759
+<         if self.set_lora and should_reduce:
+---
+>         # LoRA skipped when batch_info is None (DP-attention idle forward).
+>         have_batch_info = self.lora_backend.batch_info is not None
+>         if self.set_lora and have_batch_info and should_reduce:
+751c773
+<             if self.set_lora:
+---
+>             if self.set_lora and have_batch_info:
+761a784,789
+>         # Use base_layer.tp_rank (not the argument) so the slicing rank matches
+>         # the partition group the base layer was built on. For MLA o_proj under
+>         # DP-attention, base_layer.tp_rank is attn_tp_rank while the caller
+>         # passes the global tp_rank; input_size_per_partition is already
+>         # attn_tp-sized, so using global tp_rank overshoots to empty.
+>         local_tp_rank = getattr(self.base_layer, "tp_rank", tp_rank)
+763,764c791,792
+<         start_idx = tp_rank * shard_size
+<         end_idx = (tp_rank + 1) * shard_size
+---
+>         start_idx = local_tp_rank * shard_size
+>         end_idx = (local_tp_rank + 1) * shard_size
+850c878
+<         if self.set_lora:
+---
+>         if self.set_lora and self.lora_backend.batch_info is not None:
+885a914,920
+>         # Forward for the model's own forward-path dispatch — the outer model
+>         # reads several FusedMoE attributes (e.g. `self.experts.moe_runner_config`,
+>         # `self.experts.dispatcher`, `self.experts.num_local_experts`,
+>         # `self.experts.quant_method`) directly on the wrapper. Quant
+>         # post-processing iterators skip LoRA wrappers via
+>         # `isinstance(module, BaseLayerWithLoRA)` so the packed params on the
+>         # inner FusedMoE get processed there, not here.
+892a928,929
+>         if hasattr(base_layer, "scheme"):
+>             self.scheme = base_layer.scheme
+916a954,959
+>         elif (
+>             hasattr(base_layer, "scheme")
+>             and hasattr(base_layer.scheme, "runner")
+>             and base_layer.scheme.runner is not None
+>         ):
+>             runner_backend = base_layer.scheme.runner.runner_backend
+951a995,1003
+>         elif runner_backend.is_aiter():
+>             # AITER fused_moe doesn't expose intermediates, so we apply
+>             # LoRA as a post-hoc residual on the fused_moe output.
+>             assert base_layer.quant_method is not None, "Quant method must be set"
+>             aiter_qi = base_layer.quant_method.maybe_get_hip_aiter_quant_info(base_layer)
+>             if aiter_qi is not None:
+>                 self._quant_info = aiter_qi
+>             else:
+>                 self._quant_info = base_layer.quant_method.get_triton_quant_info(base_layer)
+1026a1079,1080
+>         if self.lora_backend.batch_info is None:
+>             return self.base_layer.forward(hidden_states, topk_output, **kwargs)
+1053a1108,1110
+>         quant_info.expert_map = getattr(
+>             base_layer.dispatcher, "local_expert_mapping", None
+>         )

@@ -92,6 +92,9 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
+from sglang.srt.mem_cache.cp_layersplit_pool import (
+    cp_layersplit_broadcast_prefix_if_needed,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
@@ -562,6 +565,9 @@ class Indexer(MultiPlatformOp):
                 key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
             )
 
+        if positions.dim() != 2 or positions.stride(1) != 1:
+            print(f"[DSA-DEBUG] q_k positions dim={positions.dim()} shape={list(positions.shape)} stride={list(positions.stride())} numel={positions.numel()}", flush=True)
+            positions = positions.reshape(1, -1).clone(memory_format=torch.contiguous_format)
         q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
 
         self._update_rope_guarded(query[..., : self.rope_head_dim], q_rope)
@@ -621,6 +627,9 @@ class Indexer(MultiPlatformOp):
             key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
         )
 
+        if positions.dim() != 2 or positions.stride(1) != 1:
+            print(f"[DSA-DEBUG] k positions dim={positions.dim()} shape={list(positions.shape)} stride={list(positions.stride())} numel={positions.numel()}", flush=True)
+            positions = positions.reshape(1, -1).clone(memory_format=torch.contiguous_format)
         _, k_rope = self.rotary_emb(positions, k_rope, k_rope)
         self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)
         key = rotate_activation(key)
@@ -1828,6 +1837,8 @@ class Indexer(MultiPlatformOp):
                 weights = self._apply_q_scale_and_softmax_scale(weights, q_scale)
             else:
                 weights = self._get_logits_head_gate(x_for_gate, q_scale)
+
+        cp_layersplit_broadcast_prefix_if_needed(layer_id, forward_batch, "indexer")
 
         if _is_cuda or _is_hip:
             # In piecewise/breakable CUDA graph, any access to seq_lens_cpu

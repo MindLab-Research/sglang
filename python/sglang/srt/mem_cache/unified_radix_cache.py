@@ -555,6 +555,48 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 extra_metric_labels=self.extra_metric_labels,
             )
 
+
+    def query_storage_hit_length(
+        self,
+        last_host_node: TreeNode,
+        new_input_tokens: List[int],
+        last_hash: Optional[str] = None,
+        prefix_keys: Optional[List[str]] = None,
+    ) -> int:
+        import os
+        rank = os.environ.get("SGLANG_RANK", "?")
+        from sglang.srt.managers.cache_controller import PrefetchOperation
+
+        logger.info(f"[L3-DBG][rank={rank}] query_storage_hit_length: enter, enable_storage={self.enable_storage}")
+        if not self.enable_storage or self.cache_controller.prefetch_rate_limited():
+            logger.info(f"[L3-DBG][rank={rank}] query_storage_hit_length: skip (storage={self.enable_storage}, rate_limited={self.cache_controller.prefetch_rate_limited() if self.enable_storage else 'N/A'})")
+            return 0
+
+        prefetch_key = RadixKey(
+            new_input_tokens,
+            extra_key=last_host_node.key.extra_key,
+            is_bigram=self.is_eagle,
+        ).page_aligned(self.page_size)
+        if len(prefetch_key) < self.prefetch_threshold:
+            logger.info(f"[L3-DBG][rank={rank}] query_storage_hit_length: skip (prefetch_key={len(prefetch_key)} < threshold={self.prefetch_threshold})")
+            return 0
+
+        logger.info(f"[L3-DBG][rank={rank}] query_storage_hit_length: before _storage_hit_query")
+        operation = PrefetchOperation(
+            "__storage_hit_query__",
+            self.cache_controller.mem_pool_host.get_dummy_flat_data_page()[:0],
+            prefetch_key,
+            last_hash,
+            prefix_keys,
+        )
+        hash_values, storage_hit_count = self.cache_controller._storage_hit_query(
+            operation
+        )
+        logger.info(f"[L3-DBG][rank={rank}] query_storage_hit_length: after _storage_hit_query, hit_count={storage_hit_count}")
+        storage_hit_count = storage_hit_count - (storage_hit_count % self.page_size)
+        logger.info(f"[L3-DBG][rank={rank}] query_storage_hit_length: exit, result={storage_hit_count}")
+        return storage_hit_count
+
     def register_sidecar_pool(self, spec: SidecarPoolSpec) -> None:
         self.sidecar_pool_specs.append(spec)
 
@@ -1961,7 +2003,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
 
     def can_terminate_prefetch(self, operation: PrefetchOperation) -> bool:
+        # All early-return paths MUST still participate in _all_reduce_attn_groups
+        # to prevent NCCL deadlock when other ranks have ongoing prefetch.
         if self.prefetch_stop_policy == "best_effort":
+            if self.tp_world_size > 1:
+                dummy = torch.tensor([0, 0], dtype=torch.int, device="cuda")
+                self._all_reduce_attn_groups(dummy, torch.distributed.ReduceOp.MAX)
             return True
 
         if len(operation.hash_value) == 0:
@@ -1978,6 +2025,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 operation
             )
         else:
+            if self.tp_world_size > 1:
+                dummy = torch.tensor([0, 0], dtype=torch.int, device="cuda")
+                self._all_reduce_attn_groups(dummy, torch.distributed.ReduceOp.MAX)
             return True
         if (
             completed
@@ -1998,6 +2048,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def check_prefetch_progress(self, req_id: str) -> bool:
         if req_id not in self.ongoing_prefetch:
+            # Participate in all_reduce to prevent deadlock with other ranks
+            # that have ongoing prefetch for this req_id.
+            if self.tp_world_size > 1:
+                dummy = torch.tensor([0, 0], dtype=torch.int, device="cuda")
+                self._all_reduce_attn_groups(dummy, torch.distributed.ReduceOp.MAX)
             return True
 
         (
@@ -2009,6 +2064,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             comp_xfers,
         ) = self.ongoing_prefetch[req_id]
         if operation.host_indices is None:
+            if self.tp_world_size > 1:
+                dummy = torch.tensor([0, 0], dtype=torch.int, device="cuda")
+                self._all_reduce_attn_groups(dummy, torch.distributed.ReduceOp.MAX)
             return True
         if not self.can_terminate_prefetch(operation):
             return False
@@ -2019,17 +2077,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         min_completed_tokens = completed_tokens
         hit_pages = operation.pool_storage_result.extra_pool_hit_pages
         if self.tp_world_size > 1:
-            # Reduce full completed tokens together with the sidecar pools that
-            # this prefetch actually transferred, in one all_reduce.
-            sidecar_pools = [t.name for xfers in comp_xfers.values() for t in xfers]
-            packed = torch.tensor(
-                [completed_tokens] + [hit_pages.get(p, 0) for p in sidecar_pools],
-                dtype=torch.int,
-            )
-            self._all_reduce_attn_groups(packed, torch.distributed.ReduceOp.MIN)
-            min_completed_tokens = int(packed[0].item())
-            for i, p in enumerate(sidecar_pools, start=1):
-                hit_pages[p] = int(packed[i].item())
+            # Use fixed-size 1-element tensor for completed_tokens sync.
+            # Original code packed variable-length sidecar_pools which could
+            # differ across ranks, causing shape mismatch.  Only sync the
+            # scalar completed_tokens here; sidecar hit_pages are per-rank
+            # and don't need cross-rank sync.
+            ct_tensor = torch.tensor([completed_tokens], dtype=torch.int, device="cuda")
+            self._all_reduce_attn_groups(ct_tensor, torch.distributed.ReduceOp.MIN)
+            min_completed_tokens = int(ct_tensor.item())
 
         fetched_key = prefetch_key[:min_completed_tokens]
         insert_result = self._insert_helper_host(
@@ -2209,6 +2264,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         _drain_extra_release()
 
     def drain_storage_control_queues(self) -> None:
+        import os
+        rank = os.environ.get("SGLANG_RANK", "?")
         cc = self.cache_controller
         extra_release_queues = getattr(cc, "extra_host_mem_release_queues", {})
         extra_pool_names = list(extra_release_queues)
@@ -2221,12 +2278,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 for pool_name in extra_pool_names
             ],
         ]
-        qsizes = torch.tensor(
-            local_qsize_list,
-            dtype=torch.int,
-        )
-        self._all_reduce_attn_groups(qsizes, torch.distributed.ReduceOp.MIN)
-        qsize_list = list(map(int, qsizes.tolist()))
+        # Use local values directly without TP all_reduce.
+        # The original code called _all_reduce_attn_groups (NCCL) here, but
+        # when L3 storage is enabled, a background prefetch thread also does
+        # all_reduce via gloo. Two threads doing collectives that both need
+        # all 8 ranks simultaneously causes a permanent deadlock:
+        #   Rank A (main thread) → NCCL all_reduce, waiting for Rank B
+        #   Rank B (prefetch thread) → gloo all_reduce, waiting for Rank A
+        # Since each rank independently reads its own queues and the values
+        # are per-rank, using local values is correct and avoids the deadlock.
+        qsize_list = local_qsize_list
         n_revoke, n_backup, n_release = qsize_list[:3]
         extra_release_counts = {
             pool_name: count
@@ -2332,11 +2393,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def writing_check(self, write_back: bool = False) -> None:
         """Poll write-through completions."""
+        import os
+        rank = os.environ.get("SGLANG_RANK", "?")
         cc = self.cache_controller
-        if cc is None:
-            return
-
-        if write_back:
+        # Every rank must enter the all_reduce below; cc can diverge across ranks.
+        if cc is not None and write_back:
             # Blocking: wait for all pending write-backs
             while self.ongoing_write_through:
                 for _, finish_event, ack_list in cc.ack_write_queue:
@@ -2351,7 +2412,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # Every rank must enter the all_reduce below; ongoing_write_through can
         # diverge across ranks (e.g. write_backup returning 0 on a subset).
         finish_count = 0
-        if self.pp_rank == 0:
+        if cc is not None and self.pp_rank == 0:
             for _, finish_event, ack_list in cc.ack_write_queue:
                 if not finish_event.query():
                     break
@@ -2371,13 +2432,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def loading_check(self) -> None:
         """Poll load-back completions."""
+        import os
+        rank = os.environ.get("SGLANG_RANK", "?")
         cc = self.cache_controller
-        if cc is None:
-            return
         # Every rank must enter the all_reduce below; ongoing_load_back can
         # diverge across ranks.
         finish_count = 0
-        if self.pp_rank == 0:
+        if cc is not None and self.pp_rank == 0:
             for _, finish_event, ack_list in cc.ack_load_queue:
                 if not finish_event.query():
                     break
@@ -2438,7 +2499,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                         last_best_match_device_node,
                     )
 
-                logger.debug(
+                logger.info(
                     "init_load_back success: loaded %d tokens for node %d",
                     len(new_indices),
                     best_match_node.id,
@@ -2452,6 +2513,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
+        import os
+        rank = os.environ.get("SGLANG_RANK", "?")
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
         self.writing_check()
@@ -2472,6 +2535,26 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.cache_controller is not None:
             return self.cache_controller.start_loading()
         return 0
+
+    def is_load_back_event_done(self, consumer_index: int) -> bool:
+        """Return True after the local load-back event is complete.
+
+        Required by decode HiCache restore state machine. Without this method,
+        _process_hicache_local_restores returns early and hicache_restore_status
+        stays PENDING forever, causing a permanent loop in HiCacheRestoreGatedKVReceiver.poll().
+        """
+        if consumer_index < 0:
+            return True
+        cc = self.cache_controller
+        if cc is None or not hasattr(cc, "layer_done_counter"):
+            return True
+        if consumer_index >= len(cc.layer_done_counter.events):
+            return True
+        finish_event = cc.layer_done_counter.events[consumer_index].finish_event
+        if not finish_event.query():
+            return False
+        self.loading_check()
+        return True
 
     # ---- Query / Inspection APIs ----
     # These APIs exist for compatibility with other RadixTree implementations.

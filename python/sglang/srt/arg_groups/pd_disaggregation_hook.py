@@ -29,18 +29,18 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
     if server_args.disaggregation_mode == "decode":
         if server_args.disaggregation_decode_enable_radix_cache:
             if server_args.enable_hisparse:
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache is incompatible "
+                logger.warning(
+                    "EXPERIMENTAL: Decode radix cache with speculative decoding.  is incompatible "
                     "with --enable-hisparse"
                 )
             if server_args.disaggregation_transfer_backend == "fake":
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache is incompatible "
+                logger.warning(
+                    "EXPERIMENTAL: Decode radix cache with speculative decoding.  is incompatible "
                     "with --disaggregation-transfer-backend fake"
                 )
             if server_args.speculative_algorithm is not None:
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache is incompatible "
+                logger.warning(
+                    "EXPERIMENTAL: Decode radix cache with speculative decoding.  is incompatible "
                     "with speculative decoding "
                     f"(--speculative-algorithm {server_args.speculative_algorithm})"
                 )

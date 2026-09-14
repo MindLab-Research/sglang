@@ -55,6 +55,9 @@ from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_output,
     cp_split_and_rebuild_position,
 )
+from sglang.srt.mem_cache.cp_layersplit_pool import (
+    cp_layersplit_broadcast_prefix_if_needed,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -687,15 +690,17 @@ class DeepseekSparseAttnBackend(
 
         cache_seqlens_int32 = (forward_batch.seq_lens + draft_token_num).to(torch.int32)
         cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
-        if forward_batch.seq_lens_cpu is not None:
+        if forward_batch.seq_lens_cpu is not None and forward_batch.seq_lens_cpu.numel() > 0:
             max_seqlen_k = int(
                 forward_batch.seq_lens_cpu.max().item() + draft_token_num
             )
-        else:
+        elif forward_batch.seq_lens is not None and forward_batch.seq_lens.numel() > 0:
             # needs_cpu_seq_lens=False nulls the host mirror for spec-v2 relay
             # batches; graph replay uses the static page-table width, so only this
             # eager (e.g. over-capture-bs) fallback needs a length here.
             max_seqlen_k = int(forward_batch.seq_lens.max().item()) + draft_token_num
+        else:
+            max_seqlen_k = 1
         # [b, max_seqlen_k]
         page_table = self.req_to_token_pool.req_to_token[
             forward_batch.req_pool_indices, :max_seqlen_k
@@ -1773,6 +1778,10 @@ class DeepseekSparseAttnBackend(
                 forward_batch=forward_batch,
                 metadata=metadata,
             )
+
+        cp_layersplit_broadcast_prefix_if_needed(
+            layer.layer_id, forward_batch, "latent"
+        )
 
         # Do absorbed multi-latent attention (MLA path)
         assert q_rope is not None

@@ -1,0 +1,80 @@
+205a206,284
+> 
+>         # Apply LoRA residual: compute LoRA delta independently and add to base output.
+>         # This is an approximation since AITER fused_moe doesn't expose intermediates
+>         # (gate_up output, activation output). We compute the full LoRA path separately:
+>         #   lora_out = down(act(gate_up_lora(x)))
+>         # and add it as a residual to the AITER base output.
+>         if hooks is not None and (
+>             hooks.after_gate_up is not None or hooks.after_down is not None
+>         ):
+>             import sglang.srt.layers.moe.topk as _topk_mod
+> 
+>             hidden_states = runner_input.hidden_states
+>             topk_ids = runner_input.topk_ids
+>             topk_weights = runner_input.topk_weights
+>             num_tokens = hidden_states.shape[0]
+>             topk = topk_ids.shape[-1]
+>             hidden_dim = hidden_states.shape[-1]
+>             inter_dim = self.config.intermediate_size_per_partition
+>             gate_up_dim = 2 * inter_dim
+> 
+>             # Step 1: Compute LoRA gate_up delta into a zero tensor
+>             lora_gate_up = torch.zeros(
+>                 num_tokens * topk,
+>                 gate_up_dim,
+>                 device=hidden_states.device,
+>                 dtype=hidden_states.dtype,
+>             )
+>             if hooks.after_gate_up is not None:
+>                 hooks.after_gate_up(
+>                     hidden_states,
+>                     lora_gate_up.view(num_tokens, topk, gate_up_dim),
+>                     topk_weights,
+>                     topk_ids,
+>                 )
+> 
+>             # Step 2: Apply activation (silu_and_mul) to the LoRA gate_up delta
+>             try:
+>                 from sgl_kernel import silu_and_mul
+>             except ImportError:
+>                 from sglang.jit_kernel.activation import silu_and_mul
+> 
+>             lora_act = torch.empty(
+>                 num_tokens * topk,
+>                 inter_dim,
+>                 device=hidden_states.device,
+>                 dtype=hidden_states.dtype,
+>             )
+>             silu_and_mul(lora_gate_up, lora_act)
+> 
+>             # Step 3: Compute LoRA down delta and add to base output
+>             if hooks.after_down is not None:
+>                 # Prepare a zero tensor for the down output delta
+>                 # For no_combine=False, output shape is (num_tokens, hidden_dim)
+>                 # We need the per-expert contribution: (num_tokens, topk, hidden_dim)
+>                 lora_down = torch.zeros(
+>                     num_tokens * topk,
+>                     hidden_dim,
+>                     device=hidden_states.device,
+>                     dtype=hidden_states.dtype,
+>                 )
+>                 hooks.after_down(
+>                     lora_act,  # intermediate_input (activation output)
+>                     lora_down.view(num_tokens, topk, hidden_dim)
+>                     if output.ndim == 1 or output.shape[0] != num_tokens * topk
+>                     else lora_down,
+>                     topk_weights,
+>                     topk_ids,
+>                 )
+>                 # Sum across experts (weighted by topk_weights) and add to base output.
+>                 # Keep the residual in the base output dtype (BF16): topk_weights is
+>                 # FP32 (runner contract), so multiplying in FP32 and adding would
+>                 # upcast `output` to FP32, which breaks AITER add_rmsnorm under
+>                 # CUDA graph ("add_rmsnorm not support output type: float").
+>                 lora_down = lora_down.view(num_tokens, topk, hidden_dim)
+>                 lora_delta = (
+>                     lora_down * topk_weights.to(output.dtype).unsqueeze(-1)
+>                 ).sum(dim=1)
+>                 output = output + lora_delta
+> 
