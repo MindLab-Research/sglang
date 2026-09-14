@@ -202,6 +202,15 @@ class LoRARegistry:
         await self._counters[lora_id].wait_for_zero()
         del self._counters[lora_id]
 
+    def pending_usage(self, lora_id: str) -> Optional[int]:
+        """In-flight request count for *lora_id*, or None if the id is unknown.
+
+        Diagnostics only: a value that never reaches zero at unload time means an
+        ``acquire()`` was never balanced by ``release()`` (leaked usage counter).
+        """
+        counter = self._counters.get(lora_id)
+        return None if counter is None else counter.value()
+
     async def get_unregistered_loras(self, lora_name: set[str]):
         """
         Returns all LoRA adapters in lora_name that are not found in self._registry.

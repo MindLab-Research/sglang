@@ -249,6 +249,54 @@ class TestRidToStateCleanupOnAbort(CustomTestCase):
             state.out_list[0]["meta_info"]["finish_reason"]["type"], "abort"
         )
 
+    def test_abort_releases_lora_usage_once(self):
+        """A waiting-queue abort must release the LoRA usage counter exactly once.
+
+        The abort echo ends the request locally, so no batch output follows to
+        release its usage; a leaked counter makes every later unload of that
+        adapter wait forever in wait_for_unload().
+        """
+
+        async def drive():
+            tm = _make_tokenizer_manager()
+            tm.enable_lora = True
+            tm.lora_registry = Mock()
+            tm.lora_registry.release = AsyncMock()
+            rid = "abort_lora_rid"
+            state = _make_req_state(rid)
+            state.obj.lora_path = "test-lora"
+            state.obj.lora_id = "lora-0"
+            tm.rid_to_state[rid] = state
+
+            tm._handle_abort_req(_make_abort_req(rid))
+            # A duplicate echo for the same rid must not release a second time.
+            tm._handle_abort_req(_make_abort_req(rid))
+            await asyncio.sleep(0)
+
+            self.assertNotIn(rid, tm.rid_to_state)
+            tm.lora_registry.release.assert_awaited_once_with("lora-0")
+
+        asyncio.run(drive())
+
+    def test_abort_without_lora_does_not_touch_registry(self):
+        """Non-LoRA requests must not touch the LoRA registry on abort."""
+
+        async def drive():
+            tm = _make_tokenizer_manager()
+            tm.enable_lora = True
+            tm.lora_registry = Mock()
+            tm.lora_registry.release = AsyncMock()
+            rid = "abort_no_lora_rid"
+            # _make_req_state sets obj.lora_path = None
+            tm.rid_to_state[rid] = _make_req_state(rid)
+
+            tm._handle_abort_req(_make_abort_req(rid))
+            await asyncio.sleep(0)
+
+            tm.lora_registry.release.assert_not_awaited()
+
+        asyncio.run(drive())
+
 
 class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
     """Test that _handle_batch_output removes rid from rid_to_state on completion."""
@@ -467,6 +515,73 @@ class TestDiscardPendingReqStates(CustomTestCase):
         obj.rid = ["p1", "already_gone"]
         tm._discard_pending_req_states(obj)  # must not raise
         self.assertNotIn("p1", tm.rid_to_state)
+
+    def test_discard_undelivered_releases_lora_usage(self):
+        """A request that never reached the scheduler releases its usage here."""
+
+        async def drive():
+            tm = _make_tokenizer_manager()
+            tm.enable_lora = True
+            tm.lora_registry = Mock()
+            tm.lora_registry.release = AsyncMock()
+            rid = "d_lora_undelivered"
+            state = _make_req_state(rid)
+            state.obj.lora_path = "test-lora"
+            state.obj.lora_id = "lora-0"
+            tm.rid_to_state[rid] = state
+            obj = Mock(spec=GenerateReqInput)
+            obj.is_single = True
+            obj.rid = rid
+
+            tm._discard_pending_req_states(obj)
+            await asyncio.sleep(0)
+
+            self.assertNotIn(rid, tm.rid_to_state)
+            tm.lora_registry.release.assert_awaited_once_with("lora-0")
+
+        asyncio.run(drive())
+
+    def test_discard_dispatched_request_is_aborted_not_dropped(self):
+        """A dispatched request is handed back to the scheduler, not dropped.
+
+        Dropping it would leak its LoRA usage counter, while releasing it locally
+        could let the adapter be unloaded while the request is still running. The
+        scheduler's abort/finish response releases the usage at the right moment.
+        """
+
+        async def drive():
+            tm = _make_tokenizer_manager()
+            tm.enable_lora = True
+            tm.lora_registry = Mock()
+            tm.lora_registry.release = AsyncMock()
+            tm.abort_request = Mock()
+            rid = "d_lora_dispatched"
+            state = _make_req_state(rid)
+            state.obj.lora_path = "test-lora"
+            state.obj.lora_id = "lora-0"
+            state.dispatched = True
+            tm.rid_to_state[rid] = state
+            obj = Mock(spec=GenerateReqInput)
+            obj.is_single = True
+            obj.rid = rid
+
+            tm._discard_pending_req_states(obj)
+            await asyncio.sleep(0)
+
+            tm.abort_request.assert_called_once_with(rid)
+            self.assertIn(rid, tm.rid_to_state)
+            tm.lora_registry.release.assert_not_awaited()
+
+        asyncio.run(drive())
+
+    def test_mark_dispatched_flags_state(self):
+        tm = _make_tokenizer_manager()
+        rid = "mark_rid"
+        state = _make_req_state(rid)
+        tm.rid_to_state[rid] = state
+        tm._mark_dispatched(rid)
+        self.assertTrue(state.dispatched)
+        tm._mark_dispatched("unknown_rid")  # must not raise
 
 
 class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):

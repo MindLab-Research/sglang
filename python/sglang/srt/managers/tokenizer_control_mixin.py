@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import os
 import hashlib
 import logging
+import os
 import time
 import uuid
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
@@ -602,9 +602,23 @@ class TokenizerControlMixin:
 
         # Initiate the actual unloading operation at the backend processes only after all
         # ongoing requests using this LoRA adapter are finished.
-        await self._lora_wait_bounded(
-            "unload_lora_adapter", self.lora_registry.wait_for_unload(lora_id)
-        )
+        try:
+            await self._lora_wait_bounded(
+                "unload_lora_adapter", self.lora_registry.wait_for_unload(lora_id)
+            )
+        except (asyncio.TimeoutError, TimeoutError):
+            # Nothing was unloaded on the engines and the registry entry is already
+            # gone, so report the outstanding usage: this distinguishes "adapter is
+            # genuinely still in use" from "its usage counter leaked" (a request
+            # ended on a cleanup path that never released it).
+            logger.warning(
+                "unload_lora_adapter(%s): still %s in-flight usage(s) after %.0fs; "
+                "adapter NOT unloaded on the engines (leaked usage counter?)",
+                obj.lora_name,
+                self.lora_registry.pending_usage(lora_id),
+                LORA_UPDATE_TIMEOUT_SECS,
+            )
+            raise
         result = (
             await self._lora_wait_bounded(
                 "unload_lora_adapter", self.update_lora_adapter_communicator(obj)

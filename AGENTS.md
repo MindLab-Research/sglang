@@ -314,6 +314,8 @@ rsync -avz --exclude='__pycache__' --exclude='*.pyc' "$SRC" root@<node>:"$DEST"
 
 - **⛔ 诊断铁律：禁止仅凭 py-spy/线程快照宣称"卡死"（2026-09-13 立，血泪）**：**空闲服务里所有线程都停在 semaphore / collective 等待是正常待命态**——`_padded_all_reduce_min`、`recv_requests`、`all_reduce`、`recv_requests` 全算。判"卡住/死锁"必须**同时**满足：①**有在飞请求**且客户端可见停滞（请求超时、TTFT/TPOT 无进展、日志不推进）；②**时间维度**：≥2 次快照（间隔 ≥10s）同一批 rank 停在同一 collective，且期间**零请求完成**；③旁证（NCCL/gloo watchdog 超时、`PADDED-AR` 跨 rank 计数不一致、Xid/NVRM、复现性）。缺任一条 → 只能说"观察到线程在等待"，**不得说卡死/死锁**。同理：**"控制面 200 但业务无进度"要先证明请求确实到达（日志有请求行）**，否则是链路/入口问题而非引擎卡死。
 
+- **⛔ LoRA 用量计数器必须与请求生命周期严格配对（2026-09-14 修）**：`_resolve_lora_path()` 的 `acquire()` 原先只有两处 `release()`（正常完成 / abort 且 status∈{500,503}），**任何"丢 `rid_to_state` 却等不到调度器回复"的清理路径都会漏账**——abort 回显 `_handle_abort_req()`（等待队列/disagg 队列 abort 只回这一条，之后不会再有 batch output）、handler 失败 `_discard_pending_req_states()`。漏一笔 ⇒ 该 adapter 的 `unload_lora_adapter` 在 `wait_for_unload()` 永远等不到计数归零（§ 等待有界后 = 900s 超时 400），期间引擎仍占着 LoRA 槽位/显存，而 `/v1/models` 里它已经消失（两本不一致）。判据：`Start (load|unload) Lora adapter` 与后端每 rank 的 `LoRA adapter (loading|unloading) starts` **不配对**。新增任何"删 state"的路径时必须同时销账；已送出调度器的请求不要本地销账（改为发 abort + 保留 state，由调度器回执销账），否则可能在请求还在用 adapter 时把它卸掉。详见 `docs/agent/lora-update-wedge-fix.md` §9。
+
 - **移植的 Triton 融合 kernel 有 kill-switch**：`SGLANG_OPT_USE_TRITON_VOCAB_PARALLEL_EMBEDDING=0` 可关闭 TP vocab embedding 融合路径（默认开）；topk1 draft kernel 无开关（topk=1 + CUDA 自动启用，异常时走 `topk1_chain_fits` fallback）。
 - **HiCache local-only prefetch 是死锁温床**：任何依赖 per-rank 状态的 collective gate 都会出问题；判断"rank-invariant"再动。
 - **`seq_len` 在 CP token split 前是 rank-invariant 的，`extend_seq_lens_cpu` 不是**（HiCache 会改）。

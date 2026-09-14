@@ -121,3 +121,54 @@ await self.lora_registry.wait_for_unload(lora_id)                    # ← 等�
 是正常量级。
 
 本次排查用法：`python3 tools/analyze_lora_log.py /root/prefill_glm53mol.log`
+
+---
+
+## 9. 第三种根因：LoRA 用量计数器泄漏（2026-09-14 修复）
+
+§3 的"无上限等待"是**放大器**；本节是**独立的第二个触发源**。修了 §3（等待有界）之后，
+它的表现变成：**这次 unload 900s 后 400 快速失败，但那个 adapter 永远卸不掉**
+（每次重试都一样）——引擎侧槽位/显存一直被占着，而 `/v1/models` 里它已经消失。
+
+### 9.1 机制
+
+- 每个用到 adapter 的请求在 `_resolve_lora_path()` 里 `acquire()` 记一笔账，由 `release()` 销账；
+  而这版代码里 `release()` **只有两处**：正常完成（`_handle_batch_output`）与
+  `finish_reason=abort` 且 status∈{500,503}。
+- `unload_lora_adapter` 的顺序是 `unregister()` → `wait_for_unload()`（等计数归零）→ 下发后端。
+  **只要有一笔账没销，计数永远不归零**，unload 就等不到（§4 之后 = 900s 超时 400）。
+- 漏账点（都是"丢 state、但等不到调度器回复"的清理路径）：
+
+  | 位置 | 触发 | 为什么必漏 |
+  |---|---|---|
+  | `_handle_abort_req()` | 调度器回送的 `AbortReq`：等待队列 abort、disagg transfer/prealloc/retracted abort、chunked-prefill abort | 等待队列里的请求**只回这一条 AbortReq**，之后不会再有 batch output ⇒ 没人销账 |
+  | `_discard_pending_req_states()` | handler 失败：输入校验失败、400 abort 抛错、客户端断连（type1/type3）抛错 | 只 `pop(rid)`，不销账 |
+
+### 9.2 现场判据（GLM-5.3 MoL PD decode，2026-09-13/14）
+
+```
+22:40:24  Start unload Lora adapter ... 01a090dd        ← 之后 17 小时 0 completion
+          /v1/models 里已无 01a090dd（= unregister 成功）
+          后端 0 条 "LoRA adapter unloading starts"
+02:08 起  9 次 load/unload 全部只留下 "Start ..."，后端 0 条 loading/unloading starts
+旁证：同期 26 条 `Received output for rid=... but the state was deleted in TokenizerManager.`
+      = "状态先被删、最终输出才到"的形态（abort 回显先赢）——正是漏账的形状
+```
+
+**一句话判据**：`Start (load|unload) Lora adapter` 与后端每 rank 的
+`LoRA adapter (loading|unloading) starts` **不配对**，且 `/v1/models` 与引擎实际占用不一致。
+
+### 9.3 修复
+
+1. `_handle_abort_req()`：删 state 前 `_schedule_lora_release(state)` 销账（一次请求一次）。
+2. `_discard_pending_req_states()`：区分两种情形——
+   **没送到调度器**（`ReqState.dispatched=False`）→ 直接删 + 销账；
+   **已送出**（`dispatched=True`）→ 发 abort 并**保留** state，由调度器的 abort/finish 回执销账
+   （否则要么漏账，要么在请求还在用 adapter 时提前销账 → 可能被卸掉）。
+3. 诊断：unload 排空超时时打印 `pending_usage`（还差几笔账），把"真的还在用"与"账漏了"分开。
+
+### 9.4 与 §3 的关系
+
+- §3（等待有界）= **兜底**：无论什么原因卡住都只卡 900s、快速失败、锁一定释放；
+- §9（销账配对）= **根治触发源**：让 unload 能真正完成，不留"卸不掉的 adapter"。
+  两者都需要：只做 §3 → adapter 一直 400；只做 §9 → 未知原因仍可能锁死通道。

@@ -147,6 +147,19 @@ _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 logger = logging.getLogger(__name__)
 
 
+def _log_lora_release_failure(task: asyncio.Task) -> None:
+    """Surface failures of the fire-and-forget LoRA usage release.
+
+    A failed release is not fatal for the request itself, but it leaves the LoRA
+    usage counter unbalanced, so it must not pass silently.
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.warning("Failed to release LoRA usage counter: %r", exc)
+
+
 @lru_cache(maxsize=1)
 def _ragged_verify_cap_accept() -> bool:
     # The mode env is fixed at server launch; cache to keep it off the
@@ -184,6 +197,11 @@ class ReqState:
 
     # For streaming output
     last_output_offset: int = 0
+
+    # True once the request has been handed to the scheduler. The scheduler then
+    # owns the request: local cleanup paths must abort it instead of dropping it
+    # silently (see _discard_pending_req_states).
+    dispatched: bool = False
 
     # Accumulate text lazily so incremental streaming can emit the incoming
     # delta directly without rebuilding the full output prefix.
@@ -441,6 +459,32 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if self.tokenizer_ipc_name is not None:
             stamp_http_worker_ipc(obj, self.tokenizer_ipc_name)
         await async_sock_send(self.send_to_scheduler, obj)
+
+    def _mark_dispatched(self, rid: str) -> None:
+        """Record that *rid* has been handed to the scheduler."""
+        state = self.rid_to_state.get(rid)
+        if state is not None:
+            state.dispatched = True
+
+    def _schedule_lora_release(self: TokenizerManager, state: ReqState) -> None:
+        """Release the LoRA usage acquired for a request whose state is dropped.
+
+        ``_resolve_lora_path()`` accounts one ``acquire()`` per dispatched
+        request; the matching ``release()`` normally happens on the
+        scheduler-response paths (``_handle_batch_output``, 5xx aborts). Every
+        cleanup path that ends a request **without** a scheduler response must
+        balance it here: a leaked counter never returns to zero, and
+        ``unload_lora_adapter()`` then blocks in ``wait_for_unload()`` while
+        holding ``lora_update_lock``, which wedges every later LoRA update until
+        the engine is restarted.
+        """
+        if not self.enable_lora:
+            return
+        lora_id = getattr(state.obj, "lora_id", None)
+        if lora_id is None or not getattr(state.obj, "lora_path", None):
+            return
+        task = asyncio.create_task(self.lora_registry.release(lora_id))
+        task.add_done_callback(_log_lora_release_failure)
 
     def init_running_status(self):
         # Request states
@@ -1373,6 +1417,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         time_stats = tokenized_obj.time_stats
         tokenized_obj.wrap_pickle_fields()
         self._dispatch_to_scheduler(tokenized_obj)
+        # Mark only after a successful send: if the send raised, the scheduler
+        # never saw the request and local cleanup may still drop it.
+        self._mark_dispatched(tokenized_obj.rid)
         tokenized_obj.time_stats = time_stats
         tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
 
@@ -1394,6 +1441,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
 
         self._dispatch_to_scheduler(batch_req)
+        for tokenized_obj in tokenized_objs:
+            self._mark_dispatched(tokenized_obj.rid)
         for tokenized_obj, time_stat in zip(tokenized_objs, time_stats):
             tokenized_obj.time_stats = time_stat
         set_time_batch(tokenized_objs, "set_api_server_dispatch_finish_time")
@@ -2824,6 +2873,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             "output_ids": output_ids,
             "meta_info": meta_info,
         }
+        # The abort echo ends this request here: no batch output will follow, so
+        # nothing else will release its LoRA usage. Balance the counter now.
+        self._schedule_lora_release(state)
         del self.rid_to_state[recv_obj.rid]
 
         state.out_list.append(out)
@@ -3026,18 +3078,31 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             time_stats.set_created_time(created_time)
 
     def _discard_pending_req_states(self, obj):
-        """Drop rid_to_state entries created by _init_req_state for *obj*.
+        """Drop or abort rid_to_state entries created by _init_req_state for *obj*.
 
-        Safe to call after a partial/failed dispatch: only entries still present
-        are removed, and the scheduler-response path looks up state with
-        ``.get(...)`` so a later output for a discarded rid is ignored, not fatal.
+        Entries whose request never reached the scheduler are dropped locally and
+        their LoRA usage is released here (no scheduler response will ever come).
+
+        Entries whose request **was** dispatched must go through the scheduler:
+        the request may still be running, so we ask for an abort and keep the
+        state. Dropping it here would either leak the LoRA usage counter (if we
+        released nothing) or let an adapter be unloaded while it is still in use
+        (if we released immediately); the scheduler's abort/finish response
+        releases the counter and removes the state at the right moment.
         """
         if not hasattr(obj, "is_single") or obj.is_single:
             rids = [obj.rid]
         else:
             rids = obj.rid
         for rid in rids:
-            self.rid_to_state.pop(rid, None)
+            state = self.rid_to_state.get(rid)
+            if state is None:
+                continue
+            if state.dispatched:
+                self.abort_request(rid)
+                continue
+            del self.rid_to_state[rid]
+            self._schedule_lora_release(state)
 
     def _should_dispatch_to_encoder(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
