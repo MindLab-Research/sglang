@@ -108,3 +108,16 @@ await self.lora_registry.wait_for_unload(lora_id)                    # ← 等�
 
 **我们侧可改进（待定）**：smg 的 `load_lora_adapter rejected by engine` 日志应带上引擎响应体
 （现在只有 `status=400`，导致必须手工直连引擎才能拿到 `curl 22` 这条关键信息）。
+
+---
+
+## 8. 分析工具
+
+`tools/analyze_lora_log.py <engine.log>` —— 扫引擎日志重建每次 LoRA 装载的分段耗时：
+`lora_id` 维度聚合 `loading starts / downloading / loading completes`，输出
+每次 load 的总时长、每 rank 的「下载→完成」耗时、相邻 rank 完成间隔（>60s 标 ⚠）。
+用途：3 秒内回答"装载本身慢不慢"（`starts=16 / completes=16` = 同一 lora_id 装了两批，
+两批间隔数十分钟 = **外部重复触发**，不是单次装载慢）；冷启动 `3.7min`（8 rank×28s）
+是正常量级。
+
+本次排查用法：`python3 tools/analyze_lora_log.py /root/prefill_glm53mol.log`
