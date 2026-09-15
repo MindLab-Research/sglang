@@ -434,6 +434,21 @@ class GroupCoordinator:
             )
 
         self.ca_comm: Optional[Any] = None
+        # P2P (NVLink peer-to-peer) bf16 all-reduce. Enabled with
+        # SGLANG_P2P_AR=1 (+ SGLANG_P2P_AR_LIB=/path/libp2p_ar.so); anything the
+        # kernel cannot handle (dtype/size/world) silently falls back below.
+        self.p2p_ar: Optional[Any] = None
+        if self.world_size > 1:
+            try:
+                from sglang.srt.distributed.device_communicators.p2p_ar.p2p_all_reduce import (
+                    get_p2p_ar,
+                    p2p_ar_enabled,
+                )
+
+                if p2p_ar_enabled():
+                    self.p2p_ar = get_p2p_ar(self.cpu_group, self.device)
+            except Exception as e:
+                logger.warning(f"Setup P2P all-reduce failed with {e}; falling back")
         self.qr_comm: Optional[QuickAllReduce] = None
         if use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
@@ -799,6 +814,12 @@ class GroupCoordinator:
                 and self.pymscclpp_comm.should_mscclpp_allreduce(input_)
             )
         if (
+            self.p2p_ar is not None
+            and not self.p2p_ar.disabled
+            and self.p2p_ar.should_p2p_ar(input_)
+        ):
+            return "p2p"
+        if (
             self.ca_comm is not None
             and not self.ca_comm.disabled
             and not should_use_pymscclpp_allreduce
@@ -831,9 +852,9 @@ class GroupCoordinator:
             outplace_all_reduce_method = self._resolve_outplace_all_reduce_method(
                 input_
             )
-            if outplace_all_reduce_method == "pymscclpp":
-                # pymscclpp reduces in place and returns its input; feed it a
-                # clone to honor the op's no-mutation contract.
+            if outplace_all_reduce_method in ("pymscclpp", "p2p"):
+                # These reduce in place and return their input; feed them a clone
+                # to honor the op's no-mutation contract.
                 input_ = input_.clone()
             elif outplace_all_reduce_method is None:
                 # Force pynccl over the in-place fallback: it is graph-capture
@@ -850,8 +871,14 @@ class GroupCoordinator:
         pymscclpp_comm = self.pymscclpp_comm
         torch_symm_mem_comm = self.torch_symm_mem_comm
         pynccl_comm = self.pynccl_comm
-        assert any([qr_comm, ca_comm, pymscclpp_comm, torch_symm_mem_comm, pynccl_comm])
-        if outplace_all_reduce_method == "ca":
+        p2p_ar = self.p2p_ar
+        assert any(
+            [qr_comm, ca_comm, pymscclpp_comm, torch_symm_mem_comm, pynccl_comm, p2p_ar]
+        )
+        if outplace_all_reduce_method == "p2p":
+            # input_ was cloned above; the kernel reduces it in place.
+            out = p2p_ar.all_reduce_inplace(input_)
+        elif outplace_all_reduce_method == "ca":
             assert not ca_comm.disabled
             out = ca_comm.custom_all_reduce(input_)
         elif outplace_all_reduce_method == "qr":
