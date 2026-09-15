@@ -34,6 +34,17 @@ from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.backend.lora_registry import get_backend_from_name
 from sglang.srt.lora.layers import BaseLayerWithLoRA, FusedMoEWithLoRA, get_lora_layer
 from sglang.srt.lora.lora import LoRAAdapter
+from sglang.srt.lora.lora_cache import (
+    cache_dir_for_path,
+    cache_ttl_sec,
+    curl_download,
+    find_adapter_dir,
+    gc as lora_cache_gc,
+    gc_enabled,
+    is_remote,
+    mark_unloaded,
+    resolve_remote_adapter,
+)
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.lora.mem_pool import LoRAMemoryPool
@@ -56,24 +67,11 @@ _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 logger = logging.getLogger(__name__)
 
 
-def _find_adapter_dir(target: str) -> str:
-    """Locate the directory that contains adapter_config.json. The checkpoint
-    tarball may nest the LoRA under e.g. `adapter/` (full checkpoint layout),
-    so return the innermost dir that looks like a LoRA adapter."""
-    import os
-
-    if os.path.exists(os.path.join(target, "adapter_config.json")):
-        return target
-    try:
-        for d in sorted(os.listdir(target)):
-            sub = os.path.join(target, d)
-            if os.path.isdir(sub) and os.path.exists(
-                os.path.join(sub, "adapter_config.json")
-            ):
-                return sub
-    except OSError:
-        pass
-    return target
+# Backwards-compatible aliases: the download / extraction / cache-GC
+# implementation lives in `lora_cache` (stdlib-only, so it can be unit tested
+# without torch / CUDA).
+_find_adapter_dir = find_adapter_dir
+_stream_download = curl_download
 
 
 def resolve_lora_local_path(name: str, path: str) -> str:
@@ -86,108 +84,16 @@ def resolve_lora_local_path(name: str, path: str) -> str:
 
     Only ONE TP rank downloads (mkdir lock); the other ranks wait for the
     marker file — avoids 8x duplicate downloads of a multi-GB checkpoint.
+
+    Cache identity is content-addressed and signature-independent (see
+    `lora_cache`): refreshing a pre-signed URL for the same artifact hits the
+    local copy instead of downloading it again. Retention is driven by
+    LoRAManager: unloading stamps `.unloaded_at`, and a later sweep deletes the
+    directory once the TTL (default 24 h) has elapsed.
     """
-    if not (path.startswith("http://") or path.startswith("https://")):
+    if not is_remote(path):
         return path
-
-    import os
-    import shutil
-    import subprocess
-    import tarfile
-    import time
-    from urllib.parse import urlparse
-
-    cache_root = os.environ.get("SGLANG_LORA_CACHE_DIR", "/root/glm52_local/loras")
-    # When the adapter is registered under its URL (the router passes
-    # lora_name=path so runtime lora_path lookups hit), the raw URL is not a
-    # valid directory component — derive a safe cache key from it instead.
-    if name.startswith("http://") or name.startswith("https://"):
-        import hashlib
-        from urllib.parse import urlparse as _urlparse
-
-        base = os.path.basename(_urlparse(name).path)
-        for _ext in (".tar.zst", ".tzst", ".tar.gz", ".tgz", ".tar"):
-            if base.endswith(_ext):
-                base = base[: -len(_ext)]
-                break
-        key = f"{base}-{hashlib.sha1(name.encode()).hexdigest()[:8]}"
-    else:
-        key = name
-    target = os.path.join(cache_root, key)
-    # Done marker is a .done file we write after extraction — the checkpoint
-    # tarball may not contain adapter_config.json, so we must not key on it.
-    marker = os.path.join(target, ".done")
-    if os.path.exists(marker):
-        logger.info("lora %s already cached at %s", name, target)
-        adapter_dir = _find_adapter_dir(target)
-        if adapter_dir != target:
-            logger.info("lora %s adapter dir: %s", name, adapter_dir)
-        return adapter_dir
-
-    # Extension detection must use the URL *path* (strip query params).
-    url_path = urlparse(path).path
-    is_zst = url_path.endswith(".tar.zst") or url_path.endswith(".tzst")
-    suffix = ".tar.zst" if is_zst else ".tar.gz"
-
-    lock_dir = target + ".lock"
-    deadline = time.time() + 3600
-    while not os.path.exists(marker):
-        if time.time() > deadline:
-            raise RuntimeError(f"timed out waiting for lora {name} to download")
-        try:
-            os.mkdir(lock_dir)
-        except FileExistsError:
-            # another TP rank is downloading; wait for the marker
-            time.sleep(1)
-            continue
-        try:
-            archive = os.path.join(cache_root, f"{key}{suffix}")
-            logger.info("downloading lora %s from %s", name, path)
-            _stream_download(path, archive)
-            logger.info("extracting lora %s -> %s", name, target)
-            if os.path.isdir(target):
-                shutil.rmtree(target, ignore_errors=True)
-            os.makedirs(target, exist_ok=True)
-            if is_zst:
-                subprocess.run(["tar", "--zstd", "-xf", archive, "-C", target], check=True)
-            else:
-                with tarfile.open(archive, "r:gz") as tf:
-                    tf.extractall(target)
-            os.remove(archive)
-
-            # Hoist a single nested top-level directory if present.
-            entries = [os.path.join(target, e) for e in os.listdir(target)]
-            if len(entries) == 1 and os.path.isdir(entries[0]):
-                nested = entries[0]
-                for e in os.listdir(nested):
-                    shutil.move(os.path.join(nested, e), os.path.join(target, e))
-                os.rmdir(nested)
-            # Write the done marker (extraction succeeded).
-            with open(marker, "w") as f:
-                f.write("ok")
-        finally:
-            try:
-                os.rmdir(lock_dir)
-            except OSError:
-                pass
-    logger.info("lora %s ready at %s", name, target)
-    adapter_dir = _find_adapter_dir(target)
-    if adapter_dir != target:
-        logger.info("lora %s adapter dir: %s", name, adapter_dir)
-    return adapter_dir
-
-
-def _stream_download(url: str, dest: str) -> None:
-    """Download a file reliably. `requests` streaming can stall on some
-    B300 nodes; curl is verified stable (~5MB/s) so use it via subprocess.
-    """
-    import subprocess
-
-    subprocess.run(
-        ["curl", "-sfL", "--retry", "8", "--retry-delay", "3", "--retry-all-errors", "--connect-timeout", "10", "-o", dest, url],
-        check=True,
-        timeout=3600,
-    )
+    return resolve_remote_adapter(name, path, logger=logger)
 
 
 class LoRAManager:
@@ -327,10 +233,18 @@ class LoRAManager:
         ), f"LoRA adapter with ID {lora_ref.lora_id} is already loaded. This should have been verified before request is sent to the backend."
 
         try:
+            # Reclaim cache space before pulling another multi-GB checkpoint:
+            # directories unloaded more than SGLANG_LORA_CACHE_TTL_SEC ago,
+            # duplicates of the same artifact, and stale archives. Never touches
+            # a directory this process has loaded or is downloading.
+            self._gc_lora_cache()
             # Resolve a remote URL to a local directory downloaded on THIS node
             # (each PD node downloads its own copy — no intermediate hop, no
             # ssh dependency; local-bandwidth, parallel across nodes).
             local_path = resolve_lora_local_path(lora_ref.lora_name, lora_ref.lora_path)
+            cache_dir = cache_dir_for_path(local_path)
+            if cache_dir:
+                self._lora_cache_dirs[lora_ref.lora_id] = cache_dir
             # load configs
             new_adapter = LoRAConfig(
                 local_path,
@@ -387,8 +301,38 @@ class LoRAManager:
                 logger.exception("Failed to remove LoRA %s from memory pool", uid)
         self.loras.pop(uid, None)
         self.configs.pop(uid, None)
+        self._lora_cache_dirs.pop(uid, None)
         if self.lora_refs.pop(uid, None) is not None:
             self.num_pinned_loras -= int(lora_ref.pinned)
+
+    def _lora_cache_dirs_in_use(self) -> set:
+        """Cache directories of adapters currently loaded by this process.
+
+        The GC must never reclaim a directory that is still serving traffic.
+        """
+        return {d for d in self._lora_cache_dirs.values() if d}
+
+    def _gc_lora_cache(self) -> None:
+        """Sweep the on-disk LoRA cache (unloaded > TTL, duplicates, archives).
+
+        Runs on load and unload — both are already heavy (multi-GB download /
+        weight load), so the extra listdir is free, and continuous LoRA churn
+        (the production pattern) keeps the cache bounded without a timer thread.
+        """
+        if not gc_enabled():
+            return
+        try:
+            result = lora_cache_gc(in_use=self._lora_cache_dirs_in_use(), logger=logger)
+        except Exception:
+            logger.exception("LoRA cache GC failed; continuing")
+            return
+        deleted = result.get("deleted") or []
+        if deleted:
+            logger.info(
+                "LoRA cache GC: removed %d dir(s), freed %.2f GB",
+                len(deleted),
+                float(result.get("freed_bytes", 0)) / 1e9,
+            )
 
     def validate_new_adapter(self, lora_config: LoRAConfig, lora_ref: LoRARef):
         """
@@ -483,6 +427,18 @@ class LoRAManager:
                 success=False,
                 error_message=str(e),
             )
+
+        # Retention: keep the unpacked adapter for the TTL (default 24 h) after
+        # unload so a quick reload stays free, then let the next sweep delete it.
+        cache_dir = self._lora_cache_dirs.pop(lora_ref.lora_id, None)
+        if cache_dir and mark_unloaded(cache_dir):
+            logger.info(
+                "LoRA cache: %s unloaded, %s kept for %.0f h before deletion",
+                lora_ref.lora_name,
+                cache_dir,
+                cache_ttl_sec() / 3600.0,
+            )
+        self._gc_lora_cache()
 
         return self.create_lora_update_result(success=True)
 
@@ -776,6 +732,10 @@ class LoRAManager:
 
         # Mapping from LoRA ID to LoRARef object.
         self.lora_refs: Dict[str, LoRARef] = {}
+
+        # Mapping from LoRA ID to the on-disk cache directory of a remotely
+        # downloaded adapter (drives GC retention + `in use` accounting).
+        self._lora_cache_dirs: Dict[str, str] = {}
 
         # Count of pinned LoRA adapters.
         self.num_pinned_loras: int = 0
