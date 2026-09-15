@@ -135,13 +135,24 @@ class P2PAllReduce:
         self._epoch_off = off
 
         # publish my handle, collect everyone's
+        #
+        # NOTE: two traps here, both hit in production:
+        #  1. `handle.bytes` on a `c_char * 64` field is truncated at the first
+        #     NUL byte (the handle is mostly zeros: 19/64 non-zero), so it must be
+        #     read with ctypes.string_at(byref(...), 64) -- otherwise `mine` ends
+        #     up 4 (or 0) elements long and the collective fails with
+        #     "invalid tensor size at index 0 (expected (4), got (64))".
+        #  2. the handle exchange must run on CPU tensors: the group handed to us
+        #     is the gloo TP group, which does not do CUDA tensors.
         import torch.distributed as dist
 
         handle = _IpcMemHandle()
         base = self._blob.data_ptr()
         self._check(self._cudart.cudaIpcGetMemHandle(ctypes.byref(handle), ctypes.c_void_p(base)))
-        gathered = [torch.zeros(_IPC_HANDLE_BYTES, dtype=torch.uint8, device=dev) for _ in range(self.world)]
-        mine = torch.frombuffer(bytearray(handle.bytes), dtype=torch.uint8).to(dev)
+        raw = ctypes.string_at(ctypes.byref(handle), _IPC_HANDLE_BYTES)
+        assert len(raw) == _IPC_HANDLE_BYTES, len(raw)
+        mine = torch.frombuffer(bytearray(raw), dtype=torch.uint8)
+        gathered = [torch.zeros(_IPC_HANDLE_BYTES, dtype=torch.uint8) for _ in range(self.world)]
         dist.all_gather(gathered, mine, group=self.group)
 
         peer_bases = []
@@ -165,8 +176,17 @@ class P2PAllReduce:
         rd = [b + self._ready_off for b in peer_bases]
         self.staging_tbl = torch.tensor(st, dtype=torch.int64, device=dev)
         self.ready_tbl = torch.tensor(rd, dtype=torch.int64, device=dev)
-        self.staging_local = torch.Tensor().set_(self._blob, self._staging_off, (self.staging.numel(),)).view(torch.float32)
-        self.ready_local = torch.Tensor().set_(self._blob, self._ready_off, (self.world,)).view(torch.uint32)
+        # Views into the CUDA blob. NOTE: do NOT build these with
+        # `torch.Tensor().set_(self._blob, ...)` -- torch.Tensor() is a CPU tensor
+        # and set_() onto a CUDA storage now raises "Attempted to set the storage
+        # of a tensor on device cpu to a storage on different device cuda:N".
+        # Slicing the CUDA blob keeps the storage on the right device.
+        self.staging_local = self._blob[
+            self._staging_off : self._staging_off + self.staging.numel() * 4
+        ].view(torch.float32)
+        self.ready_local = self._blob[
+            self._ready_off : self._ready_off + self.ready.numel() * 4
+        ].view(torch.uint32)
 
     def _check(self, err):
         if int(err) != 0:
