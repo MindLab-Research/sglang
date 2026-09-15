@@ -11,6 +11,86 @@ import triton.language as tl
 
 from sglang.jit_kernel.moe_align import moe_align_block_size as jit_moe_align_block_size
 
+# ---------------------------------------------------------------------------
+# MoL LoRA stage tuning (SGLANG_OPT_MOL_LORA_STAGE_CFG, see environ.py)
+# ---------------------------------------------------------------------------
+# The virtual-experts LoRA stages (shrink + expand) run through the MoE
+# stage-config path. For these shapes the autotuner has no entry, so the
+# fallback config is used and _get_routing() hands its BLOCK_SIZE_M to
+# moe_align_block_size: every touched virtual-expert bucket is padded to a full
+# BLOCK_SIZE_M-row block. With the stock values (BLOCK_SIZE_M=64,
+# BLOCK_SIZE_N=64) a decode batch's ~1.1k real (token, virtual-expert) pairs
+# become ~1.6k blocks x 64 rows ~= 1e5 padded rows, and every stage's launch
+# grid follows from that plus BLOCK_SIZE_N. Measured (B300, bs=23, 60-step
+# profiler window): the down-delta expand is a single 153,984-CTA launch taking
+# 160.6us/layer at ~85GB/s effective (~1% of HBM roofline) while its four
+# sibling launches do the same kind of work in 5-43us -- i.e. all five
+# per-layer LoRA launches are tile/CTA-overhead bound, not bandwidth bound.
+#
+# The fix retunes the one knob that actually drives the launch count. Note the
+# arithmetic carefully: the align step pads every touched bucket to a multiple
+# of BLOCK_SIZE_M, so padded_rows = blocks * BLOCK_SIZE_M and therefore
+#     grid_m = cdiv(padded_rows, BLOCK_SIZE_M) == blocks
+# i.e. grid_m is *invariant* to BLOCK_SIZE_M (and shrinking BLOCK_SIZE_M only
+# splits buckets into more blocks, raising grid_m). The launch count is
+#     grid = blocks * cdiv(N, BLOCK_SIZE_N),
+# so BLOCK_SIZE_N is the lever. It is clamped to the stage's real GEMM N so no
+# dead columns are computed. BLOCK_SIZE_K and the K-loop stay untouched, so each
+# output element still reduces over K inside a single tile -> bit-identical.
+_MOL_LORA_TUNED_BLOCK_N = 256
+_MOL_LORA_STAGE_CFG_CACHED: "bool | None" = None
+
+
+def _mol_lora_stage_cfg_enabled() -> bool:
+    """Cached read of SGLANG_OPT_MOL_LORA_STAGE_CFG (hot path: 2 calls/layer)."""
+    global _MOL_LORA_STAGE_CFG_CACHED
+    if _MOL_LORA_STAGE_CFG_CACHED is None:
+        from sglang.srt.environ import envs
+
+        _MOL_LORA_STAGE_CFG_CACHED = bool(envs.SGLANG_OPT_MOL_LORA_STAGE_CFG.get())
+    return _MOL_LORA_STAGE_CFG_CACHED
+
+
+def _apply_mol_lora_stage_cfg(cfg: dict, n_dim: int) -> dict:
+    """Widen the MoL LoRA stage N-tile (grid = blocks * cdiv(N, BLOCK_SIZE_N)).
+
+    ``n_dim`` is the stage GEMM's real N (rank for the shrink, output width for
+    the expand) -- not the weight tensor's leading dim, since the shrink weight
+    is laid out [E, K, N] and the expand weight [E, N, K].
+    """
+    tuned = dict(cfg)
+    tuned["BLOCK_SIZE_N"] = min(_MOL_LORA_TUNED_BLOCK_N, max(16, int(n_dim)))
+    return tuned
+
+
+_MOL_LORA_STAGE_CFG_LOGGED = False
+
+
+def _log_mol_lora_stage_cfg_once(cfg: dict, tuned: dict, n_dim: int) -> None:
+    """One-shot loud marker so a deployment can be verified from the log (grep
+    MOL-LORA-STAGE-CFG) -- the decode node's per-layer kernel timing is the
+    actual acceptance signal, this just proves the flag reached the kernels."""
+    global _MOL_LORA_STAGE_CFG_LOGGED
+    if _MOL_LORA_STAGE_CFG_LOGGED:
+        return
+    _MOL_LORA_STAGE_CFG_LOGGED = True
+    import logging
+
+    old_n = int(cfg.get("BLOCK_SIZE_N") or 1)
+    new_n = int(tuned.get("BLOCK_SIZE_N") or 1)
+    logging.getLogger(__name__).info(
+        "[MOL-LORA-STAGE-CFG] enabled: n_dim=%d BLOCK_SIZE_N %d -> %d "
+        "(BLOCK_SIZE_M=%s BLOCK_SIZE_K=%s untouched; N-tile count %.1fx smaller)",
+        n_dim,
+        old_n,
+        new_n,
+        cfg.get("BLOCK_SIZE_M"),
+        cfg.get("BLOCK_SIZE_K"),
+        old_n / max(1, new_n),
+    )
+
+
+
 
 @triton.jit
 def _fused_virtual_topk_ids_kernel(
@@ -583,6 +663,7 @@ def _merged_experts_fused_moe_lora_add_impl(
     def _get_stage_config(
         weight: torch.Tensor,
         stage_top_k: int,
+        n_dim: int,
     ) -> dict[str, Any]:
         from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
             get_config_dtype_str,
@@ -616,6 +697,14 @@ def _merged_experts_fused_moe_lora_add_impl(
                 "num_warps": 4,
                 "num_stages": 4,
             }
+        # Unified MoL stage tuning (SGLANG_OPT_MOL_LORA_STAGE_CFG). Touches only
+        # BLOCK_SIZE_N, so the align block size / BLOCK_SIZE_K / K-loop stay as
+        # upstream -> bit-identical results. Kill-switch: leave the env unset.
+        if _mol_lora_stage_cfg_enabled():
+            tuned = _apply_mol_lora_stage_cfg(cfg, n_dim)
+            if tuned != cfg:
+                _log_mol_lora_stage_cfg_once(cfg, tuned, n_dim)
+            cfg = tuned
         return cfg
 
     def _align_block_size(
@@ -725,7 +814,10 @@ def _merged_experts_fused_moe_lora_add_impl(
         device=hidden_states.device,
     )
 
-    a_stage_config = _get_stage_config(lora_a_virtual, input_top_k)
+    # Shrink GEMM: B is [E, K=hidden, N=rank] -> stage N is the LoRA rank dim.
+    a_stage_config = _get_stage_config(
+        lora_a_virtual, input_top_k, lora_a_virtual.shape[2]
+    )
     (
         sorted_token_ids,
         expert_ids,
@@ -751,7 +843,9 @@ def _merged_experts_fused_moe_lora_add_impl(
         a_stage_config,
     )
 
-    b_stage_config = _get_stage_config(lora_b_virtuals[0], 1)
+    # Expand GEMM: B is [E, N=output width, K=rank] -> stage N is the output width
+    # per B tensor (gate/up half for gate_up, full hidden for down).
+    b_stage_config = _get_stage_config(lora_b_virtuals[0], 1, half_out)
     (
         sorted_token_ids,
         expert_ids,

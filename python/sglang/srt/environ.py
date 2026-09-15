@@ -1016,6 +1016,28 @@ class Envs:
 
     # CUDA kernels
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
+    # MoL (Mixture-of-LoRA) virtual-experts LoRA stage tuning -- one switch for
+    # the shrink + expand kernels of the merged-experts LoRA delta.
+    #
+    # The virtual-experts LoRA stages reuse the MoE stage-config path, and for
+    # these shapes (num_experts = max_loras * n_routed, rank-sized K) the
+    # autotuner has no entry, so the fallback (BLOCK_SIZE_M=64, BLOCK_SIZE_N=64)
+    # is used. _get_routing() then hands BLOCK_SIZE_M to moe_align_block_size,
+    # so every touched virtual-expert bucket is padded to a full 64-row block:
+    # ~1.6k blocks x 64 rows ~= 1e5 padded rows for ~1.1k real
+    # (token, virtual-expert) pairs. Every stage's launch grid follows from
+    # that + BLOCK_SIZE_N (measured on the B300 decode node, bs=23 window:
+    # down-delta expand grid=[153984] 160.6us/layer at ~85GB/s effective
+    # (~1% of HBM roofline); gate_up expands grid=[6416] 7.5+6.8us;
+    # shrink_splitk grid=[1604]/[802] 43.1+5.2us) -- i.e. all five per-layer
+    # LoRA launches are tile/CTA-overhead bound, not bandwidth bound.
+    #
+    # Enabled: retunes only BLOCK_SIZE_M (64 -> 16, the align padding unit) and
+    # BLOCK_SIZE_N (64 -> up to 256, the N-tile width) of the MoL stages, which
+    # cuts the padded rows and the grid by ~4x. BLOCK_SIZE_K and the K-loop are
+    # untouched, so the per-output reduction order is unchanged -> bit-identical
+    # results. Kill-switch for A/B: unset (default) keeps upstream behaviour.
+    SGLANG_OPT_MOL_LORA_STAGE_CFG = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
     SGLANG_DSV4_MHC_PREWARM = EnvBool(True)
