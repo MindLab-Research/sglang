@@ -861,13 +861,23 @@ class Indexer(MultiPlatformOp):
         if _is_hip:
             from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
-            q_fp8 = q_fp8.unsqueeze(1)
+            q_fp8 = q_fp8[:q_offset].unsqueeze(1)
+            weights = weights[:q_offset]
             batch_size, next_n, heads, _ = q_fp8.shape
             logits = torch.empty(
                 (batch_size * next_n, max_seq_len),
                 device=q_fp8.device,
                 dtype=torch.float32,
             )
+            # For target_verify/draft_extend, seqlens_32 and block_tables are
+            # expanded per-token; truncate to match the actual batch_size
+            # after q_offset truncation (mirrors CUDA branch's block_tables[::next_n]).
+            if (
+                forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            ):
+                seqlens_32 = seqlens_32[:batch_size]
+                block_tables = block_tables[:batch_size]
             deepgemm_fp8_paged_mqa_logits(
                 q_fp8,
                 kv_cache_fp8,
