@@ -113,8 +113,27 @@ SIGPIPE(141) → 管道整体判失败 → 走"不支持"分支 → 产物只有
 修复：先抓 help 到变量再 grep（`NVCC_HELP="$("$NVCC" --help 2>&1 || true)"`）+ 不支持时打
 WARNING；重建后 `cuobjdump -lelf` 确认含 `sm_103a`。
 
-### 8.4 该部署的 profiler 不可用（验证手段受限）
+### 8.4 blob 视图不能再用 `torch.Tensor().set_(cuda_blob, ...)`
+
+修完 8.1–8.3 后暴露的第四个 init bug（双端 8 rank）：
+
+```
+p2p_ar: init failed (Attempted to set the storage of a tensor on device "cpu" to a
+        storage on different device "cuda:N". This is no longer allowed; the
+        devices must match.)
+```
+
+`staging_local` / `ready_local` 原本写成
+`torch.Tensor().set_(self._blob, off, shape)`：`torch.Tensor()` 是 **CPU** 张量、`self._blob`
+在 **CUDA**，现代 torch 拒绝把 CPU 张量的 storage 重指到 CUDA storage。
+修复：直接**切片 CUDA blob** 再 `.view(dtype)`（storage 天然在正确设备）。
+
+### 8.5 该部署的 profiler 不可用（验证手段受限）
 
 `/stop_profile` 报 `RuntimeError: Profiling is not in progress`，trace 永不落盘 ⇒ 内核级证据
 只能走日志探针（同 `MOL-PROBE` 思路：在 host 侧把真正交给 kernel 的 config/grid 打一次），
 profile 口径的 A/B 需要另找环境或先修 profiler。
+
+> 教训：P2P AR 这条链上 **4 个 bug 全部只在真机启停时才暴露**（IPC 句柄 ABI、字节截断、
+> 编译架构探测的 SIGPIPE、张量 storage 设备语义）。"能 import、能编 .so、逻辑自洽"
+> 完全不能替代一次真实启停。

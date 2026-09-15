@@ -711,11 +711,9 @@ def _merged_experts_fused_moe_lora_add_impl(
             stage_top_k,
             config_dtype,
         )
-        used_fallback = False
         try:
             cfg = get_config_func(token_lora_mapping.shape[0])
         except ValueError:
-            used_fallback = True
             K_dim = weight.shape[2]
             N_dim = weight.shape[1]
             if K_dim >= 1024:
@@ -732,12 +730,17 @@ def _merged_experts_fused_moe_lora_add_impl(
                 "num_warps": 4,
                 "num_stages": 4,
             }
-        # Unified MoL stage tuning (SGLANG_OPT_MOL_LORA_STAGE_CFG). Only the
-        # fallback config is retuned -- an autotuned entry (if one ever exists
-        # for these shapes) is left alone. Touches only BLOCK_SIZE_N, so the
-        # align block size / BLOCK_SIZE_K / K-loop stay as upstream
-        # -> bit-identical. Kill-switch: leave the env unset.
-        if used_fallback and _mol_lora_stage_cfg_enabled():
+        # Unified MoL stage tuning (SGLANG_OPT_MOL_LORA_STAGE_CFG).
+        #
+        # Applied whether or not the autotuner produced a config: measured on the
+        # B300 pair, the autotuner returns a *generic* entry for these shapes
+        # (BM=16 BN=32 BK=64 -- see MOL-PROBE), there is no tuned-for-MoL config to
+        # protect, and this helper is only ever called for the MoL virtual-expert
+        # stages. Gating on `used_fallback` (an earlier, over-cautious version)
+        # silently turned the flag into a no-op here.
+        # Touches only BLOCK_SIZE_N, so the align block size / BLOCK_SIZE_K /
+        # K-loop stay as upstream -> bit-identical. Kill-switch: unset the env.
+        if _mol_lora_stage_cfg_enabled():
             tuned = _apply_mol_lora_stage_cfg(cfg, n_dim)
             if tuned != cfg:
                 _log_mol_lora_stage_cfg_once(cfg, tuned, n_dim)
