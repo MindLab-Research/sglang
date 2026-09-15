@@ -32,6 +32,27 @@ _DEFAULT_MAX_ELEMS = int(os.environ.get("SGLANG_P2P_AR_MAX_ELEMS", 8 * 1024 * 10
 _IPC_HANDLE_BYTES = 64  # cudaIpcMemHandle_t
 
 
+class _IpcMemHandle(ctypes.Structure):
+    """cudaIpcMemHandle_t -- 64 opaque bytes that must be passed BY VALUE.
+
+    Passing a ``ctypes.c_char * 64`` array (or any pointer) instead hands the
+    runtime the *address* of the bytes: the ABI classifies this struct as MEMORY,
+    so the callee copies sizeof(cudaIpcMemHandle_t) bytes out of the argument
+    slot, reads the pointer value as the handle payload and fails with
+    cudaErrorInvalidValue (1). Verified on the B300 boxes with a two-process
+    probe (allocate+get in process A, open in process B):
+
+        c_char*64 array,  flags=1 -> err=1
+        struct by value,  flags=1 -> err=0   (ptr resolved)
+        struct by value,  flags=0 -> err=1   (peer access flag is required)
+
+    That is exactly the "p2p_ar: init failed (cuda error 1); disabled" seen on
+    both PD nodes.
+    """
+
+    _fields_ = [("bytes", ctypes.c_char * _IPC_HANDLE_BYTES)]
+
+
 def p2p_ar_enabled() -> bool:
     return os.environ.get("SGLANG_P2P_AR", "0") == "1"
 
@@ -65,6 +86,20 @@ class P2PAllReduce:
             ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
         ]
         self._cudart = ctypes.CDLL("libcudart.so")
+        # Explicit prototypes: the IPC handle is a 64-byte struct passed BY VALUE
+        # to cudaIpcOpenMemHandle (see _IpcMemHandle). Without these, ctypes
+        # marshals the argument as an integer/pointer and the open fails with
+        # cudaErrorInvalidValue (1).
+        self._cudart.cudaIpcGetMemHandle.restype = ctypes.c_int
+        self._cudart.cudaIpcGetMemHandle.argtypes = [
+            ctypes.POINTER(_IpcMemHandle), ctypes.c_void_p,
+        ]
+        self._cudart.cudaIpcOpenMemHandle.restype = ctypes.c_int
+        self._cudart.cudaIpcOpenMemHandle.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p), _IpcMemHandle, ctypes.c_uint,
+        ]
+        self._cudart.cudaIpcCloseMemHandle.restype = ctypes.c_int
+        self._cudart.cudaIpcCloseMemHandle.argtypes = [ctypes.c_void_p]
 
         if self.world < 2 or self.world > 8:
             logger.info("p2p_ar: world=%d not in [2,8]; disabled", self.world)
@@ -102,11 +137,11 @@ class P2PAllReduce:
         # publish my handle, collect everyone's
         import torch.distributed as dist
 
-        handle = (ctypes.c_char * _IPC_HANDLE_BYTES)()
+        handle = _IpcMemHandle()
         base = self._blob.data_ptr()
         self._check(self._cudart.cudaIpcGetMemHandle(ctypes.byref(handle), ctypes.c_void_p(base)))
         gathered = [torch.zeros(_IPC_HANDLE_BYTES, dtype=torch.uint8, device=dev) for _ in range(self.world)]
-        mine = torch.frombuffer(bytearray(handle), dtype=torch.uint8).to(dev)
+        mine = torch.frombuffer(bytearray(handle.bytes), dtype=torch.uint8).to(dev)
         dist.all_gather(gathered, mine, group=self.group)
 
         peer_bases = []
@@ -115,9 +150,7 @@ class P2PAllReduce:
             if r == self.rank:
                 peer_bases.append(base)
                 continue
-            h = (ctypes.c_char * _IPC_HANDLE_BYTES).from_buffer_copy(
-                gathered[r].cpu().numpy().tobytes()
-            )
+            h = _IpcMemHandle.from_buffer_copy(gathered[r].cpu().numpy().tobytes())
             ptr = ctypes.c_void_p()
             self._check(
                 self._cudart.cudaIpcOpenMemHandle(
