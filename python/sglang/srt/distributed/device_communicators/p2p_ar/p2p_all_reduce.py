@@ -57,6 +57,25 @@ def p2p_ar_enabled() -> bool:
     return os.environ.get("SGLANG_P2P_AR", "0") == "1"
 
 
+_CAPTURE_SKIP_LOGGED = False
+
+
+def _capture_guard_enabled() -> bool:
+    """Kill-switch for the CUDA-graph-capture guard: SGLANG_P2P_AR_CAPTURE_GUARD=0."""
+    return os.environ.get("SGLANG_P2P_AR_CAPTURE_GUARD", "1") != "0"
+
+
+def _note_capture_skip_once() -> None:
+    global _CAPTURE_SKIP_LOGGED
+    if _CAPTURE_SKIP_LOGGED:
+        return
+    _CAPTURE_SKIP_LOGGED = True
+    logger.info(
+        "p2p_ar: CUDA graph capture detected -- falling back for captured graphs "
+        "(SGLANG_P2P_AR_CAPTURE_GUARD=0 disables this guard)"
+    )
+
+
 class P2PAllReduce:
     """Owns the staging/ready/epoch buffers and the peer pointer tables."""
 
@@ -194,6 +213,18 @@ class P2PAllReduce:
 
     # ------------------------------------------------------------------- gate
     def should_p2p_ar(self, x: torch.Tensor) -> bool:
+        # Never take the P2P path while this rank is capturing CUDA graphs.
+        #
+        # The kernel spin-waits on peer ready flags. During capture each rank
+        # walks shapes/steps in its own order (and skips shapes the others run),
+        # so the waits pair up wrongly and the capture never finishes -- observed
+        # on 1022 with SGLANG_P2P_AR=1: "Capturing batches (bs=64): 0/27" stuck
+        # for 8+ minutes with all 8 GPUs pinned at 100%, while every boot with
+        # p2p_ar disabled (or failed -> NCCL fallback) finished capture in ~1-2
+        # minutes. Kill-switch: SGLANG_P2P_AR_CAPTURE_GUARD=0.
+        if _capture_guard_enabled() and torch.cuda.is_current_stream_capturing():
+            _note_capture_skip_once()
+            return False
         return (
             not self.disabled
             and x.dtype == torch.bfloat16
