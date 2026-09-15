@@ -1032,11 +1032,14 @@ class Envs:
     # shrink_splitk grid=[1604]/[802] 43.1+5.2us) -- i.e. all five per-layer
     # LoRA launches are tile/CTA-overhead bound, not bandwidth bound.
     #
-    # Enabled: retunes only BLOCK_SIZE_M (64 -> 16, the align padding unit) and
-    # BLOCK_SIZE_N (64 -> up to 256, the N-tile width) of the MoL stages, which
-    # cuts the padded rows and the grid by ~4x. BLOCK_SIZE_K and the K-loop are
-    # untouched, so the per-output reduction order is unchanged -> bit-identical
-    # results. Kill-switch for A/B: unset (default) keeps upstream behaviour.
+    # Enabled: retunes only BLOCK_SIZE_N (64 -> up to 256) of the MoL stages.
+    # The launch grid is built host-side as
+    #   cdiv(sorted_token_ids.shape[0], BLOCK_SIZE_M) * cdiv(B.shape[1], BLOCK_SIZE_N)
+    # with sorted_token_ids being the worst-case routing buffer, so grid_m only
+    # weakly depends on BLOCK_SIZE_M (~virtual_E + numel/BLOCK_SIZE_M) while
+    # grid_n = cdiv(N, BLOCK_SIZE_N) is a clean 4x lever. BLOCK_SIZE_M,
+    # BLOCK_SIZE_K and the K-loop are untouched, so the per-output reduction
+    # order is unchanged -> bit-identical. Kill-switch for A/B: unset = upstream.
     SGLANG_OPT_MOL_LORA_STAGE_CFG = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)

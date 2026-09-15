@@ -51,7 +51,12 @@ except ValueError:
 = 1024 桶）：
 
 - 真实 (token, 虚拟专家) pair ≈ 1.1k → **padded rows ≈ 1604 blocks × 64 ≈ 1e5（~93× 膨胀）**
-- launch 数 `grid = blocks × cdiv(N, BLOCK_SIZE_N)`
+- launch 数（host 端，`fused_moe_triton_kernels.py::invoke_fused_moe_kernel`）：
+  ```
+  grid = cdiv(sorted_token_ids.shape[0], BLOCK_SIZE_M) * cdiv(B.shape[1], BLOCK_SIZE_N)
+  ```
+  其中 `sorted_token_ids` 是最坏情况**分配**缓冲（`_get_routing` 刻意不 trim，见该函数注释）
+  ⇒ `sorted_len = numel + virtual_E×(BLOCK_SIZE_M−1)`、`grid_m ≈ virtual_E + numel/BLOCK_SIZE_M`。
 
 **三处 grid 独立对账**（同一窗口实测 vs 公式）：
 

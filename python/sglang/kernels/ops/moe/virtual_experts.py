@@ -27,28 +27,36 @@ from sglang.jit_kernel.moe_align import moe_align_block_size as jit_moe_align_bl
 # sibling launches do the same kind of work in 5-43us -- i.e. all five
 # per-layer LoRA launches are tile/CTA-overhead bound, not bandwidth bound.
 #
-# The fix retunes the one knob that actually drives the launch count. Note the
-# arithmetic carefully: the align step pads every touched bucket to a multiple
-# of BLOCK_SIZE_M, so padded_rows = blocks * BLOCK_SIZE_M and therefore
-#     grid_m = cdiv(padded_rows, BLOCK_SIZE_M) == blocks
-# i.e. grid_m is *invariant* to BLOCK_SIZE_M (and shrinking BLOCK_SIZE_M only
-# splits buckets into more blocks, raising grid_m). The launch count is
-#     grid = blocks * cdiv(N, BLOCK_SIZE_N),
-# so BLOCK_SIZE_N is the lever. It is clamped to the stage's real GEMM N so no
-# dead columns are computed. BLOCK_SIZE_K and the K-loop stay untouched, so each
-# output element still reduces over K inside a single tile -> bit-identical.
+# The fix retunes the knob that actually drives the launch count. The grid is
+# built host-side in invoke_fused_moe_kernel as
+#     grid = cdiv(sorted_token_ids.shape[0], BLOCK_SIZE_M) * cdiv(B.shape[1], BLOCK_SIZE_N)
+# and sorted_token_ids is the *worst-case allocated* routing buffer (the caller
+# deliberately keeps the untrimmed allocation, see the long note in _get_routing),
+# so     sorted_len = numel + virtual_num_experts * (BLOCK_SIZE_M - 1)
+#      grid_m    = cdiv(sorted_len, BLOCK_SIZE_M) ~= virtual_num_experts + numel/BLOCK_SIZE_M
+# i.e. grid_m only weakly decreases with BLOCK_SIZE_M (a few percent) while each
+# tile walks proportionally more padded rows -- so that knob is NOT the lever.
+# BLOCK_SIZE_N is: grid_n = cdiv(N, BLOCK_SIZE_N) is a clean 4x cut for the
+# down-delta expand (N=6144: 96 -> 24) and for the gate_up halves (N=256: 4 -> 1).
+# It is clamped to the stage's real GEMM N so no dead columns are computed.
+# BLOCK_SIZE_K and the K-loop stay untouched, so each output element still
+# reduces over K inside a single tile -> bit-identical.
 _MOL_LORA_TUNED_BLOCK_N = 256
-_MOL_LORA_STAGE_CFG_CACHED: "bool | None" = None
+_MOL_LORA_STAGE_CFG_ENV = None
 
 
 def _mol_lora_stage_cfg_enabled() -> bool:
-    """Cached read of SGLANG_OPT_MOL_LORA_STAGE_CFG (hot path: 2 calls/layer)."""
-    global _MOL_LORA_STAGE_CFG_CACHED
-    if _MOL_LORA_STAGE_CFG_CACHED is None:
+    """Read SGLANG_OPT_MOL_LORA_STAGE_CFG (2 calls per layer).
+
+    The EnvBool object is cached but its value is read live, so a test/runner can
+    still flip it (envs.<X>.override()) after this module was imported.
+    """
+    global _MOL_LORA_STAGE_CFG_ENV
+    if _MOL_LORA_STAGE_CFG_ENV is None:
         from sglang.srt.environ import envs
 
-        _MOL_LORA_STAGE_CFG_CACHED = bool(envs.SGLANG_OPT_MOL_LORA_STAGE_CFG.get())
-    return _MOL_LORA_STAGE_CFG_CACHED
+        _MOL_LORA_STAGE_CFG_ENV = envs.SGLANG_OPT_MOL_LORA_STAGE_CFG
+    return bool(_MOL_LORA_STAGE_CFG_ENV.get())
 
 
 def _apply_mol_lora_stage_cfg(cfg: dict, n_dim: int) -> dict:
@@ -678,9 +686,11 @@ def _merged_experts_fused_moe_lora_add_impl(
             stage_top_k,
             config_dtype,
         )
+        used_fallback = False
         try:
             cfg = get_config_func(token_lora_mapping.shape[0])
         except ValueError:
+            used_fallback = True
             K_dim = weight.shape[2]
             N_dim = weight.shape[1]
             if K_dim >= 1024:
@@ -697,10 +707,12 @@ def _merged_experts_fused_moe_lora_add_impl(
                 "num_warps": 4,
                 "num_stages": 4,
             }
-        # Unified MoL stage tuning (SGLANG_OPT_MOL_LORA_STAGE_CFG). Touches only
-        # BLOCK_SIZE_N, so the align block size / BLOCK_SIZE_K / K-loop stay as
-        # upstream -> bit-identical results. Kill-switch: leave the env unset.
-        if _mol_lora_stage_cfg_enabled():
+        # Unified MoL stage tuning (SGLANG_OPT_MOL_LORA_STAGE_CFG). Only the
+        # fallback config is retuned -- an autotuned entry (if one ever exists
+        # for these shapes) is left alone. Touches only BLOCK_SIZE_N, so the
+        # align block size / BLOCK_SIZE_K / K-loop stay as upstream
+        # -> bit-identical. Kill-switch: leave the env unset.
+        if used_fallback and _mol_lora_stage_cfg_enabled():
             tuned = _apply_mol_lora_stage_cfg(cfg, n_dim)
             if tuned != cfg:
                 _log_mol_lora_stage_cfg_once(cfg, tuned, n_dim)
@@ -814,9 +826,13 @@ def _merged_experts_fused_moe_lora_add_impl(
         device=hidden_states.device,
     )
 
-    # Shrink GEMM: B is [E, K=hidden, N=rank] -> stage N is the LoRA rank dim.
+    # Shrink GEMM: the kernel documents its weight as B[E, N, K] (b_ptr is walked
+    # as offs_k * stride_bk + offs_bn * stride_bn), and _invoke_moe_lora_shrink_splitk
+    # itself reads N = weight.shape[1] -- same for the merged 4-D view
+    # [max_loras, num_experts, rank, in] -> [E, rank, in]. So the stage N is
+    # shape[1] (the LoRA rank), not shape[2] (the contraction dim).
     a_stage_config = _get_stage_config(
-        lora_a_virtual, input_top_k, lora_a_virtual.shape[2]
+        lora_a_virtual, input_top_k, lora_a_virtual.shape[1]
     )
     (
         sorted_token_ids,
