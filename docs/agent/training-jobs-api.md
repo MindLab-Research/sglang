@@ -24,7 +24,7 @@
 | 路径前缀 | `/v1/control/jobs` |
 | 并发上限 | 64（同 job 的任务共享，多个 job 同时提交也在 64 内排队） |
 | 请求超时 | **仅空闲超时**（env `SMG_JOBS_REQUEST_TIMEOUT_SECS` 可调，默认 3600s，建议 7200+）：引擎每吐一段新内容就重置计时器，**只要持续出内容就永不超时**；仅当整整该时长无任何数据才判定上游卡死断开。**无固定 wall-clock 总 deadline** |
-| 结果保留 | 48 小时（磁盘持久化，router 重启自动恢复） |
+| 结果保留 | **48 小时**（磁盘持久化，router 重启自动恢复）。超过保留期的**终态** job（completed/failed/cancelled/partial）会被后台 GC 删除；`queued`/`running` 永不因超龄被删。env `SMG_JOBS_RETENTION_HOURS` 可调（小数小时可用；**0 = 关闭 GC**），扫描间隔 `SMG_JOBS_GC_INTERVAL_SECS`（默认 1800s） |
 | 单 job 任务数上限 | 4096 |
 
 ---
@@ -374,7 +374,10 @@ requests.delete(f"{BASE}/v1/control/jobs/{job_id}", headers=HEADERS)
 ## 8. 运维备注（服务端）
 
 - 结果落盘：`/root/smg-jobs/{job_id}/`（`job.json` + `task_XXXX.json`，原子写）；router 启动时自动恢复
-- 相关环境变量（启动 router 时）：`SMG_JOBS_DIR`（默认 ./smg-jobs）、`SMG_JOBS_MAX_CONCURRENCY`（默认 64）、`SMG_JOBS_REQUEST_TIMEOUT_SECS`（默认 3600）、`SMG_JOBS_SELF_URL`（默认 `http://127.0.0.1:{port}`）
+- 相关环境变量（启动 router 时）：`SMG_JOBS_DIR`（默认 ./smg-jobs）、`SMG_JOBS_MAX_CONCURRENCY`（默认 64）、`SMG_JOBS_REQUEST_TIMEOUT_SECS`（默认 3600）、`SMG_JOBS_SELF_URL`（默认 `http://127.0.0.1:{port}`）、**`SMG_JOBS_RETENTION_HOURS`（默认 48，0=关闭 GC）**、**`SMG_JOBS_GC_INTERVAL_SECS`（默认 1800）**
+- **本地 GC（2026-09-15 加入）**：后台任务定期扫描 `SMG_JOBS_DIR`，把**最后活动时间**超过保留期的 job 目录删掉（`job.json` 每次状态变更都会重写、`task_*.json` 随任务完成落盘，所以该时间即真实进度）。判据：只删终态；`running`/`queued` 一律保留；删除会打日志（含释放体积），例如
+  `jobs: gc removed job_xxx (idle 52.1h > retention 48.0h, freed 91.2 MB)`。
+  启动时也会立即扫一次（把停机期间积压的旧数据回收）。
 - 当前部署命令（B300-1）：
   ```bash
   SMG_JOBS_DIR=/root/smg-jobs setsid nohup /usr/local/bin/smg launch \
