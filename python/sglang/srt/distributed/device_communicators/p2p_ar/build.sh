@@ -15,8 +15,16 @@ OUT="${1:-$HERE/libp2p_ar.so}"
 NVCC="${NVCC:-nvcc}"
 
 ARCH_FLAGS=()
-if nvcc --help 2>/dev/null | grep -q "compute_103a"; then
+# NOTE: probe the *configured* compiler, and never pipe its help straight into
+# `grep -q`: grep exits on first match, nvcc then dies of SIGPIPE (141) and with
+# `set -o pipefail` the whole pipeline looks like a failure -- which silently
+# dropped the sm_103a gencode and produced a .so that cannot run on SM103 (the
+# build "succeeded"; the failure only showed up at load time). Capture first.
+NVCC_HELP="$("$NVCC" --help 2>&1 || true)"
+if grep -q "compute_103a" <<<"$NVCC_HELP"; then
   ARCH_FLAGS+=("-gencode" "arch=compute_103a,code=sm_103a")
+else
+  echo "WARNING: $NVCC has no compute_103a support -> SM103 (B300) is NOT covered" >&2
 fi
 # common fallbacks so the .so also builds on other boxes
 ARCH_FLAGS+=("-gencode" "arch=compute_90a,code=sm_90a")
