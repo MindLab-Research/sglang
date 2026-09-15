@@ -62,3 +62,59 @@ partials 进 AR 前**已经是 bf16**（torch `dist.all_reduce` 看到的就是 
 
 `SGLANG_P2P_AR=1` + `SGLANG_P2P_AR_LIB=/path/libp2p_ar.so` 是**启动参数**，需**重启**引擎生效
 （decode 端先上，prefill 端同理）。未验证前不要在生产 1021/1022 打开。
+
+## 8. 2026-09-15 部署实录：init 链路 3 个真 bug（全部实测定位）
+
+在 1021/1022（8.213.214.14）首次真正启停验证 `SGLANG_P2P_AR=1`，双端 8 rank 全部：
+
+```
+p2p_ar: init failed (cuda error 1); disabled
+```
+
+逐层剥出 3 个 bug（本特性从未跑过 ⇒ 全部是首次暴露）：
+
+### 8.1 `cudaIpcMemHandle_t` 必须按值传（cuda error 1 的真身）
+
+`cudaIpcOpenMemHandle` 第二个参数是 64 字节结构体，ABI 归 **MEMORY 类 = 按值传递**。
+原实现传 `ctypes.c_char * 64` 数组，ctypes 会把它当**指针**传 → callee 把指针值当句柄内容
+读 → `cudaErrorInvalidValue(1)`。
+
+两进程实验（A 进程 allocate+get，B 进程 open，同一张卡）：
+
+| 传参形式 | flags | 结果 |
+|---|---|---|
+| `c_char*64` 数组（原实现） | `cudaIpcMemLazyEnablePeerAccess` | **err=1** |
+| 64B `ctypes.Structure` **按值** | `cudaIpcMemLazyEnablePeerAccess` | **err=0**（ptr 解析成功） |
+| 结构体按值 | 0 | err=1 ⇒ **peer-access flag 必需** |
+
+修复：新增 `_IpcMemHandle(ctypes.Structure)`；`cudaIpcGetMemHandle` 传 `byref(struct)`、
+`cudaIpcOpenMemHandle` 传 **struct 实例**；并显式设 `argtypes/restype`（否则 ctypes 退回
+整型/指针 marshalling，同样得到 err=1）。
+
+### 8.2 `handle.bytes` 在第一个 NUL 处截断（第二层误导性错误）
+
+IPC 句柄 64 字节中只有 ~19 字节非零；对 `c_char * 64` 字段取 `.bytes`/`.value` 会**在第一个
+NUL 处截断** → `mine` 变 4 字节（个别 rank 0 字节）→
+
+```
+ProcessGroupGloo::allgather: invalid tensor size at index 0 (expected (4), got (64))
+both buffer length (0) and count (-1) must not be 0
+```
+
+修复：`ctypes.string_at(ctypes.byref(handle), 64)` 取全量 + `assert len(raw) == 64`。
+同族坑：句柄交换必须用 **CPU 张量** —— 传进来的 group 是 **gloo**，不支持 CUDA 张量。
+
+### 8.3 `build.sh` 静默编错架构（丢 sm_103a）
+
+`set -euo pipefail` + `nvcc --help | grep -q compute_103a`：grep 命中即退出 → nvcc 收
+SIGPIPE(141) → 管道整体判失败 → 走"不支持"分支 → 产物只有 `sm_90a/sm_80` cubin，而
+**build.sh 仍返回 0**。B300(SM103) 上加载即失败，且只在 load 时暴露。
+
+修复：先抓 help 到变量再 grep（`NVCC_HELP="$("$NVCC" --help 2>&1 || true)"`）+ 不支持时打
+WARNING；重建后 `cuobjdump -lelf` 确认含 `sm_103a`。
+
+### 8.4 该部署的 profiler 不可用（验证手段受限）
+
+`/stop_profile` 报 `RuntimeError: Profiling is not in progress`，trace 永不落盘 ⇒ 内核级证据
+只能走日志探针（同 `MOL-PROBE` 思路：在 host 侧把真正交给 kernel 的 config/grid 打一次），
+profile 口径的 A/B 需要另找环境或先修 profiler。
