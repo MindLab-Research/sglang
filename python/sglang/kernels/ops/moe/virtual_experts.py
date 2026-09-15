@@ -71,6 +71,31 @@ def _apply_mol_lora_stage_cfg(cfg: dict, n_dim: int) -> dict:
     return tuned
 
 
+_MOL_STAGE_PROBE_LOGGED = False
+
+
+def _probe_mol_stage_cfg(a_cfg: dict, b_cfg: dict) -> None:
+    """One-shot diagnostic: proves the MoL stage path ran and shows the tiling
+    actually handed to the kernels (grep MOL-PROBE in the engine log).
+
+    This is the log-side counterpart of the profiler check: BLOCK_SIZE_N here is
+    what becomes `num_pid_n = cdiv(N, BLOCK_SIZE_N)` in the kernel, i.e. the
+    launch-count lever this flag tunes (expand: 64 before, min(256, N) after).
+    """
+    global _MOL_STAGE_PROBE_LOGGED
+    if _MOL_STAGE_PROBE_LOGGED:
+        return
+    _MOL_STAGE_PROBE_LOGGED = True
+    import logging
+
+    logging.getLogger(__name__).info(
+        "[MOL-PROBE] flag=%s shrink(BM=%s BN=%s BK=%s) expand(BM=%s BN=%s BK=%s)",
+        _mol_lora_stage_cfg_enabled(),
+        a_cfg.get("BLOCK_SIZE_M"), a_cfg.get("BLOCK_SIZE_N"), a_cfg.get("BLOCK_SIZE_K"),
+        b_cfg.get("BLOCK_SIZE_M"), b_cfg.get("BLOCK_SIZE_N"), b_cfg.get("BLOCK_SIZE_K"),
+    )
+
+
 _MOL_LORA_STAGE_CFG_LOGGED = False
 
 
@@ -862,6 +887,7 @@ def _merged_experts_fused_moe_lora_add_impl(
     # Expand GEMM: B is [E, N=output width, K=rank] -> stage N is the output width
     # per B tensor (gate/up half for gate_up, full hidden for down).
     b_stage_config = _get_stage_config(lora_b_virtuals[0], 1, half_out)
+    _probe_mol_stage_cfg(a_stage_config, b_stage_config)
     (
         sorted_token_ids,
         expert_ids,
