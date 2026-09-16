@@ -98,6 +98,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+class KvOffloadIndexError(RuntimeError):
+    """Raised when KV indices passed to the host-offload path are out of range.
+
+    The offload path (retract -> ``get_cpu_copy`` -> resume) is a
+    recompute-saving optimisation, so an invalid index must degrade into a
+    skipped offload instead of a device-side assert that aborts every rank.
+    """
+
 GB = 1024 * 1024 * 1024
 _is_cuda = is_cuda()
 _is_npu = is_npu()
@@ -4119,8 +4128,68 @@ class MLATokenToKVPool(KVCache):
         for kv_cache in self.kv_buffer:
             kv_cache[tgt_loc_flat] = kv_cache[src_loc_flat]
 
+    def localize_kv_offload_indices(self, indices: torch.Tensor) -> torch.Tensor:
+        """Map KV indices from the allocator domain to this rank's physical slots.
+
+        With DCP enabled the allocator hands out ids over a *virtual* space that
+        is ``dcp_size`` times larger than this rank's physical pool, so a raw id
+        can exceed the buffer's row count. The KV write path
+        (``_write_mla_kv_buffer``) already converts ids and applies the owner
+        filter; the retract->host-offload path (``Req.offload_kv_cache`` ->
+        ``get_cpu_copy``) used to index the physical buffer with the raw ids.
+        That is a device-side assert away from killing every TP rank: on
+        2026-09-16 the PD decode engine lost all 8 ranks inside
+        ``retract_decode -> offload_kv_cache -> get_cpu_copy``.
+
+        Non-owner / invalid ids are routed to the scratch row ``self.size``
+        (exactly like the write path), so offloading them is harmless and
+        restoring them is a no-op.
+        """
+        if not dcp_enabled():
+            return indices
+        _dws = get_attention_dcp_world_size()
+        _ps = self.page_size
+        _valid = (indices >= 0) & (indices < self.size * _dws)
+        _slot = (indices // (_ps * _dws)) * _ps + (indices % _ps)
+        _owner = ((indices // _ps) % _dws == get_attention_dcp_rank()) & _valid
+        return torch.where(_owner, _slot, torch.full_like(indices, self.size))
+
+    def assert_kv_offload_indices_in_range(
+        self, indices: torch.Tensor, where: str
+    ) -> None:
+        """Fail fast (in Python) when offload indices are out of the buffer.
+
+        Indexing ``kv_buffer`` with an out-of-range id triggers a *device-side*
+        assert, which poisons the CUDA context and aborts every rank. A cheap
+        host-side check turns that class of bug into one skipped offload.
+        """
+        cap = self.size + self.page_size
+        if indices.numel() == 0:
+            return
+        idx_max = int(indices.max())
+        idx_min = int(indices.min())
+        if idx_max >= cap or idx_min < 0:
+            logger.error(
+                "OFFLOAD-OOB[%s]: idx_min=%d idx_max=%d cap=%d size=%d page_size=%d "
+                "dcp=%d -> skipping KV offload (request will be recomputed) "
+                "instead of asserting inside the CUDA kernel",
+                where,
+                idx_min,
+                idx_max,
+                cap,
+                self.size,
+                self.page_size,
+                get_attention_dcp_world_size() if dcp_enabled() else 1,
+            )
+            raise KvOffloadIndexError(
+                f"{where}: KV offload index out of range "
+                f"(min={idx_min}, max={idx_max}, cap={cap})"
+            )
+
     def get_cpu_copy(self, indices, mamba_indices=None):
         current_platform.synchronize()
+        indices = self.localize_kv_offload_indices(indices)
+        self.assert_kv_offload_indices_in_range(indices, "get_cpu_copy")
         kv_cache_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
@@ -4136,6 +4205,8 @@ class MLATokenToKVPool(KVCache):
 
     def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
         current_platform.synchronize()
+        indices = self.localize_kv_offload_indices(indices)
+        self.assert_kv_offload_indices_in_range(indices, "load_cpu_copy")
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
             for i in range(0, len(indices), chunk_size):
@@ -4517,7 +4588,12 @@ class DSATokenToKVPool(MLATokenToKVPool):
         # DSA attention reads garbage at those token positions.
         kv_cache_cpu = super().get_cpu_copy(indices, mamba_indices=mamba_indices)
 
-        page_indices = indices[:: self.page_size] // self.page_size
+        # Page-indexed companion buffer: localize the ids first (DCP virtual ->
+        # this rank's physical slot, owner filter) so the page indices cannot
+        # point outside index_k_with_scale_buffer either.
+        loc = self.localize_kv_offload_indices(indices)
+        self.assert_kv_offload_indices_in_range(loc, "get_cpu_copy[index_k]")
+        page_indices = loc[:: self.page_size] // self.page_size
         torch.cuda.synchronize()
         index_k_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
@@ -4539,7 +4615,9 @@ class DSATokenToKVPool(MLATokenToKVPool):
             kv_cache_cpu_dict["kv"], indices, mamba_indices=mamba_indices
         )
 
-        page_indices = indices[:: self.page_size] // self.page_size
+        loc = self.localize_kv_offload_indices(indices)
+        self.assert_kv_offload_indices_in_range(loc, "load_cpu_copy[index_k]")
+        page_indices = loc[:: self.page_size] // self.page_size
         index_k_cpu = kv_cache_cpu_dict["index_k"]
         torch.cuda.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
