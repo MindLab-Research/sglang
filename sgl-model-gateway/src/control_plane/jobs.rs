@@ -36,10 +36,40 @@ fn default_n() -> u64 {
     1
 }
 
+/// Reference to an existing task whose tokens seed a continuation.
+///
+/// The continuation input is `source input tokens ++ source generated tokens`,
+/// resolved server-side, so the client never re-sends the (possibly huge) token
+/// arrays. `sample_index` picks which sample of a multi-sample source to
+/// continue (default 0).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContinueFrom {
+    pub job_id: String,
+    /// Source task id (globally unique, e.g. `job_..._t0000`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    /// Source task index inside `job_id` (alternative to `task_id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample_index: Option<usize>,
+}
+
 /// One training task, in the training client's OpenAI-ish format.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+///
+/// Exactly one input source must be provided: `prompt` (text), `input_ids`
+/// (tokens) or `continue_from` (server-side continuation).
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct TaskRequest {
+    #[serde(default)]
     pub prompt: String,
+    /// Token-level input. Takes the place of `prompt`; the engine skips
+    /// tokenization entirely, so the sequence is bit-exact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_ids: Option<Vec<i64>>,
+    /// Continue an existing task without re-sending any tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continue_from: Option<ContinueFrom>,
     #[serde(default)]
     pub max_tokens: Option<u64>,
     #[serde(default)]
@@ -66,6 +96,159 @@ pub struct TaskRequest {
 impl TaskRequest {
     fn sanitize_n(&self) -> u64 {
         self.n.clamp(1, 64)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Input-source rules + native /generate body construction. Pure helpers (unit
+// tested below) — the job manager only supplies resolved token ids.
+// ---------------------------------------------------------------------------
+
+/// Exactly one input source must be given, and it must be non-empty.
+fn validate_task_input(req: &TaskRequest) -> Result<(), String> {
+    let has_text = !req.prompt.trim().is_empty();
+    let has_ids = req.input_ids.is_some();
+    let has_cont = req.continue_from.is_some();
+    let given = [has_text, has_ids, has_cont].iter().filter(|b| **b).count();
+    if given == 0 {
+        return Err(
+            "task has no input: provide exactly one of 'prompt', 'input_ids' or 'continue_from'"
+                .into(),
+        );
+    }
+    if given > 1 {
+        return Err(
+            "task must provide exactly one of 'prompt', 'input_ids' or 'continue_from'".into(),
+        );
+    }
+    if let Some(ids) = &req.input_ids {
+        if ids.is_empty() {
+            return Err("task with empty input_ids".into());
+        }
+    }
+    Ok(())
+}
+
+/// Build the native /generate body for one task. A resolved `input_ids` (either
+/// client-supplied or composed by a continuation) replaces the text prompt so
+/// the token sequence the model sees is bit-exact.
+fn build_generate_body(req: &TaskRequest, input_ids: Option<&[i64]>) -> Value {
+    let mut body = json!({
+        "sampling_params": {
+            "max_new_tokens": req.max_tokens.unwrap_or(4096),
+        },
+        "return_logprob": true,
+        "stream": true,
+    });
+    match input_ids {
+        Some(ids) => body["input_ids"] = json!(ids),
+        None => body["text"] = json!(req.prompt),
+    }
+    {
+        let sp = body["sampling_params"].as_object_mut().unwrap();
+        if let Some(t) = req.temperature {
+            sp.insert("temperature".into(), json!(t));
+        }
+        if let Some(p) = req.top_p {
+            sp.insert("top_p".into(), json!(p));
+        }
+    }
+    if let Some(lp) = &req.lora_path {
+        body["lora_path"] = json!(lp);
+    }
+    body
+}
+
+/// Continuation input: everything the source task was given, plus everything it
+/// generated — the model then resumes exactly where it stopped.
+fn compose_input_ids(base: &[i64], generated: &[i64]) -> Vec<i64> {
+    let mut out = Vec::with_capacity(base.len() + generated.len());
+    out.extend_from_slice(base);
+    out.extend_from_slice(generated);
+    out
+}
+
+/// Generated tokens of the sample a continuation resumes from.
+fn select_sample_ids(result: &TaskResult, sample_index: usize) -> Result<Vec<i64>, String> {
+    match result.samples.get(sample_index) {
+        Some(s) => Ok(s.output_ids.clone()),
+        None => Err(format!(
+            "sample_index {} out of range: source has {} sample(s)",
+            sample_index,
+            result.samples.len()
+        )),
+    }
+}
+
+/// Sampling/adapter overrides for a job-level resume body.
+#[derive(Clone, Debug, Default)]
+struct ResumeOverrides {
+    max_tokens: Option<u64>,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+    lora_path: Option<String>,
+    n: Option<u64>,
+}
+
+/// Parsed submit body: (job-level lora default, explicit tasks, resume spec).
+type ParsedSubmit = (
+    Option<String>,
+    Vec<TaskRequest>,
+    Option<(ContinueFrom, ResumeOverrides)>,
+);
+
+/// Parse a submit body into (job-level lora default, explicit tasks, job-level
+/// resume spec). Three accepted shapes:
+///   * `[ {...}, ... ]`                          — task array
+///   * `{ "requests": [ ... ], "lora_path": x }` — object form
+///   * `{ "continue_from": { "job_id": ... } }`  — resume a whole job
+fn parse_submit_body(body: &Value) -> Result<ParsedSubmit, String> {
+    let parse_requests = |arr: &[Value]| -> Result<Vec<TaskRequest>, String> {
+        arr.iter()
+            .enumerate()
+            .map(|(i, v)| {
+                serde_json::from_value::<TaskRequest>(v.clone())
+                    .map_err(|e| format!("invalid task at index {i}: {e}"))
+            })
+            .collect()
+    };
+    match body {
+        Value::Array(arr) => Ok((None, parse_requests(arr)?, None)),
+        Value::Object(obj) => {
+            let lora = obj
+                .get("lora_path")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            if let Some(cf_val) = obj.get("continue_from") {
+                if obj.contains_key("requests") {
+                    return Err(
+                        "body cannot contain both 'requests' and 'continue_from'".to_string()
+                    );
+                }
+                let cf: ContinueFrom = serde_json::from_value(cf_val.clone())
+                    .map_err(|e| format!("invalid continue_from: {e}"))?;
+                let ov = ResumeOverrides {
+                    max_tokens: obj.get("max_tokens").and_then(|v| v.as_u64()),
+                    temperature: obj.get("temperature").and_then(|v| v.as_f64()),
+                    top_p: obj.get("top_p").and_then(|v| v.as_f64()),
+                    lora_path: lora.clone(),
+                    n: obj.get("n").and_then(|v| v.as_u64()),
+                };
+                return Ok((lora, Vec::new(), Some((cf, ov))));
+            }
+            let reqs = obj
+                .get("requests")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| {
+                    "object body must contain a 'requests' array or a 'continue_from' object"
+                        .to_string()
+                })?;
+            Ok((lora, parse_requests(reqs)?, None))
+        }
+        _ => Err(
+            "body must be a JSON array of tasks, {requests: [...]}, or {continue_from: {...}}"
+                .to_string(),
+        ),
     }
 }
 
@@ -174,6 +357,9 @@ pub struct JobManager {
     client: reqwest::Client,
     self_base_url: String,
     api_key: Option<String>,
+    /// Engine base URLs, used to tokenize a source prompt exactly when a
+    /// `continue_from` continuation needs its token ids.
+    engine_urls: Vec<String>,
     data_dir: PathBuf,
     semaphore: Arc<Semaphore>,
     request_timeout: Duration,
@@ -232,6 +418,7 @@ impl JobManager {
         data_dir: PathBuf,
         max_concurrency: usize,
         request_timeout_secs: u64,
+        engine_urls: Vec<String>,
     ) -> Arc<Self> {
         Self::build(
             self_base_url,
@@ -265,6 +452,7 @@ impl JobManager {
             client,
             self_base_url,
             api_key,
+            engine_urls,
             data_dir,
             semaphore: Arc::new(Semaphore::new(max_concurrency.max(1))),
             request_timeout: Duration::from_secs(request_timeout_secs.max(60)),
@@ -289,6 +477,292 @@ impl JobManager {
 
     fn job_dir(&self, job_id: &str) -> PathBuf {
         self.data_dir.join(sanitize_id(job_id))
+    }
+
+    // -- continuation (`continue_from`) --------------------------------------
+
+    fn task_input_path(&self, job_id: &str, index: usize) -> PathBuf {
+        self.job_dir(job_id).join(format!("input_{index:04}.json"))
+    }
+
+    /// Persist the exact token input a continuation was run with, so a later
+    /// continuation of *that* task is bit-exact too (the ids cannot be
+    /// recomputed later: a continued task has no text prompt of its own).
+    fn persist_task_input(&self, job_id: &str, index: usize, input_ids: &[i64]) {
+        let dir = self.job_dir(job_id);
+        let _ = std::fs::create_dir_all(&dir);
+        atomic_write(
+            &self.task_input_path(job_id, index),
+            &json!({ "task_id_index": index, "input_ids": input_ids }),
+        );
+    }
+
+    fn load_task_input(&self, job_id: &str, index: usize) -> Option<Vec<i64>> {
+        let raw = std::fs::read_to_string(self.task_input_path(job_id, index)).ok()?;
+        let doc: Value = serde_json::from_str(&raw).ok()?;
+        let arr = doc.get("input_ids")?.as_array()?;
+        let ids: Vec<i64> = arr.iter().filter_map(|v| v.as_i64()).collect();
+        if ids.len() != arr.len() || ids.is_empty() {
+            return None;
+        }
+        Some(ids)
+    }
+
+    /// Exact token ids for a prompt string, from an engine's own tokenizer.
+    ///
+    /// `/generate` text prompts and `/v1/tokenize` run through the same
+    /// tokenizer object inside the engine, so the ids are identical; asking an
+    /// engine avoids both storing prompt ids with every task (which would
+    /// duplicate the whole prompt on disk) and the engine's optional
+    /// `prompt_token_ids` echo, which is repeated on every streaming chunk and
+    /// would therefore balloon long prompts.
+    async fn tokenize_prompt(&self, text: &str) -> Result<Vec<i64>, String> {
+        if self.engine_urls.is_empty() {
+            return Err(
+                "continue_from needs an engine tokenizer, but no engine URL is configured \
+                 (set SMG_JOBS_ENGINE_URLS or launch the router with worker URLs)"
+                    .into(),
+            );
+        }
+        let mut last_err = String::new();
+        for url in &self.engine_urls {
+            let endpoint = format!("{}/v1/tokenize", url.trim_end_matches('/'));
+            let mut builder = self.client.post(&endpoint).json(&json!({ "prompt": text }));
+            if let Some(key) = &self.api_key {
+                builder = builder.bearer_auth(key);
+            }
+            let resp = match builder.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    last_err = format!("{endpoint} request failed: {e}");
+                    continue;
+                }
+            };
+            let status = resp.status();
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                last_err = format!("{endpoint} returned {status}: {}", truncate(&body, 200));
+                continue;
+            }
+            let doc: Value = match resp.json().await {
+                Ok(v) => v,
+                Err(e) => {
+                    last_err = format!("{endpoint} returned invalid JSON: {e}");
+                    continue;
+                }
+            };
+            match doc.get("tokens").and_then(|v| v.as_array()) {
+                Some(arr) if !arr.is_empty() && arr.iter().all(|v| v.is_i64()) => {
+                    return Ok(arr.iter().filter_map(|v| v.as_i64()).collect());
+                }
+                Some(arr) => {
+                    last_err =
+                        format!("{endpoint} returned an unusable 'tokens' array (len={})", arr.len());
+                }
+                None => last_err = format!("{endpoint} response has no 'tokens' array"),
+            }
+        }
+        Err(format!("could not tokenize the source prompt: {last_err}"))
+    }
+
+    /// Mark a task failed before any sample was produced (pre-flight failures:
+    /// adapter missing, input resolution error).
+    async fn fail_task_preflight(&self, job: &Arc<Job>, task_id: &str, err: String) {
+        {
+            let mut tasks = job.tasks.write().await;
+            if let Some(t) = tasks.iter_mut().find(|t| t.task_id == task_id) {
+                t.status = TaskStatus::Failed;
+                t.error = Some(err.clone());
+            }
+        }
+        tracing::warn!("jobs: task {} pre-flight failed: {}", task_id, err);
+        self.persist_job(job);
+    }
+
+    /// Verify that every engine has the adapter loaded.
+    ///
+    /// PD caveat this guards against: an adapter that is missing on one engine
+    /// makes the request hang in `KVPoll.Bootstrapping` until the 600s bootstrap
+    /// timeout (decode cannot allocate KV / send KV indices without it), and the
+    /// engines deliberately refuse to reload adapters inside a request. Failing
+    /// the task here turns a 10-minute silent stall into an actionable error.
+    async fn ensure_lora_loaded(&self, lora_path: &str) -> Result<(), String> {
+        if self.engine_urls.is_empty() {
+            // Nothing to check against: keep working (the engine fails fast on
+            // its own now) rather than blocking every adapter task.
+            return Ok(());
+        }
+        let mut missing: Vec<String> = Vec::new();
+        for url in &self.engine_urls {
+            match self.engine_has_lora(url, lora_path).await {
+                Ok(true) => {}
+                Ok(false) => missing.push(url.clone()),
+                Err(e) => return Err(format!("could not verify adapter on {url}: {e}")),
+            }
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "LoRA adapter is not loaded on {} of {} engine(s): {}. A PD request for a \
+             missing adapter hangs until the bootstrap timeout (600s). Load it on every \
+             engine first:\n  POST <engine>/load_lora_adapter \
+             {{\"lora_name\": \"{lora_path}\", \"lora_path\": \"{lora_path}\"}}\n\
+             and resubmit afterwards.",
+            missing.len(),
+            self.engine_urls.len(),
+            missing.join(", ")
+        ))
+    }
+
+    /// Does `base`'s `/v1/models` list `lora_path`? (Engines register an adapter
+    /// under the path they were given.)
+    async fn engine_has_lora(&self, base: &str, lora_path: &str) -> Result<bool, String> {
+        let url = format!("{}/v1/models", base.trim_end_matches('/'));
+        let mut builder = self.client.get(&url).timeout(Duration::from_secs(10));
+        if let Some(key) = &self.api_key {
+            builder = builder.bearer_auth(key);
+        }
+        let resp = builder.send().await.map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            return Err(format!("status {}", resp.status()));
+        }
+        let doc: Value = resp.json().await.map_err(|e| e.to_string())?;
+        let has = doc
+            .get("data")
+            .and_then(|d| d.as_array())
+            .map(|arr| {
+                arr.iter().any(|m| {
+                    m.get("id").and_then(|v| v.as_str()) == Some(lora_path)
+                        || m.get("root").and_then(|v| v.as_str()) == Some(lora_path)
+                })
+            })
+            .unwrap_or(false);
+        Ok(has)
+    }
+
+    /// Source tasks a resume reference selects, in submission order.
+    async fn select_resume_sources(
+        &self,
+        cf: &ContinueFrom,
+    ) -> Result<(Arc<Job>, Vec<Task>), String> {
+        let job = self
+            .get_job(&cf.job_id)
+            .ok_or_else(|| format!("continue_from: unknown job_id '{}'", cf.job_id))?;
+        let tasks = job.tasks.read().await;
+        let mut selected: Vec<Task> = if let Some(tid) = &cf.task_id {
+            tasks.iter().filter(|t| &t.task_id == tid).cloned().collect()
+        } else if let Some(idx) = cf.index {
+            tasks.iter().filter(|t| t.index == idx).cloned().collect()
+        } else {
+            tasks.iter().cloned().collect()
+        };
+        drop(tasks);
+        if selected.is_empty() {
+            return Err(format!(
+                "continue_from: no matching task in job '{}'",
+                cf.job_id
+            ));
+        }
+        // Keep submission order so the resumed job's task indices line up.
+        selected.sort_by_key(|t| t.index);
+        Ok((job, selected))
+    }
+
+    /// Single source task (task-level `continue_from`).
+    async fn find_source_task(&self, cf: &ContinueFrom) -> Result<(Arc<Job>, Task), String> {
+        let (job, mut selected) = self.select_resume_sources(cf).await?;
+        if selected.len() > 1 {
+            return Err(format!(
+                "continue_from: job '{}' has {} tasks — specify 'task_id' or 'index'",
+                cf.job_id,
+                selected.len()
+            ));
+        }
+        Ok((job, selected.remove(0)))
+    }
+
+    /// Generated tokens of a source task: live snapshot while it runs, else the
+    /// persisted result.
+    async fn source_output_ids(
+        &self,
+        source: &Task,
+        sample_index: usize,
+    ) -> Result<Vec<i64>, String> {
+        if let Some(live) = self
+            .partial_results
+            .get(&source.task_id)
+            .map(|e| e.value().clone())
+        {
+            let snapshot = live.read().await.clone();
+            if snapshot.samples.len() > sample_index {
+                return Ok(snapshot.samples[sample_index].output_ids.clone());
+            }
+        }
+        if let Some(res) = &source.result {
+            return select_sample_ids(res, sample_index);
+        }
+        Err(format!(
+            "continue_from: task '{}' has no generated tokens yet (status={:?})",
+            source.task_id, source.status
+        ))
+    }
+
+    /// Token input a source task was run with: explicit ids, else the persisted
+    /// composition of its own continuation, else `None` (= text prompt).
+    fn source_input_ids(&self, job_id: &str, source: &Task) -> Option<Vec<i64>> {
+        if let Some(ids) = &source.request.input_ids {
+            return Some(ids.clone());
+        }
+        self.load_task_input(job_id, source.index)
+    }
+
+    /// Resolve a task's exact token input. `None` means "plain text prompt" —
+    /// the engine tokenizes it as usual.
+    async fn resolve_input_ids(&self, req: &TaskRequest) -> Result<Option<Vec<i64>>, String> {
+        if let Some(ids) = &req.input_ids {
+            return Ok(Some(ids.clone()));
+        }
+        let Some(cf) = &req.continue_from else {
+            return Ok(None);
+        };
+        let (job, source) = self.find_source_task(cf).await?;
+        let generated = self
+            .source_output_ids(&source, cf.sample_index.unwrap_or(0))
+            .await?;
+        let base = match self.source_input_ids(&job.job_id, &source) {
+            Some(ids) => ids,
+            None if !source.request.prompt.trim().is_empty() => {
+                self.tokenize_prompt(&source.request.prompt).await?
+            }
+            None => {
+                return Err(format!(
+                    "continue_from: task '{}' has no recoverable input tokens \
+                     (its composed input was not persisted)",
+                    source.task_id
+                ))
+            }
+        };
+        Ok(Some(compose_input_ids(&base, &generated)))
+    }
+
+    /// A continuation inherits the source adapter + sampling params unless the
+    /// client overrides them, so a bare `continue_from` reruns the same setup.
+    async fn apply_continuation_defaults(&self, req: &mut TaskRequest) -> Result<(), String> {
+        let Some(cf) = req.continue_from.clone() else {
+            return Ok(());
+        };
+        let (_job, source) = self.find_source_task(&cf).await?;
+        if req.lora_path.is_none() {
+            req.lora_path = source.request.lora_path.clone();
+        }
+        if req.temperature.is_none() {
+            req.temperature = source.request.temperature;
+        }
+        if req.top_p.is_none() {
+            req.top_p = source.request.top_p;
+        }
+        Ok(())
     }
 
     // -- persistence ---------------------------------------------------------
@@ -379,44 +853,50 @@ impl JobManager {
 
     // -- submission ----------------------------------------------------------
 
-    /// Accepts either a raw JSON array of task requests, or an object
-    /// `{ "lora_path": optional, "requests": [...] }` (job-level lora as the
-    /// default, overridable per task).
+    /// Accepts:
+    ///   * a raw JSON array of task requests,
+    ///   * an object `{ "lora_path": optional, "requests": [...] }` (job-level
+    ///     lora as the default, overridable per task),
+    ///   * a job-level resume `{ "continue_from": {...}, ... }` which rebuilds
+    ///     the source job's task list, each task continuing from its own output.
     pub async fn submit(self: &Arc<Self>, body: Value) -> Result<Arc<Job>, String> {
-        let parse_requests = |arr: &[Value]| -> Result<Vec<TaskRequest>, String> {
-            arr.iter()
-                .enumerate()
-                .map(|(i, v)| {
-                    serde_json::from_value::<TaskRequest>(v.clone())
-                        .map_err(|e| format!("invalid task at index {i}: {e}"))
-                })
-                .collect()
-        };
-        let (job_lora, requests): (Option<String>, Vec<TaskRequest>) = match &body {
-            Value::Array(arr) => (None, parse_requests(arr)?),
-            Value::Object(obj) => {
-                let lora = obj
-                    .get("lora_path")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                let reqs = obj
-                    .get("requests")
-                    .and_then(|v| v.as_array())
-                    .ok_or_else(|| "object body must contain a 'requests' array".to_string())?;
-                (lora, parse_requests(reqs)?)
+        let (job_lora, mut requests, resume) = parse_submit_body(&body)?;
+        if let Some((cf, ov)) = resume {
+            let (source_job, sources) = self.select_resume_sources(&cf).await?;
+            let mut expanded = Vec::with_capacity(sources.len());
+            for src in sources {
+                expanded.push(TaskRequest {
+                    continue_from: Some(ContinueFrom {
+                        job_id: source_job.job_id.clone(),
+                        task_id: Some(src.task_id.clone()),
+                        index: None,
+                        sample_index: cf.sample_index,
+                    }),
+                    max_tokens: ov.max_tokens,
+                    temperature: ov.temperature,
+                    top_p: ov.top_p,
+                    lora_path: ov.lora_path.clone(),
+                    n: ov.n.unwrap_or(1),
+                    ..Default::default()
+                });
             }
-            _ => return Err("body must be a JSON array of tasks or {requests: [...]}".into()),
-        };
+            requests = expanded;
+        }
         if requests.is_empty() {
             return Err("empty task array".into());
         }
         if requests.len() > 4096 {
             return Err("too many tasks in one job (max 4096)".into());
         }
-        for r in &requests {
-            if r.prompt.trim().is_empty() {
-                return Err("task with empty prompt".into());
+        for r in requests.iter_mut() {
+            if r.lora_path.is_none() {
+                r.lora_path = job_lora.clone();
             }
+            validate_task_input(r)?;
+        }
+        // Continuations default to the source's adapter + sampling params.
+        for r in requests.iter_mut() {
+            self.apply_continuation_defaults(r).await?;
         }
 
         let job_id = self.gen_id("job");
@@ -492,6 +972,39 @@ impl JobManager {
                 }
             }
         }
+        // Pre-flight the adapter before anything is registered. In PD an
+        // adapter that is missing on any engine makes the request hang in
+        // KVPoll.Bootstrapping until the 600s bootstrap timeout (the decode
+        // engine cannot allocate KV / send its KV indices until it has the
+        // adapter, and the engines no longer reload implicitly inside a
+        // request). Fail the task immediately with the exact remediation
+        // instead of burning the timeout.
+        if let Some(lora_path) = req.lora_path.clone() {
+            if let Err(err) = self.ensure_lora_loaded(&lora_path).await {
+                self.fail_task_preflight(&job, &task_id, err).await;
+                return;
+            }
+        }
+
+        // Resolve the exact token input before anything is registered: a
+        // `continue_from` task may need an engine tokenizer call, and a failure
+        // here must fail the task without producing a (misleading) sample.
+        let input_ids = match self.resolve_input_ids(&req).await {
+            Ok(ids) => ids,
+            Err(err) => {
+                self.fail_task_preflight(&job, &task_id, err).await;
+                return;
+            }
+        };
+        if req.continue_from.is_some() {
+            if let Some(ids) = input_ids.as_ref() {
+                // Persist the composed ids: continuing *this* task later must
+                // not have to re-derive them from a source that may have moved on.
+                self.persist_task_input(&job.job_id, index, ids);
+            }
+        }
+        let body = build_generate_body(&req, input_ids.as_deref());
+
         // Register live cancel flag + token progress before the run so the
         // cancel endpoint and status polling can see them immediately.
         let cancel = Arc::new(AtomicBool::new(false));
@@ -526,7 +1039,7 @@ impl JobManager {
                 g.samples.push(SampleResult::default());
             }
             match self
-                .run_one_sample(&req, &cancel, &progress, Some(&live))
+                .run_one_sample(&body, &cancel, &progress, Some(&live))
                 .await
             {
                 Ok(s) => {
@@ -619,39 +1132,19 @@ impl JobManager {
     }
 
     /// Convert one OpenAI-style request to native /generate and aggregate the
-    /// SSE stream into a single sample result. `cancel` (when set) stops the
+    /// SSE stream into a single sample result. `body` is the prebuilt native
+    /// /generate body (see `build_generate_body`); `cancel` (when set) stops the
     /// stream at the next chunk boundary and returns whatever was aggregated so
     /// far; `progress` is updated with the running generated-token count;
     /// `live` (task-level partial result) receives periodic snapshots of the
     /// in-flight sample so download endpoints can stream partial output.
     async fn run_one_sample(
         &self,
-        req: &TaskRequest,
+        body: &Value,
         cancel: &Arc<AtomicBool>,
         progress: &Arc<AtomicU64>,
         live: Option<&Arc<tokio::sync::RwLock<TaskResult>>>,
     ) -> Result<SampleResult, String> {
-        let mut gen_body = json!({
-            "text": req.prompt,
-            "sampling_params": {
-                "max_new_tokens": req.max_tokens.unwrap_or(4096),
-            },
-            "return_logprob": true,
-            "stream": true,
-        });
-        {
-            let sp = gen_body["sampling_params"].as_object_mut().unwrap();
-            if let Some(t) = req.temperature {
-                sp.insert("temperature".into(), json!(t));
-            }
-            if let Some(p) = req.top_p {
-                sp.insert("top_p".into(), json!(p));
-            }
-        }
-        if let Some(lp) = &req.lora_path {
-            gen_body["lora_path"] = json!(lp);
-        }
-
         let url = format!("{}/generate", self.self_base_url.trim_end_matches('/'));
         let mut builder = self
             .client
@@ -662,7 +1155,7 @@ impl JobManager {
             // only time-based guard is the per-chunk idle timeout in
             // `aggregate_sse` (no-new-data window), so a live stream runs
             // indefinitely while the engine keeps emitting tokens.
-            .json(&gen_body);
+            .json(body);
         if let Some(key) = &self.api_key {
             builder = builder.bearer_auth(key);
         }
@@ -672,8 +1165,8 @@ impl JobManager {
             .map_err(|e| format!("generate request failed: {e}"))?;
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("generate returned {status}: {}", truncate(&body, 500)));
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("generate returned {status}: {}", truncate(&text, 500)));
         }
 
         let agg = aggregate_sse(resp, cancel, progress, live, self.request_timeout).await?;
@@ -1482,6 +1975,184 @@ mod tests {
         assert_eq!(back, TaskStatus::Cancelled);
     }
 
+    fn req_text(prompt: &str) -> TaskRequest {
+        TaskRequest {
+            prompt: prompt.into(),
+            max_tokens: Some(128),
+            temperature: Some(0.7),
+            top_p: Some(0.9),
+            lora_path: Some("/loras/L0".into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn build_body_prefers_tokens_over_text() {
+        // Text task: body carries the prompt text and no token array.
+        let body = build_generate_body(&req_text("hello"), None);
+        assert_eq!(body["text"], json!("hello"));
+        assert!(body.get("input_ids").is_none());
+        assert_eq!(body["sampling_params"]["max_new_tokens"], json!(128));
+        assert_eq!(body["sampling_params"]["temperature"], json!(0.7));
+        assert_eq!(body["sampling_params"]["top_p"], json!(0.9));
+        assert_eq!(body["lora_path"], json!("/loras/L0"));
+        assert_eq!(body["return_logprob"], json!(true));
+        assert_eq!(body["stream"], json!(true));
+
+        // Continuation: the resolved tokens replace the text entirely, so the
+        // engine must not re-tokenize anything.
+        let body = build_generate_body(&req_text("ignored"), Some(&[1, 2, 3]));
+        assert_eq!(body["input_ids"], json!([1, 2, 3]));
+        assert!(body.get("text").is_none());
+    }
+
+    #[test]
+    fn compose_input_ids_is_source_plus_generated() {
+        assert_eq!(compose_input_ids(&[1, 2], &[3, 4]), vec![1, 2, 3, 4]);
+        // A cancel at 0 tokens still yields a runnable input (the source prompt).
+        assert_eq!(compose_input_ids(&[1, 2], &[]), vec![1, 2]);
+    }
+
+    #[test]
+    fn select_sample_ids_checks_bounds() {
+        let result = TaskResult {
+            task_id: "t".into(),
+            index: 0,
+            samples: vec![
+                SampleResult {
+                    output_ids: vec![7, 8],
+                    ..Default::default()
+                },
+                SampleResult {
+                    output_ids: vec![9],
+                    ..Default::default()
+                },
+            ],
+        };
+        assert_eq!(select_sample_ids(&result, 0).unwrap(), vec![7, 8]);
+        assert_eq!(select_sample_ids(&result, 1).unwrap(), vec![9]);
+        let err = select_sample_ids(&result, 2).unwrap_err();
+        assert!(err.contains("out of range"), "{err}");
+    }
+
+    #[test]
+    fn validate_task_input_requires_exactly_one_source() {
+        assert!(validate_task_input(&req_text("x")).is_ok());
+
+        let mut ids_only = TaskRequest {
+            input_ids: Some(vec![1, 2]),
+            ..Default::default()
+        };
+        assert!(validate_task_input(&ids_only).is_ok());
+
+        let cont_only = TaskRequest {
+            continue_from: Some(ContinueFrom {
+                job_id: "j".into(),
+                task_id: None,
+                index: None,
+                sample_index: None,
+            }),
+            ..Default::default()
+        };
+        assert!(validate_task_input(&cont_only).is_ok());
+
+        // No input at all.
+        let empty = TaskRequest::default();
+        assert!(validate_task_input(&empty).is_err());
+
+        // Empty token array is not an input.
+        ids_only.input_ids = Some(vec![]);
+        assert!(validate_task_input(&ids_only).is_err());
+
+        // Two sources at once is ambiguous.
+        let both = TaskRequest {
+            prompt: "x".into(),
+            input_ids: Some(vec![1]),
+            ..Default::default()
+        };
+        assert!(validate_task_input(&both).is_err());
+        let mut text_and_cont = req_text("x");
+        text_and_cont.continue_from = cont_only.continue_from.clone();
+        assert!(validate_task_input(&text_and_cont).is_err());
+    }
+
+    #[test]
+    fn continue_from_parses_job_and_task_forms() {
+        let cf: ContinueFrom =
+            serde_json::from_value(json!({"job_id": "job_1"})).unwrap();
+        assert_eq!(cf.job_id, "job_1");
+        assert!(cf.task_id.is_none());
+
+        let cf: ContinueFrom = serde_json::from_value(
+            json!({"job_id": "job_1", "task_id": "job_1_t0002", "sample_index": 1}),
+        )
+        .unwrap();
+        assert_eq!(cf.task_id.as_deref(), Some("job_1_t0002"));
+        assert_eq!(cf.sample_index, Some(1));
+
+        // job_id is mandatory.
+        assert!(serde_json::from_value::<ContinueFrom>(json!({"task_id": "x"})).is_err());
+    }
+
+    #[test]
+    fn parse_submit_body_supports_all_shapes() {
+        // Array form, unchanged.
+        let body = json!([{"prompt": "a", "max_tokens": 16}]);
+        let (lora, reqs, resume) = parse_submit_body(&body).unwrap();
+        assert!(lora.is_none());
+        assert_eq!(reqs.len(), 1);
+        assert!(resume.is_none());
+
+        // Object form with job-level lora.
+        let body = json!({"lora_path": "/l", "requests": [{"prompt": "a"}]});
+        let (lora, reqs, _) = parse_submit_body(&body).unwrap();
+        assert_eq!(lora.as_deref(), Some("/l"));
+        assert_eq!(reqs.len(), 1);
+
+        // Job-level resume sugar.
+        let body = json!({
+            "continue_from": {"job_id": "job_1"},
+            "max_tokens": 256,
+            "temperature": 0.0,
+            "lora_path": "/l2",
+            "n": 2
+        });
+        let (lora, reqs, resume) = parse_submit_body(&body).unwrap();
+        assert_eq!(lora.as_deref(), Some("/l2"));
+        assert!(reqs.is_empty());
+        let (cf, ov) = resume.expect("resume spec");
+        assert_eq!(cf.job_id, "job_1");
+        assert_eq!(ov.max_tokens, Some(256));
+        assert_eq!(ov.temperature, Some(0.0));
+        assert_eq!(ov.n, Some(2));
+
+        // requests + continue_from is contradictory.
+        let body = json!({"continue_from": {"job_id": "j"}, "requests": []});
+        assert!(parse_submit_body(&body).is_err());
+        // Unknown object shape.
+        assert!(parse_submit_body(&json!({"foo": 1})).is_err());
+        // Invalid continue_from payload.
+        assert!(parse_submit_body(&json!({"continue_from": {"task_id": "x"}})).is_err());
+    }
+
+    #[test]
+    fn continuation_request_deserializes_without_prompt() {
+        // The whole point: a continuation body carries only a reference.
+        let req: TaskRequest = serde_json::from_value(json!({
+            "continue_from": {"job_id": "job_1", "task_id": "job_1_t0000"},
+            "max_tokens": 512
+        }))
+        .unwrap();
+        assert!(req.prompt.is_empty());
+        assert!(req.input_ids.is_none());
+        assert_eq!(
+            req.continue_from.as_ref().unwrap().task_id.as_deref(),
+            Some("job_1_t0000")
+        );
+        assert_eq!(req.max_tokens, Some(512));
+        validate_task_input(&req).unwrap();
+    }
+
     #[test]
     fn aggregate_status_counts_cancelled() {
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -1491,15 +2162,7 @@ mod tests {
                 index: 0,
                 request: TaskRequest {
                     prompt: "x".into(),
-                    max_tokens: None,
-                    temperature: None,
-                    top_p: None,
-                    n: 1,
-                    lora_path: None,
-                    model: None,
-                    stream: None,
-                    logprobs: None,
-                    stream_options: None,
+                    ..Default::default()
                 },
                 status: s,
                 error: None,
@@ -1526,6 +2189,288 @@ mod tests {
         });
     }
 
+    // -- continuation resolution (incl. pre-feature/historical jobs) ---------
+
+    fn mk_manager(dir: &Path, engine_urls: Vec<String>) -> Arc<JobManager> {
+        JobManager::new(
+            "http://127.0.0.1:1".to_string(),
+            None,
+            dir.to_path_buf(),
+            4,
+            60,
+            engine_urls,
+        )
+    }
+
+    fn sample(ids: Vec<i64>) -> SampleResult {
+        SampleResult {
+            output_ids: ids,
+            ..Default::default()
+        }
+    }
+
+    fn insert_source_job(
+        mgr: &Arc<JobManager>,
+        job_id: &str,
+        tasks: Vec<Task>,
+    ) {
+        let job = Arc::new(Job {
+            job_id: job_id.to_string(),
+            created_at_unix: 0,
+            tasks: Arc::new(RwLock::new(tasks)),
+        });
+        mgr.jobs.insert(job_id.to_string(), job);
+    }
+
+    #[tokio::test]
+    async fn resolve_continuation_composes_input_and_generated_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = mk_manager(dir.path(), Vec::new());
+        insert_source_job(
+            &mgr,
+            "job_a",
+            vec![Task {
+                task_id: "job_a_t0000".into(),
+                index: 0,
+                request: TaskRequest {
+                    input_ids: Some(vec![1, 2, 3]),
+                    ..Default::default()
+                },
+                status: TaskStatus::Cancelled,
+                error: None,
+                result: Some(TaskResult {
+                    task_id: "job_a_t0000".into(),
+                    index: 0,
+                    samples: vec![sample(vec![4, 5])],
+                }),
+            }],
+        );
+
+        let req = TaskRequest {
+            continue_from: Some(ContinueFrom {
+                job_id: "job_a".into(),
+                task_id: None,
+                index: None,
+                sample_index: None,
+            }),
+            max_tokens: Some(16),
+            ..Default::default()
+        };
+        let ids = mgr.resolve_input_ids(&req).await.unwrap().unwrap();
+        assert_eq!(ids, vec![1, 2, 3, 4, 5]);
+
+        // The composed input is persisted, so continuing *this* task later is
+        // exact too (no dependency on a source that may have moved on).
+        mgr.persist_task_input("job_b", 0, &ids);
+        assert_eq!(mgr.load_task_input("job_b", 0).unwrap(), vec![1, 2, 3, 4, 5]);
+    }
+
+    #[tokio::test]
+    async fn resolve_continuation_uses_selected_sample() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = mk_manager(dir.path(), Vec::new());
+        insert_source_job(
+            &mgr,
+            "job_s",
+            vec![Task {
+                task_id: "job_s_t0000".into(),
+                index: 0,
+                request: TaskRequest {
+                    input_ids: Some(vec![10]),
+                    ..Default::default()
+                },
+                status: TaskStatus::Completed,
+                error: None,
+                result: Some(TaskResult {
+                    task_id: "job_s_t0000".into(),
+                    index: 0,
+                    samples: vec![sample(vec![11]), sample(vec![12, 13])],
+                }),
+            }],
+        );
+        let mk_req = |sample_index: Option<usize>| TaskRequest {
+            continue_from: Some(ContinueFrom {
+                job_id: "job_s".into(),
+                task_id: Some("job_s_t0000".into()),
+                index: None,
+                sample_index,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            mgr.resolve_input_ids(&mk_req(None)).await.unwrap().unwrap(),
+            vec![10, 11]
+        );
+        assert_eq!(
+            mgr.resolve_input_ids(&mk_req(Some(1)))
+                .await
+                .unwrap()
+                .unwrap(),
+            vec![10, 12, 13]
+        );
+        let err = mgr.resolve_input_ids(&mk_req(Some(9))).await.unwrap_err();
+        assert!(err.contains("out of range"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn resolve_continuation_reports_unknown_or_ambiguous_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = mk_manager(dir.path(), Vec::new());
+        let mk_src = |task_id: &str, index: usize| Task {
+            task_id: task_id.to_string(),
+            index,
+            request: TaskRequest {
+                prompt: "p".into(),
+                ..Default::default()
+            },
+            status: TaskStatus::Completed,
+            error: None,
+            result: Some(TaskResult {
+                task_id: task_id.to_string(),
+                index,
+                samples: vec![sample(vec![1])],
+            }),
+        };
+        insert_source_job(&mgr, "job_m", vec![mk_src("job_m_t0000", 0), mk_src("job_m_t0001", 1)]);
+
+        // Unknown job id.
+        let err = mgr
+            .resolve_input_ids(&TaskRequest {
+                continue_from: Some(ContinueFrom {
+                    job_id: "nope".into(),
+                    task_id: None,
+                    index: None,
+                    sample_index: None,
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(err.contains("unknown job_id"), "{err}");
+
+        // Multi-task job without a selector: must ask for task_id/index.
+        // (Its prompt would need an engine, so the selector check comes first.)
+        let err = mgr
+            .resolve_input_ids(&TaskRequest {
+                continue_from: Some(ContinueFrom {
+                    job_id: "job_m".into(),
+                    task_id: None,
+                    index: None,
+                    sample_index: None,
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(err.contains("specify 'task_id' or 'index'"), "{err}");
+
+        // Text source with no engine configured → explicit, actionable error.
+        let err = mgr
+            .resolve_input_ids(&TaskRequest {
+                continue_from: Some(ContinueFrom {
+                    job_id: "job_m".into(),
+                    task_id: Some("job_m_t0000".into()),
+                    index: None,
+                    sample_index: None,
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(err.contains("no engine URL"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn legacy_job_files_are_recovered_and_continuable() {
+        let dir = tempfile::tempdir().unwrap();
+        // Pre-feature on-disk shape: no input_ids / continue_from fields.
+        let job_dir = dir.path().join("job_old");
+        std::fs::create_dir_all(&job_dir).unwrap();
+        std::fs::write(
+            job_dir.join("job.json"),
+            r#"{"job_id":"job_old","created_at_unix":1,"tasks":[{"task_id":"job_old_t0000","index":0,"request":{"prompt":"legacy prompt","max_tokens":64},"status":"cancelled","error":null,"result":null}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            job_dir.join("task_0000.json"),
+            r#"{"task_id":"job_old_t0000","index":0,"samples":[{"output_text":"hi","output_ids":[7,8],"output_token_logprobs":[-0.1,-0.2],"finish_reason":"cancelled","prompt_tokens":2,"completion_tokens":2}]}"#,
+        )
+        .unwrap();
+
+        let mgr = mk_manager(dir.path(), Vec::new());
+        mgr.recover_from_disk();
+        let job = mgr.get_job("job_old").expect("legacy job recovered");
+        let tasks = job.tasks.read().await;
+        let task = &tasks[0];
+        assert!(task.request.input_ids.is_none());
+        assert!(task.request.continue_from.is_none());
+        assert_eq!(
+            select_sample_ids(task.result.as_ref().expect("legacy result"), 0).unwrap(),
+            vec![7, 8]
+        );
+        drop(tasks);
+
+        // A legacy (text) source resolves by tokenizing its prompt on an engine;
+        // without one configured the failure says exactly what is missing.
+        let err = mgr
+            .resolve_input_ids(&TaskRequest {
+                continue_from: Some(ContinueFrom {
+                    job_id: "job_old".into(),
+                    task_id: None,
+                    index: None,
+                    sample_index: None,
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(err.contains("no engine URL"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn job_level_resume_expands_one_task_per_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = mk_manager(dir.path(), Vec::new());
+        let mk_src = |task_id: &str, index: usize| Task {
+            task_id: task_id.to_string(),
+            index,
+            request: TaskRequest {
+                input_ids: Some(vec![index as i64 + 1]),
+                temperature: Some(0.3),
+                top_p: Some(0.8),
+                lora_path: Some("/loras/L9".into()),
+                ..Default::default()
+            },
+            status: TaskStatus::Cancelled,
+            error: None,
+            result: Some(TaskResult {
+                task_id: task_id.to_string(),
+                index,
+                samples: vec![sample(vec![100 + index as i64])],
+            }),
+        };
+        insert_source_job(&mgr, "job_src", vec![mk_src("job_src_t0000", 0), mk_src("job_src_t0001", 1)]);
+
+        let job = mgr
+            .submit(json!({
+                "continue_from": {"job_id": "job_src"},
+                "max_tokens": 32
+            }))
+            .await
+            .expect("resume accepted");
+        let tasks = job.tasks.read().await;
+        assert_eq!(tasks.len(), 2, "one continuation task per source task");
+        for (i, t) in tasks.iter().enumerate() {
+            let cf = t.request.continue_from.as_ref().expect("continue_from set");
+            assert_eq!(cf.job_id, "job_src");
+            assert_eq!(cf.task_id, Some(format!("job_src_t{i:04}")));
+            assert_eq!(t.request.max_tokens, Some(32));
+            // Sampling params + adapter are inherited from the source task.
+            assert_eq!(t.request.temperature, Some(0.3));
+            assert_eq!(t.request.top_p, Some(0.8));
+            assert_eq!(t.request.lora_path.as_deref(), Some("/loras/L9"));
+            assert_eq!(t.index, i);
+        }
     // -- garbage collection --------------------------------------------------
 
     fn test_request() -> TaskRequest {
@@ -1671,5 +2616,6 @@ mod tests {
         assert!(size > 0, "job dir has bytes");
         let m = newest_mtime(&dir).expect("mtime");
         assert!(SystemTime::now().duration_since(m).unwrap() < Duration::from_secs(60));
+
     }
 }
