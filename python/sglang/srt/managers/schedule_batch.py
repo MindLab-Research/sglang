@@ -1625,12 +1625,38 @@ class Req(ReqDllmMixin):
         token_indices = req_to_token_pool.req_to_token[
             self.req_pool_idx, : self.seqlen - 1
         ]
-        # Copies over both the kv cache and mamba state if available
-        self.kv_cache_cpu = token_to_kv_pool_allocator.get_cpu_copy(
-            token_indices, mamba_indices=self.mamba_pool_idx
-        )
+        # Copies over both the kv cache and mamba state if available.
+        #
+        # This is a recompute-saving optimisation ONLY: a failure here must never
+        # take the engine down. On 2026-09-16 an out-of-range index (raw DCP
+        # virtual ids fed to the physical buffer) turned into a device-side
+        # assert inside the copy kernel, which aborted all 8 TP ranks and left
+        # the PD decode engine dead. The pool now localizes + range-checks the
+        # ids (KvOffloadIndexError) and we degrade to "no offload" here, i.e. the
+        # request is recomputed instead of restored from host memory.
+        try:
+            self.kv_cache_cpu = token_to_kv_pool_allocator.get_cpu_copy(
+                token_indices, mamba_indices=self.mamba_pool_idx
+            )
+        except Exception:
+            self.kv_cache_cpu = None
+            logger.exception(
+                "OFFLOAD-SKIP rid=%s: KV host offload failed, the request will be "
+                "recomputed instead of restored (engine stays alive)",
+                self.rid,
+            )
 
     def load_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
+        if self.kv_cache_cpu is None:
+            # Offload was skipped at retract time (see offload_kv_cache): there
+            # is no host copy to restore, so leave the freshly allocated slots
+            # alone instead of crashing while unpickling None.
+            logger.warning(
+                "OFFLOAD-SKIP rid=%s: no offloaded KV to restore; keeping the "
+                "newly allocated slots",
+                self.rid,
+            )
+            return
         token_indices = req_to_token_pool.req_to_token[
             self.req_pool_idx, : self.seqlen - 1
         ]
