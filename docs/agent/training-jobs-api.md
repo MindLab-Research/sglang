@@ -83,18 +83,14 @@
 
 ### 3.2 字段说明
 
-> **输入三选一**：`prompt`（文本）/ `input_ids`（token）/ `continue_from`（引用已有任务续跑）。**必须且只能给一个**，否则 400。
-
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `prompt` | string | ✅（三选一） | 生成提示词（空串/纯空白会被拒绝） |
-| `input_ids` | int[] | ✅（三选一） | **token 级输入**，替代 `prompt`（引擎不再做 tokenize，序列逐位确定） |
-| `continue_from` | object | ✅（三选一） | **续跑引用**，服务端自己拼输入，客户端不需要回传任何 token，见 §10 |
+| `prompt` | string | ✅ | 生成提示词（空串/纯空白会被拒绝） |
 | `max_tokens` | int | ❌ | 最大生成 token 数，默认 4096 |
-| `temperature` | float | ❌ | 采样温度，默认服务端值（续跑任务省略时继承源任务） |
-| `top_p` | float | ❌ | nucleus 采样，默认服务端值（续跑任务省略时继承源任务） |
+| `temperature` | float | ❌ | 采样温度，默认服务端值 |
+| `top_p` | float | ❌ | nucleus 采样，默认服务端值 |
 | `n` | int | ❌ | 采样次数（1-64），默认 1；结果为数组 `samples[n]` |
-| `lora_path` | string\|null | ❌ | **LoRA adapter 路径；不传=基模**。job 级设置可被任务级覆盖，任务级 `null` 强制基模；续跑任务省略时继承源任务 |
+| `lora_path` | string\|null | ❌ | **LoRA adapter 路径；不传=基模**。job 级设置可被任务级覆盖，任务级 `null` 强制基模 |
 | `model` | string | ❌ | 兼容字段（接受训练侧模型名，如 `zai-org/GLM-5.2`，单模型部署忽略） |
 | `stream` / `stream_options` / `logprobs` | any | ❌ | 兼容字段（内部固定流式执行 + 返回 logprob，无需设置） |
 
@@ -378,7 +374,7 @@ requests.delete(f"{BASE}/v1/control/jobs/{job_id}", headers=HEADERS)
 ## 8. 运维备注（服务端）
 
 - 结果落盘：`/root/smg-jobs/{job_id}/`（`job.json` + `task_XXXX.json`，原子写）；router 启动时自动恢复
-- 相关环境变量（启动 router 时）：`SMG_JOBS_DIR`（默认 ./smg-jobs）、`SMG_JOBS_MAX_CONCURRENCY`（默认 64）、`SMG_JOBS_REQUEST_TIMEOUT_SECS`（默认 3600）、`SMG_JOBS_SELF_URL`（默认 `http://127.0.0.1:{port}`）、**`SMG_JOBS_ENGINE_URLS`**（逗号分隔的引擎地址，`continue_from` 续跑把源 prompt 还原成 token id 时用；不设则回退到 router 启动参数里的 worker URL，见 §10）、**`SMG_JOBS_RETENTION_HOURS`（默认 48，0=关闭 GC）**、**`SMG_JOBS_GC_INTERVAL_SECS`（默认 1800）**
+- 相关环境变量（启动 router 时）：`SMG_JOBS_DIR`（默认 ./smg-jobs）、`SMG_JOBS_MAX_CONCURRENCY`（默认 64）、`SMG_JOBS_REQUEST_TIMEOUT_SECS`（默认 3600）、`SMG_JOBS_SELF_URL`（默认 `http://127.0.0.1:{port}`）、**`SMG_JOBS_RETENTION_HOURS`（默认 48，0=关闭 GC）**、**`SMG_JOBS_GC_INTERVAL_SECS`（默认 1800）**
 - **本地 GC（2026-09-15 加入）**：后台任务定期扫描 `SMG_JOBS_DIR`，把**最后活动时间**超过保留期的 job 目录删掉（`job.json` 每次状态变更都会重写、`task_*.json` 随任务完成落盘，所以该时间即真实进度）。判据：只删终态；`running`/`queued` 一律保留；删除会打日志（含释放体积），例如
   `jobs: gc removed job_xxx (idle 52.1h > retention 48.0h, freed 91.2 MB)`。
   启动时也会立即扫一次（把停机期间积压的旧数据回收）。
@@ -406,84 +402,3 @@ requests.delete(f"{BASE}/v1/control/jobs/{job_id}", headers=HEADERS)
 | 真实样例（gateway-req-02.json，4096 tokens，62s） | ids=4096 / logprobs=4096 / entries=4096，completion_tokens=4096，三元组 token_id 逐位吻合 ✅ |
 | token id 还原 | bf16 tokenizer decode(output_ids) 与 output_text 逐位一致 ✅ |
 | 认证 | 无 key 401 / control key 200 ✅ |
-
----
-
-## 10. 续跑：cancel → continue（2026-09-14 新增）
-
-> **结果方向不变**：每个任务的 `output_text` / `output_ids` / 逐 token logprob **照常回传**（那是训练数据本身）。
-> 本节只解决**请求方向**的体积问题：客户端要"接着往下生成"时，**不需要把之前的 token 回传**，只发一个引用即可。
-
-### 10.1 为什么需要它
-
-- cancel 是**终结语义**：引擎侧 abort → rid 销毁、KV 释放；sglang **没有 un-cancel / 恢复同一 rid** 的接口。所以"续跑"必然是**新请求**重走 prefill。
-- 那次的正确姿势是：`新输入 = 原来的输入 token ++ 已经生成的 token`（token 级拼接，**不能拼文本** —— 重新 tokenize 会在 thinking 段/特殊 token 边界漂移一两个 token，续跑就不是同一条轨迹了）。
-- 这些 token 客户端本来就有（`output_ids` + 它自己发过的 prompt），但**让客户端回传**意味着把几万～几十万 token 塞进请求体（体积大、还要自己保证逐位正确）。本特性把这件事**移到服务端**：客户端只发 `job_id`（可再指定 task / sample）。
-
-### 10.2 用法 A：整个 job 续跑（最小请求体）
-
-```bash
-curl -X POST http://8.213.214.14:18888/v1/control/jobs \
-  -H 'Authorization: Bearer <control-key>' -H 'Content-Type: application/json' \
-  -d '{"continue_from": {"job_id": "job_1787282349702_001_6026"}, "max_tokens": 512}'
-```
-
-- 新 job 与源 job **任务数一一对应**（顺序一致），第 i 个任务续跑源 job 的第 i 个任务；
-- `max_tokens` / `temperature` / `top_p` / `lora_path` / `n` 是本级覆盖项；`temperature`/`top_p`/`lora_path` 省略时**继承源任务**（同 adapter、同采样），`max_tokens` 不继承（新预算是新请求的事）；
-- `{"continue_from": {...}, "requests": [...]}` 同时出现 → 400（语义冲突）。
-
-### 10.3 用法 B：任务级续跑
-
-```json
-[
-  {"continue_from": {"job_id": "job_x", "task_id": "job_x_t0000"}, "max_tokens": 512},
-  {"continue_from": {"job_id": "job_x", "index": 1, "sample_index": 1}, "temperature": 0.0}
-]
-```
-
-| `continue_from` 字段 | 必填 | 说明 |
-|---|---|---|
-| `job_id` | ✅ | 源 job |
-| `task_id` | ❌ | 源任务 id（全局唯一，提交响应里给的就是它） |
-| `index` | ❌ | 源任务序号（`task_id` 的替代写法） |
-| `sample_index` | ❌ | 从第几个 sample 续（`n>1` 时用），默认 0 |
-
-- 源 job 只有 1 个任务时可以都不写；
-- 源 job 有多个任务且不指定 → 400（提示补 `task_id`/`index`）。
-
-### 10.4 用法 C：显式 token（仍支持）
-
-客户端自己拼好整段时照旧可发 `input_ids`（与 `prompt` 二选一）：
-
-```json
-[{"input_ids": [128000, 9906, ...], "max_tokens": 512}]
-```
-
-`input_ids` 与 `continue_from` 的服务端语义完全一致（都走 native `/generate` 的 `input_ids` 路径），区别只是"谁来拼"。
-
-### 10.5 语义与保真
-
-| 项 | 行为 |
-|---|---|
-| 结果内容 | 续跑任务的结果**只含本次新生成的 token**（旧 token 客户端已经有），`samples[]` 结构不变 |
-| 逐位一致 | 服务端拼的是 **token 数组**，不是文本 → 边界不发生重 tokenize |
-| 续跑链 | "续跑的续跑"支持：组合后的输入会落盘 `input_XXXX.json`，下一跳直接复用，不依赖源任务是否还在动 |
-| 历史数据 | **完全支持**：本特性上线前已落盘的 job/task 无需迁移即可作为源。文本 `prompt` 由引擎 tokenizer 现场还原为 id（与当初 `/generate` 同一 tokenizer 对象）；已完成的 `task_XXXX.json` 结果照旧参与拼接 |
-| 运行中的源 | 源任务还在跑时也能续（取实时 partial 快照）；源任务一条都没生成时返回明确错误，不会静默产空样本 |
-
-### 10.6 成本（重要）
-
-- 原 prompt 部分：prefill 端命中 radix / HiCache 前缀缓存，基本不重算；
-- **已生成的 token 必须重新 prefill**（它们从没进过 prefill 的缓存）；且 decode 端 `--disable-radix-cache`（红线）→ **整个上下文的 KV 都要从 prefill 传过去**，传输量 ∝ 上下文长度，与"续跑新增多少 token"无关。
-- 结论：续几万 token 的 rollout 很划算；100k+ 上下文会明显（传输是大头）。
-
-### 10.7 错误码
-
-| 现象 | 原因 |
-|---|---|
-| 400 `task must provide exactly one of 'prompt', 'input_ids' or 'continue_from'` | 输入来源给了 0 个或 ≥2 个 |
-| 400 `continue_from: unknown job_id 'xxx'` | 源 job 已被 delete（或超过 48h 保留期） |
-| 400 `continue_from: job 'x' has N tasks — specify 'task_id' or 'index'` | 多任务 job 未指定源任务 |
-| 任务级 `error`：`continue_from: task 'x' has no generated tokens yet` | 源任务还没生成任何 token |
-| 任务级 `error`：`continue_from: task 'x' has no recoverable input tokens` | 源任务的组合输入既无 `input_ids` 也无 `input_XXXX.json`（异常场景） |
-| 任务级 `error`：`no engine URL is configured` | router 未配置引擎地址：设置 `SMG_JOBS_ENGINE_URLS`（逗号分隔）或按 worker URL 启动 router |

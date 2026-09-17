@@ -3007,31 +3007,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"All loaded adapters: {self.lora_ref_cache.keys()}."
                 )
 
-            # PD (disaggregated prefill/decode): never reload implicitly inside a
-            # request. The load runs in the request path of *each* engine while
-            # the decode side still owes the prefill its KV indices; the prefill
-            # therefore sits in KVPoll.Bootstrapping until the bootstrap timeout
-            # (600s) and the request dies with an empty stream — observed
-            # 2026-09-14 with a large OSS-backed adapter (both engines logged
-            # "Start load Lora adapter", then no ACK, then
-            # "Prefill bootstrap failed ... timed out after 600.0s"). Fail fast
-            # with the exact remediation instead: an explicit load also
-            # guarantees that every engine ends up with the adapter, which an
-            # in-request reload cannot.
-            _disagg_mode = getattr(self.server_args, "disaggregation_mode", None)
-            if _disagg_mode not in (None, "", "null"):
-                raise ValueError(
-                    f"LoRA adapter '{lora_path}' is not loaded on this engine, and "
-                    f"implicit reload is disabled in disaggregation mode "
-                    f"(disaggregation_mode={_disagg_mode!r}): loading an adapter "
-                    "inside a request wedges the prefill/decode bootstrap "
-                    "handshake (the request hangs until the bootstrap timeout, "
-                    "then fails). Load it explicitly on every engine first:\n"
-                    f"  POST /load_lora_adapter "
-                    f'{{"lora_name": "{lora_path}", "lora_path": "{lora_path}"}}\n'
-                    "and resubmit the request afterwards."
-                )
-
             logger.info(f"Reloading evicted adapter: {lora_path}")
             new_lora_ref = self.lora_ref_cache[lora_path]
             load_result = await self.load_lora_adapter(
