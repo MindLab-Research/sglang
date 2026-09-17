@@ -979,6 +979,16 @@ class LoRAMemoryPool:
             self.eviction_policy.mark_used(uid)
 
         for uid in ordered_uids:
+            if uid is None:
+                # Base keeps NO pool slot: a base request needs no LoRA delta,
+                # so its metadata uses the "no adapter" sentinel -1 -- the same
+                # one the CP padding rows use, and every consuming kernel skips
+                # negative slots ([PAD-NO-DELTA]). A buffer for base would cost
+                # one whole slot for tensors that are never read (11.05 GB at
+                # rank 16 on B300, measured 2026-09-17) and would put a
+                # never-used uid into the eviction candidates, so one of N
+                # slots could not hold an adapter.
+                continue
             if uid not in self.uid_to_buffer_id:
                 buffer_id = get_available_buffer_slot()
                 lora_adapter = lora_adapters.get(uid, None)
