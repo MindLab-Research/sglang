@@ -1370,6 +1370,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         jobs_engine_urls.clone(),
     );
     jobs_state.recover_from_disk();
+    // Local retention: delete finished jobs older than
+    // SMG_JOBS_RETENTION_HOURS (default 48h, 0 = disabled) so the job store
+    // cannot grow without bound. Logs its own config line.
+    jobs_state.spawn_gc_task();
     info!(
         "Training job manager ready (concurrency={}, dir from SMG_JOBS_DIR, timeout={}s, engines={})",
         jobs_concurrency,

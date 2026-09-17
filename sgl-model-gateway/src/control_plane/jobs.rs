@@ -375,6 +375,40 @@ pub struct JobManager {
     /// while the job is still generating. Live only (final results are
     /// persisted to task_{index}.json on completion).
     partial_results: DashMap<String, Arc<tokio::sync::RwLock<TaskResult>>>,
+    /// Local retention for **finished** jobs. `None` disables garbage
+    /// collection. Data older than this is deleted from disk (results and
+    /// requests alike), so the training client must have downloaded it by then.
+    retention: Option<Duration>,
+}
+
+/// Default local retention for finished jobs (hours).
+const DEFAULT_RETENTION_HOURS: f64 = 48.0;
+/// Default GC scan interval (seconds).
+const DEFAULT_GC_INTERVAL_SECS: u64 = 1800;
+
+/// Retention from `SMG_JOBS_RETENTION_HOURS` (hours, fractional allowed).
+/// Unset -> 48h; `0` or negative -> GC disabled (`None`).
+fn retention_from_env() -> Option<Duration> {
+    match std::env::var("SMG_JOBS_RETENTION_HOURS") {
+        Ok(raw) => raw
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|h| *h > 0.0)
+            .map(|h| Duration::from_secs_f64(h * 3600.0)),
+        Err(_) => Some(Duration::from_secs_f64(DEFAULT_RETENTION_HOURS * 3600.0)),
+    }
+}
+
+/// GC scan interval from `SMG_JOBS_GC_INTERVAL_SECS` (default 1800s).
+fn gc_interval_from_env() -> Duration {
+    Duration::from_secs(
+        std::env::var("SMG_JOBS_GC_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|s| *s > 0)
+            .unwrap_or(DEFAULT_GC_INTERVAL_SECS),
+    )
 }
 
 impl JobManager {
@@ -385,6 +419,24 @@ impl JobManager {
         max_concurrency: usize,
         request_timeout_secs: u64,
         engine_urls: Vec<String>,
+    ) -> Arc<Self> {
+        Self::build(
+            self_base_url,
+            api_key,
+            data_dir,
+            max_concurrency,
+            request_timeout_secs,
+            retention_from_env(),
+        )
+    }
+
+    fn build(
+        self_base_url: String,
+        api_key: Option<String>,
+        data_dir: PathBuf,
+        max_concurrency: usize,
+        request_timeout_secs: u64,
+        retention: Option<Duration>,
     ) -> Arc<Self> {
         // Pool idle timeout MUST stay below the engine's uvicorn keep-alive
         // (SGLANG_TIMEOUT_KEEP_ALIVE, default 5s): a pooled connection idle
@@ -409,6 +461,7 @@ impl JobManager {
             cancel_flags: DashMap::new(),
             progress_tokens: DashMap::new(),
             partial_results: DashMap::new(),
+            retention,
         })
     }
 
@@ -1147,6 +1200,112 @@ impl JobManager {
         removed
     }
 
+    // -- garbage collection --------------------------------------------------
+
+    /// Delete job directories whose last activity is older than the retention
+    /// window.
+    ///
+    /// Only **finished** jobs are eligible: a job that is still queued or
+    /// running is never removed based on age alone (its files are rewritten as
+    /// it progresses, so in practice a live job is also never "old" — this
+    /// check is the belt to that suspenders). Jobs that were recovered from
+    /// disk without a live entry are treated as finished.
+    ///
+    /// Returns the number of jobs removed.
+    pub async fn gc_once(&self) -> usize {
+        let Some(retention) = self.retention else {
+            return 0; // GC disabled
+        };
+        let Ok(entries) = std::fs::read_dir(&self.data_dir) else {
+            return 0;
+        };
+        let now = SystemTime::now();
+        let mut removed = 0usize;
+        let mut freed = 0u64;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(job_id) = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            // Last activity = newest mtime among the job's files: job.json is
+            // rewritten on every state change and task files land as tasks
+            // finish, so this tracks real progress.
+            let Some(last) = newest_mtime(&path) else {
+                continue;
+            };
+            let Ok(age) = now.duration_since(last) else {
+                continue; // future mtime (clock skew): keep it
+            };
+            if age < retention {
+                continue;
+            }
+            // Clone the Arc out of the map so no DashMap guard is held across
+            // the await below.
+            let tracked = self.jobs.get(&job_id).map(|e| e.value().clone());
+            if let Some(job) = &tracked {
+                let status = job.aggregate_status().await;
+                if status == "running" || status == "queued" {
+                    continue;
+                }
+            }
+            let bytes = dir_size(&path);
+            if tracked.is_some() {
+                let _ = self.remove_job(&job_id);
+            } else {
+                let _ = std::fs::remove_dir_all(&path);
+            }
+            tracing::info!(
+                "jobs: gc removed {} (idle {:.1}h > retention {:.1}h, freed {:.1} MB)",
+                job_id,
+                age.as_secs_f64() / 3600.0,
+                retention.as_secs_f64() / 3600.0,
+                bytes as f64 / 1e6
+            );
+            removed += 1;
+            freed += bytes;
+        }
+        if removed > 0 {
+            tracing::info!(
+                "jobs: gc pass removed {} job(s), freed {:.1} MB",
+                removed,
+                freed as f64 / 1e6
+            );
+        }
+        removed
+    }
+
+    /// Start the background GC loop (no-op when retention is disabled).
+    ///
+    /// The first tick fires immediately so a router restart reclaims space that
+    /// accumulated while it was down.
+    pub fn spawn_gc_task(self: &Arc<Self>) {
+        let Some(retention) = self.retention else {
+            tracing::info!("jobs: gc disabled (SMG_JOBS_RETENTION_HOURS=0)");
+            return;
+        };
+        let interval = gc_interval_from_env();
+        let me = self.clone();
+        tokio::spawn(async move {
+            tracing::info!(
+                "jobs: gc enabled (retention {:.1}h, idempotent scan every {}s)",
+                retention.as_secs_f64() / 3600.0,
+                interval.as_secs()
+            );
+            let mut ticker = tokio::time::interval(interval);
+            loop {
+                ticker.tick().await;
+                let _ = me.gc_once().await;
+            }
+        });
+    }
+
     pub fn list_jobs(&self) -> Vec<Arc<Job>> {
         self.jobs.iter().map(|e| e.value().clone()).collect()
     }
@@ -1183,6 +1342,42 @@ fn snapshot_live_sample(text: &str, ids: &[i64], entries: &[Value]) -> SampleRes
         prompt_tokens: None,
         completion_tokens: Some(ids.len() as u64),
     }
+}
+
+/// Newest mtime among the files directly inside `dir`, falling back to the
+/// directory's own mtime. `None` when nothing is stat-able.
+///
+/// Used as "last activity": `job.json` is rewritten on every state change and
+/// `task_*.json` lands as each task finishes, so this tracks real progress.
+fn newest_mtime(dir: &Path) -> Option<SystemTime> {
+    let mut newest: Option<SystemTime> = None;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            if let Ok(t) = e.metadata().and_then(|m| m.modified()) {
+                newest = Some(match newest {
+                    Some(prev) if prev > t => prev,
+                    _ => t,
+                });
+            }
+        }
+    }
+    // Fall back to the directory's own mtime when it holds no files yet.
+    newest.or_else(|| std::fs::metadata(dir).and_then(|m| m.modified()).ok())
+}
+
+/// Recursive byte size of a directory (GC accounting / logging).
+fn dir_size(dir: &Path) -> u64 {
+    let mut total = 0u64;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            match e.metadata() {
+                Ok(md) if md.is_dir() => total += dir_size(&e.path()),
+                Ok(md) => total += md.len(),
+                Err(_) => {}
+            }
+        }
+    }
+    total
 }
 
 fn sanitize_id(id: &str) -> String {
@@ -2276,5 +2471,151 @@ mod tests {
             assert_eq!(t.request.lora_path.as_deref(), Some("/loras/L9"));
             assert_eq!(t.index, i);
         }
+    // -- garbage collection --------------------------------------------------
+
+    fn test_request() -> TaskRequest {
+        TaskRequest {
+            prompt: "x".into(),
+            max_tokens: Some(8),
+            temperature: None,
+            top_p: None,
+            n: 1,
+            lora_path: None,
+            model: None,
+            stream: None,
+            logprobs: None,
+            stream_options: None,
+        }
+    }
+
+    /// Write a minimal but valid on-disk job (job.json) for `job_id`.
+    fn write_job_dir(root: &Path, job_id: &str, task_status: &str) -> std::path::PathBuf {
+        let dir = root.join(job_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let doc = json!({
+            "job_id": job_id,
+            "created_at_unix": 1,
+            "tasks": [{
+                "task_id": format!("{job_id}_t0000"),
+                "index": 0,
+                "request": {"prompt": "x", "max_tokens": 8},
+                "status": task_status,
+            }],
+        });
+        std::fs::write(dir.join("job.json"), serde_json::to_string(&doc).unwrap()).unwrap();
+        dir
+    }
+
+    fn age_file(path: &Path, age: Duration) {
+        let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.set_modified(SystemTime::now() - age).unwrap();
+    }
+
+    fn gc_manager(root: &Path, retention: Option<Duration>) -> Arc<JobManager> {
+        JobManager::build(
+            "http://127.0.0.1:1".to_string(),
+            None,
+            root.to_path_buf(),
+            4,
+            60,
+            retention,
+        )
+    }
+
+    #[tokio::test]
+    async fn gc_removes_expired_finished_jobs_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let old_done = write_job_dir(root, "job_old_done", "completed");
+        let old_running = write_job_dir(root, "job_old_running", "running");
+        let fresh = write_job_dir(root, "job_fresh", "completed");
+
+        let three_days = Duration::from_secs(72 * 3600);
+        age_file(&old_done.join("job.json"), three_days);
+        age_file(&old_running.join("job.json"), three_days);
+
+        let mgr = gc_manager(root, Some(Duration::from_secs(48 * 3600)));
+        // The running job is still tracked in memory (a live job must survive
+        // regardless of how old its files look).
+        mgr.jobs.insert(
+            "job_old_running".to_string(),
+            Arc::new(Job {
+                job_id: "job_old_running".to_string(),
+                created_at_unix: 1,
+                tasks: Arc::new(RwLock::new(vec![Task {
+                    task_id: "job_old_running_t0000".to_string(),
+                    index: 0,
+                    request: test_request(),
+                    status: TaskStatus::Running,
+                    error: None,
+                    result: None,
+                }])),
+            }),
+        );
+
+        assert_eq!(mgr.gc_once().await, 1, "only the expired finished job goes");
+        assert!(!old_done.exists(), "expired finished job removed");
+        assert!(old_running.exists(), "running job never removed");
+        assert!(fresh.exists(), "fresh job kept");
+        assert!(mgr.get_job("job_old_running").is_some());
+        assert!(mgr.get_job("job_old_done").is_none() || !old_done.exists());
+    }
+
+    #[tokio::test]
+    async fn gc_disabled_keeps_everything() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let old = write_job_dir(root, "job_old", "completed");
+        age_file(&old.join("job.json"), Duration::from_secs(30 * 24 * 3600));
+
+        let mgr = gc_manager(root, None); // SMG_JOBS_RETENTION_HOURS=0
+        assert_eq!(mgr.gc_once().await, 0);
+        assert!(old.exists(), "GC disabled: nothing is deleted");
+    }
+
+    #[tokio::test]
+    async fn gc_removes_untracked_expired_dirs_and_orphan_entries() {
+        // A dir left by an older run (not in memory) must still be reclaimed,
+        // and an in-memory finished job must disappear from the registry too.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let orphan = write_job_dir(root, "job_orphan", "completed");
+        let tracked = write_job_dir(root, "job_tracked", "completed");
+        let old = Duration::from_secs(96 * 3600);
+        age_file(&orphan.join("job.json"), old);
+        age_file(&tracked.join("job.json"), old);
+
+        let mgr = gc_manager(root, Some(Duration::from_secs(48 * 3600)));
+        mgr.jobs.insert(
+            "job_tracked".to_string(),
+            Arc::new(Job {
+                job_id: "job_tracked".to_string(),
+                created_at_unix: 1,
+                tasks: Arc::new(RwLock::new(vec![Task {
+                    task_id: "job_tracked_t0000".to_string(),
+                    index: 0,
+                    request: test_request(),
+                    status: TaskStatus::Completed,
+                    error: None,
+                    result: None,
+                }])),
+            }),
+        );
+
+        assert_eq!(mgr.gc_once().await, 2);
+        assert!(!orphan.exists());
+        assert!(!tracked.exists());
+        assert!(mgr.get_job("job_tracked").is_none(), "registry entry dropped");
+    }
+
+    #[test]
+    fn gc_helpers_report_last_activity_and_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = write_job_dir(tmp.path(), "job_x", "completed");
+        let size = dir_size(&dir);
+        assert!(size > 0, "job dir has bytes");
+        let m = newest_mtime(&dir).expect("mtime");
+        assert!(SystemTime::now().duration_since(m).unwrap() < Duration::from_secs(60));
+
     }
 }
