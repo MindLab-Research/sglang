@@ -44,6 +44,10 @@ def _embedding_lora_a_kernel(
     token_idx = tl.program_id(axis=0)
 
     w_index = tl.load(weight_indices + batch_id)
+    # [PAD-NO-DELTA] -1 = "no adapter" (base / CP padding rows): skip before
+    # the lora_ranks load, a negative index would read out of bounds.
+    if w_index < 0:
+        return
     rank_val = tl.load(lora_ranks + w_index)
 
     # If rank is 0, skip
