@@ -1337,12 +1337,37 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(3600);
-    let jobs_state = crate::control_plane::jobs::JobManager::new(
+    // Engine URLs (comma-separated) for `continue_from` tokenization: the
+    // source prompt is turned back into ids by an engine's own tokenizer, so the
+    // client never re-sends tokens when continuing. Defaults to the configured
+    // workers; jobs still need them when the router itself has no tokenizer.
+    let jobs_engine_urls: Vec<String> = match std::env::var("SMG_JOBS_ENGINE_URLS") {
+        Ok(raw) => raw
+            .split(',')
+            .map(|u| u.trim().to_string())
+            .filter(|u| !u.is_empty())
+            .collect(),
+        Err(_) => match &config.router_config.mode {
+            RoutingMode::PrefillDecode {
+                prefill_urls,
+                decode_urls,
+                ..
+            } => prefill_urls
+                .iter()
+                .map(|(url, _)| url.clone())
+                .chain(decode_urls.iter().cloned())
+                .collect(),
+            RoutingMode::Regular { worker_urls } => worker_urls.clone(),
+            RoutingMode::OpenAI { worker_urls } => worker_urls.clone(),
+        },
+    };
+    let jobs_state = control_plane::jobs::JobManager::new(
         jobs_self_url,
         auth_config.api_key.clone(),
         std::path::PathBuf::from(jobs_data_dir),
         jobs_concurrency,
         jobs_timeout,
+        jobs_engine_urls.clone(),
     );
     jobs_state.recover_from_disk();
     // Local retention: delete finished jobs older than
@@ -1350,8 +1375,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // cannot grow without bound. Logs its own config line.
     jobs_state.spawn_gc_task();
     info!(
-        "Training job manager ready (concurrency={}, dir from SMG_JOBS_DIR, timeout={}s)",
-        jobs_concurrency, jobs_timeout
+        "Training job manager ready (concurrency={}, dir from SMG_JOBS_DIR, timeout={}s, engines={})",
+        jobs_concurrency,
+        jobs_timeout,
+        jobs_engine_urls.len()
     );
 
     // Initialize control plane authentication if configured
