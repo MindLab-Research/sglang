@@ -30,6 +30,14 @@ pub struct RouterConfig {
     pub worker_startup_check_interval_secs: u64,
     pub dp_aware: bool,
     pub api_key: Option<String>,
+    /// LoRA slots the control plane may keep loaded per engine unit
+    /// (`ChildUnit::capacity`). Must match the engines' `--max-loaded-loras`
+    /// minus the always-resident base model: when it is smaller, every extra
+    /// deploy drains and unloads the LRU adapter (`select_replacee`), so an
+    /// adapter that clients still need silently disappears. Default 2 keeps
+    /// the historical BF16 GLM-5.2 behaviour.
+    #[serde(default = "default_control_plane_lora_capacity")]
+    pub control_plane_lora_capacity: usize,
     pub discovery: Option<DiscoveryConfig>,
     pub metrics: Option<MetricsConfig>,
     pub trace_config: Option<TraceConfig>,
@@ -153,6 +161,10 @@ fn default_sse_snapshot_ttl_secs() -> u64 {
 
 fn default_l1_max_memory() -> usize {
     50 * 1024 * 1024 // 50MB
+}
+
+fn default_control_plane_lora_capacity() -> usize {
+    2
 }
 
 fn default_pool_idle_timeout_secs() -> u64 {
@@ -540,6 +552,7 @@ impl Default for RouterConfig {
             worker_startup_check_interval_secs: 30,
             dp_aware: false,
             api_key: None,
+            control_plane_lora_capacity: default_control_plane_lora_capacity(),
             discovery: None,
             metrics: None,
             trace_config: None,

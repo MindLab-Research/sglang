@@ -178,6 +178,13 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// LoRA slots the control plane may keep loaded per engine unit
+    /// (see `RouterConfig::control_plane_lora_capacity`).
+    pub fn control_plane_lora_capacity(mut self, capacity: usize) -> Self {
+        self.config.control_plane_lora_capacity = capacity;
+        self
+    }
+
     pub fn request_timeout_secs(mut self, timeout: u64) -> Self {
         self.config.request_timeout_secs = timeout;
         self
