@@ -304,6 +304,17 @@ def find_adapter_dir(target: str) -> str:
     return target
 
 
+def extract_archive(archive: str, target: str, is_zst: bool) -> None:
+    """Extract ``archive`` into ``target`` (multi-threaded zstd for .tar.zst)."""
+    if is_zst:
+        from sglang.srt.lora.mmap_weights import extract_zstd_argv
+
+        subprocess.run(extract_zstd_argv(archive, target), check=True, timeout=600)
+    else:
+        with tarfile.open(archive, "r:gz") as tf:
+            tf.extractall(target)
+
+
 def curl_download(url: str, dest: str) -> None:
     """Download ``url`` to ``dest`` with curl.
 
@@ -399,18 +410,20 @@ def resolve_remote_adapter(
         try:
             archive = os.path.join(root, f"{key}{suffix}")
             log("downloading lora %s from %s", name, path)
+            t_download = time.perf_counter()
             download(path, archive)
             log("extracting lora %s -> %s", name, target)
             if os.path.isdir(target):
                 shutil.rmtree(target, ignore_errors=True)
             os.makedirs(target, exist_ok=True)
-            if is_zst:
-                subprocess.run(
-                    ["tar", "--zstd", "-xf", archive, "-C", target], check=True
-                )
-            else:
-                with tarfile.open(archive, "r:gz") as tf:
-                    tf.extractall(target)
+            t_extract = time.perf_counter()
+            extract_archive(archive, target, is_zst=is_zst)
+            log(
+                "[LORA-LOAD-TIMING] adapter=%s download_ms=%.0f extract_ms=%.0f",
+                name,
+                (t_extract - t_download) * 1e3,
+                (time.perf_counter() - t_extract) * 1e3,
+            )
             os.remove(archive)
 
             # Hoist a single nested top-level directory if present.
