@@ -485,9 +485,23 @@ class LoRAManager:
         # Load active loras into lora memory pool
         cur_uids = new_loras | running_loras
 
-        assert len(cur_uids) <= self.max_loras_per_batch
+        # Base (None) keeps no pool slot (see LoRAMemoryPool.prepare_lora_batch),
+        # so only real adapters count against the pool here and only they can be
+        # "new". Counting base (i) tripped this assert for any batch that mixed
+        # base with max_loras_per_batch adapters -- it runs in the request path,
+        # so the whole engine died with it (kill_process_tree) -- and (ii) made
+        # the changed-slots update below look up a slot id base does not have,
+        # a KeyError on the startup call fetch_new_loras({None}) that
+        # initialises the pool.
+        active_uids = {uid for uid in cur_uids if uid is not None}
+        assert len(active_uids) <= self.max_loras_per_batch, (
+            f"{len(active_uids)} adapters in one batch exceed the "
+            f"{self.max_loras_per_batch} LoRA pool slots (base needs no slot)"
+        )
         new_uids = {
-            uid for uid in cur_uids if uid not in self.memory_pool.uid_to_buffer_id
+            uid
+            for uid in active_uids
+            if uid not in self.memory_pool.uid_to_buffer_id
         }
         self.memory_pool.prepare_lora_batch(
             cur_uids=cur_uids,
