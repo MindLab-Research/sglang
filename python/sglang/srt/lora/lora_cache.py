@@ -58,6 +58,7 @@ import re
 import shutil
 import subprocess
 import tarfile
+import threading
 import time
 from typing import Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -437,6 +438,81 @@ def resolve_remote_adapter(
 # --------------------------------------------------------------------------- #
 # GC
 # --------------------------------------------------------------------------- #
+class CacheGCScheduler:
+    """Run :func:`gc` on a daemon thread, at most one sweep at a time.
+
+    Why this exists (2026-09-17, AWS B300 MoL pair ``3.37.20.114`` / ``15.164.0.39``):
+    ``gc()`` used to be called *synchronously* from
+    ``LoRAManager.load_lora_adapter()`` / ``unload_lora_adapter()`` — i.e. while the
+    engine holds ``lora_update_lock``. With a 55 GB adapter directory a sweep takes
+    minutes (tar / dedup / prune), so every later LoRA op queued behind it:
+
+    * ``Start unload Lora adapter`` at 14:16:20 never returned (no per-rank lines);
+    * loads submitted from 14:19 onward never ran (no ``LORA-ASSIGN``);
+    * the control-plane deploy therefore never got its per-engine ACK and sat at
+      ``FAILED``/``LOADING`` for ~30 min while the platform retried the deploy.
+
+    The sweep is idle-time housekeeping: it must never block the update path.
+    Scheduling is O(1); the caller keeps holding no lock while the GC runs.
+
+    ``gc_enabled()`` (``SGLANG_LORA_CACHE_GC``) is still honoured here, and only one
+    sweep runs at a time — a second ``schedule()`` while a sweep is alive is a no-op,
+    because the sweep in flight already sees the current directory set.
+
+    Residual race (documented, not solved here): ``in_use`` is a snapshot taken at
+    schedule time. A directory that becomes in use *after* the snapshot can still be
+    reclaimed if its TTL already expired; ``resolve_lora_local_path`` re-downloads in
+    that case, so the cost is a re-download rather than a correctness bug.
+    """
+
+    def __init__(self, *, name: str = "lora-cache-gc") -> None:
+        self._name = name
+        self._thread: Optional[threading.Thread] = None
+        self._last_result: Optional[Dict[str, object]] = None
+
+    def schedule(self, in_use: Iterable[str] = (), logger=None) -> bool:
+        """Start a sweep if none is running. Returns True when one was started."""
+        if not gc_enabled():
+            return False
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            return False
+        self._thread = threading.Thread(
+            target=self._run,
+            args=(set(in_use), logger),
+            name=self._name,
+            daemon=True,
+        )
+        self._thread.start()
+        return True
+
+    def _run(self, in_use: set, logger) -> None:
+        try:
+            result = gc(in_use=in_use, logger=logger)
+        except Exception:
+            if logger is not None:
+                logger.exception("LoRA cache GC failed (background); continuing")
+            return
+        self._last_result = result
+        deleted = (result or {}).get("deleted") or []
+        if deleted and logger is not None:
+            logger.info(
+                "LoRA cache GC: removed %d dir(s), freed %.2f GB",
+                len(deleted),
+                float((result or {}).get("freed_bytes", 0)) / 1e9,
+            )
+
+    def running(self) -> bool:
+        thread = self._thread
+        return thread is not None and thread.is_alive()
+
+    def wait(self, timeout: Optional[float] = None) -> None:
+        """Join the in-flight sweep (tests / shutdown)."""
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout)
+
+
 def gc(
     root: Optional[str] = None,
     ttl: Optional[float] = None,
