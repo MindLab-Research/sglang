@@ -1258,12 +1258,17 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
                 decode_url: Some(decode_url.clone()),
                 api_key: config.router_config.api_key.clone(),
                 models: Vec::new(),
-                // Matches --max-loaded-loras 2 on the BF16 GLM-5.2 cluster.
-                capacity: 2,
+                // Must match the engines' `--max-loaded-loras` minus the base
+                // model -- see `RouterConfig::control_plane_lora_capacity`.
+                capacity: config.router_config.control_plane_lora_capacity.max(1),
                 ssh_hosts: Vec::new(),
             };
             control_plane.register_child(unit);
-            info!("Registered launched PD cluster as control-plane child (decode={decode_url})");
+            info!(
+                "Registered launched PD cluster as control-plane child \
+                 (decode={decode_url}, lora_capacity={})",
+                config.router_config.control_plane_lora_capacity.max(1)
+            );
         }
     }
 

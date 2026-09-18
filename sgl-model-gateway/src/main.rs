@@ -624,6 +624,18 @@ struct CliArgs {
     #[arg(long = "control-plane-api-keys", action = ArgAction::Append, env = "CONTROL_PLANE_API_KEYS", help_heading = "Control Plane Authentication")]
     control_plane_api_keys: Vec<String>,
 
+    /// LoRA slots the control plane keeps loaded per engine unit. Set it to the
+    /// engines' `--max-loaded-loras` minus the base model (e.g. 4 for
+    /// `--max-loaded-loras 5`), otherwise each extra deploy evicts a loaded
+    /// adapter. Default 2 matches the BF16 GLM-5.2 cluster.
+    #[arg(
+        long = "control-plane-lora-capacity",
+        env = "CONTROL_PLANE_LORA_CAPACITY",
+        default_value_t = 2,
+        help_heading = "Control Plane Authentication"
+    )]
+    control_plane_lora_capacity: usize,
+
     /// Disable audit logging for control plane operations
     #[arg(
         long,
@@ -1036,6 +1048,7 @@ impl CliArgs {
             .pool_max_idle_per_host(self.pool_max_idle_per_host)
             .tcp_keepalive_secs(self.tcp_keepalive_secs)
             .max_concurrent_requests(self.max_concurrent_requests)
+            .control_plane_lora_capacity(self.control_plane_lora_capacity.max(1))
             .queue_size(self.queue_size)
             .queue_timeout_secs(self.queue_timeout_secs)
             .cors_allowed_origins(self.cors_allowed_origins.clone())
