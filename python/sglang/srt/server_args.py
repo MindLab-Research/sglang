@@ -1125,6 +1125,14 @@ class ServerArgs:
         Optional[str],
         "Set admin API key for sensitive management endpoints (e.g. /clear_hicache_storage_backend). When set, admin endpoints require this key and do NOT accept --api-key.",
     ] = None
+    router: A[
+        Optional[str],
+        "URL of an sgl-model-gateway (Rust router) to auto-register with on startup, e.g. http://gateway:30000. After the server passes warmup and is healthy, it POSTs its own URL to {router}/workers (worker_type derived from --disaggregation-mode; runtime 'sglang'). On graceful shutdown it DELETEs its registration. The router being down at startup is tolerated (retried for a few minutes, then the server starts anyway).",
+    ] = None
+    router_advertise_url: A[
+        Optional[str],
+        "URL this worker advertises to --router when registering, e.g. http://10.0.0.1:30000. Default: derived from --host/--port (when --host binds all interfaces, the local routable IP is auto-detected). Only effective with --router.",
+    ] = None
     served_model_name: A[
         Optional[str],
         "Override the model name returned by the v1/models endpoint in OpenAI API server.",
