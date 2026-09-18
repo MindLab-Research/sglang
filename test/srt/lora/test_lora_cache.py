@@ -363,6 +363,77 @@ def test_gc_keeps_dir_that_was_reused_after_unload():
 
 
 # --------------------------------------------------------------------------- #
+
+# --------------------------------------------------------------------------- #
+# GC scheduling (2026-09-17: the sweep must never run on the LoRA update path)
+# --------------------------------------------------------------------------- #
+def test_gc_scheduler_is_non_blocking_and_single_flight():
+    """``schedule()`` 必须立刻返回，且同一时刻只跑一次 sweep。
+
+    现场（AWS B300 对，2026-09-17）：GC 以前在 ``lora_update_lock`` 内同步跑，
+    55GB 目录下要分钟级 —— 一次 unload 之后再没有任何 LoRA op 完成（``Start unload``
+    14:16:20 无果、14:19 起的 load 全排队），CP 部署因此永远拿不到 per-engine ACK。
+    """
+    orig_gc = lc.gc
+    calls = []
+
+    def slow_gc(**kwargs):
+        calls.append(kwargs.get("in_use"))
+        time.sleep(0.4)
+        return {"deleted": [], "freed_bytes": 0}
+
+    lc.gc = slow_gc
+    try:
+        sched = lc.CacheGCScheduler()
+        t0 = time.time()
+        started = sched.schedule(in_use={"/live-1"}, logger=None)
+        elapsed = time.time() - t0
+        assert started is True
+        assert elapsed < 0.2, f"schedule() 阻塞了 {elapsed:.3f}s"
+        assert sched.schedule(in_use={"/live-2"}, logger=None) is False
+        sched.wait(timeout=5)
+        assert calls == [{"/live-1"}], calls
+        assert sched.running() is False
+    finally:
+        lc.gc = orig_gc
+
+
+def test_gc_scheduler_honours_env_switch():
+    """``SGLANG_LORA_CACHE_GC=0`` 时不调度（现场就是用这个开关兜住的）。"""
+    orig_gc = lc.gc
+    orig_env = os.environ.get("SGLANG_LORA_CACHE_GC")
+
+    def must_not_run(**kwargs):
+        raise AssertionError("GC 不该被调度")
+
+    lc.gc = must_not_run
+    os.environ["SGLANG_LORA_CACHE_GC"] = "0"
+    try:
+        assert lc.CacheGCScheduler().schedule(in_use=set(), logger=None) is False
+    finally:
+        lc.gc = orig_gc
+        if orig_env is None:
+            os.environ.pop("SGLANG_LORA_CACHE_GC", None)
+        else:
+            os.environ["SGLANG_LORA_CACHE_GC"] = orig_env
+
+
+def test_gc_scheduler_swallows_errors():
+    """GC 抛异常不能影响调用方 —— 它现在跑在后台线程里。"""
+    orig_gc = lc.gc
+
+    def boom(**kwargs):
+        raise RuntimeError("disk on fire")
+
+    lc.gc = boom
+    try:
+        sched = lc.CacheGCScheduler()
+        assert sched.schedule(in_use=set(), logger=None) is True
+        sched.wait(timeout=5)
+        assert sched.running() is False
+    finally:
+        lc.gc = orig_gc
+
 def _run_all():
     tests = [
         (name, fn) for name, fn in sorted(globals().items())

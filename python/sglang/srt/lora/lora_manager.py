@@ -35,12 +35,11 @@ from sglang.srt.lora.backend.lora_registry import get_backend_from_name
 from sglang.srt.lora.layers import BaseLayerWithLoRA, FusedMoEWithLoRA, get_lora_layer
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_cache import (
+    CacheGCScheduler,
     cache_dir_for_path,
     cache_ttl_sec,
     curl_download,
     find_adapter_dir,
-    gc as lora_cache_gc,
-    gc_enabled,
     is_remote,
     mark_unloaded,
     resolve_remote_adapter,
@@ -237,7 +236,9 @@ class LoRAManager:
             # directories unloaded more than SGLANG_LORA_CACHE_TTL_SEC ago,
             # duplicates of the same artifact, and stale archives. Never touches
             # a directory this process has loaded or is downloading.
-            self._gc_lora_cache()
+            # Scheduled, not run inline: the sweep takes minutes on a large cache and
+            # must not block this thread while it holds `lora_update_lock`.
+            self._schedule_lora_cache_gc()
             # Resolve a remote URL to a local directory downloaded on THIS node
             # (each PD node downloads its own copy — no intermediate hop, no
             # ssh dependency; local-bandwidth, parallel across nodes).
@@ -312,27 +313,19 @@ class LoRAManager:
         """
         return {d for d in self._lora_cache_dirs.values() if d}
 
-    def _gc_lora_cache(self) -> None:
-        """Sweep the on-disk LoRA cache (unloaded > TTL, duplicates, archives).
+    def _schedule_lora_cache_gc(self) -> None:
+        """Queue the on-disk cache sweep; never blocks the LoRA update path.
 
-        Runs on load and unload — both are already heavy (multi-GB download /
-        weight load), so the extra listdir is free, and continuous LoRA churn
-        (the production pattern) keeps the cache bounded without a timer thread.
+        The sweep itself (`lora_cache.gc`) reclaims directories unloaded > TTL,
+        duplicates and stale archives. It used to run inline here — i.e. while the
+        engine held `lora_update_lock` — which wedged the whole LoRA update path for
+        minutes on a 55 GB cache (2026-09-17, both AWS B300 engines: an unload that
+        never returned, loads queued behind it, and a control-plane deploy that sat
+        at FAILED/LOADING for ~30 min because the per-engine ACK never came).
+        It now runs on a daemon thread, at most one sweep at a time; `in_use` is
+        snapshotted here so the sweep still refuses to touch live directories.
         """
-        if not gc_enabled():
-            return
-        try:
-            result = lora_cache_gc(in_use=self._lora_cache_dirs_in_use(), logger=logger)
-        except Exception:
-            logger.exception("LoRA cache GC failed; continuing")
-            return
-        deleted = result.get("deleted") or []
-        if deleted:
-            logger.info(
-                "LoRA cache GC: removed %d dir(s), freed %.2f GB",
-                len(deleted),
-                float(result.get("freed_bytes", 0)) / 1e9,
-            )
+        self._lora_cache_gc.schedule(self._lora_cache_dirs_in_use(), logger=logger)
 
     def validate_new_adapter(self, lora_config: LoRAConfig, lora_ref: LoRARef):
         """
@@ -438,7 +431,7 @@ class LoRAManager:
                 cache_dir,
                 cache_ttl_sec() / 3600.0,
             )
-        self._gc_lora_cache()
+        self._schedule_lora_cache_gc()
 
         return self.create_lora_update_result(success=True)
 
@@ -767,6 +760,9 @@ class LoRAManager:
         # Mapping from LoRA ID to the on-disk cache directory of a remotely
         # downloaded adapter (drives GC retention + `in use` accounting).
         self._lora_cache_dirs: Dict[str, str] = {}
+        # Sweeps the on-disk cache off the update path (see CacheGCScheduler:
+        # it used to run while holding `lora_update_lock` and wedged the engine).
+        self._lora_cache_gc = CacheGCScheduler()
 
         # Count of pinned LoRA adapters.
         self.num_pinned_loras: int = 0
