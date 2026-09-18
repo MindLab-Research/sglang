@@ -2664,3 +2664,9 @@ def scattered_to_tp_attn_full(
     )
     attn_tp_all_gather_into_tensor(hidden_states, local_hidden_states.contiguous())
     return hidden_states
+
+
+# lora_manager.init_lora_shapes 引用本开关（--lora-target-modules 含
+# indexer 目标时检查）。DSA indexer Q/K fusion 尚未在本分支落地，
+# 先以 False 占位，fusion 引入后改为真实探测。
+_use_dsa_indexer_fusion = False
