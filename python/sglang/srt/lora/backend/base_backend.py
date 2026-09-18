@@ -601,10 +601,17 @@ def _compute_moe_lora_info(
         return adapter_enabled, token_lora_mapping
 
     if has_segments:
-        active_ranks = lora_ranks[weight_indices.long()]
-        adapter_enabled.scatter_(
-            0, weight_indices.long(), (active_ranks > 0).to(torch.int32)
-        )
+        # Negative entries are the "no adapter" sentinel (base / CP padding
+        # rows): they own no adapter_enabled bit, and a negative index either
+        # raises or wraps to the last slot in scatter_. The CUDA path above
+        # already returns early for them (see _compute_moe_lora_info_kernel).
+        wi_nonneg = weight_indices.long()
+        wi_nonneg = wi_nonneg[wi_nonneg >= 0]
+        if wi_nonneg.numel():
+            active_ranks = lora_ranks[wi_nonneg]
+            adapter_enabled.scatter_(
+                0, wi_nonneg, (active_ranks > 0).to(torch.int32)
+            )
     if num_tokens == 0:
         return adapter_enabled, token_lora_mapping
     if not has_segments:

@@ -446,7 +446,13 @@ class LoRAManager:
         """
         Validate if the LoRA IDs in the batch can be loaded into the current LoRA memory pool.
         """
-        if len(lora_ids) > self.max_loras_per_batch:
+        # Base (None) keeps no pool slot (see LoRAMemoryPool.prepare_lora_batch),
+        # so only real adapters count against the pool, the per-batch limit and
+        # the pinned-LoRA accounting below. Counting base made a base+adapter
+        # batch look one slot larger than it is and could reject a batch that
+        # actually fits.
+        active_lora_ids = {uid for uid in lora_ids if uid is not None}
+        if len(active_lora_ids) > self.max_loras_per_batch:
             return False
 
         # skip pinned LoRA check if no pinned LoRA adapters are loaded.
@@ -468,7 +474,7 @@ class LoRAManager:
             f"({self.num_pinned_loras}). This indicates a bug in the LoRA loading logic."
         )
 
-        required_slots = len(lora_ids) - pinned_loras_in_batch
+        required_slots = len(active_lora_ids) - pinned_loras_in_batch
         mem_pool_vacancy = self.memory_pool.max_loras_per_batch - self.num_pinned_loras
 
         return required_slots <= mem_pool_vacancy
@@ -479,9 +485,23 @@ class LoRAManager:
         # Load active loras into lora memory pool
         cur_uids = new_loras | running_loras
 
-        assert len(cur_uids) <= self.max_loras_per_batch
+        # Base (None) keeps no pool slot (see LoRAMemoryPool.prepare_lora_batch),
+        # so only real adapters count against the pool here and only they can be
+        # "new". Counting base (i) tripped this assert for any batch that mixed
+        # base with max_loras_per_batch adapters -- it runs in the request path,
+        # so the whole engine died with it (kill_process_tree) -- and (ii) made
+        # the changed-slots update below look up a slot id base does not have,
+        # a KeyError on the startup call fetch_new_loras({None}) that
+        # initialises the pool.
+        active_uids = {uid for uid in cur_uids if uid is not None}
+        assert len(active_uids) <= self.max_loras_per_batch, (
+            f"{len(active_uids)} adapters in one batch exceed the "
+            f"{self.max_loras_per_batch} LoRA pool slots (base needs no slot)"
+        )
         new_uids = {
-            uid for uid in cur_uids if uid not in self.memory_pool.uid_to_buffer_id
+            uid
+            for uid in active_uids
+            if uid not in self.memory_pool.uid_to_buffer_id
         }
         self.memory_pool.prepare_lora_batch(
             cur_uids=cur_uids,
@@ -528,7 +548,13 @@ class LoRAManager:
             ):
                 use_cuda_graph = False
 
-        weight_indices = [0] * len(forward_batch.lora_ids)
+        # -1 = "no adapter": every consuming kernel skips negative slots (the
+        # sentinel the CP padding rows already use). Slot 0 is NOT a safe
+        # default for a uid without an adapter any more -- base no longer owns
+        # a slot, so slot 0 belongs to whichever adapter is resident there
+        # (pure-LoRA traffic evicts base), and defaulting to 0 would silently
+        # add that adapter's delta to a base request.
+        weight_indices = [-1] * len(forward_batch.lora_ids)
         lora_ranks = [0] * self.max_loras_per_batch
         scalings = [0] * self.max_loras_per_batch
         for i, uid in enumerate(forward_batch.lora_ids):
@@ -540,7 +566,12 @@ class LoRAManager:
                 lora_ranks[weight_indices[i]] = lora.config.r
                 scalings[weight_indices[i]] = lora.scaling
 
-        local_active = any(lora_ranks[wi] > 0 for wi in weight_indices)
+        # The wi >= 0 guard is required by the -1 defaults above: a negative
+        # wi would index lora_ranks from the end (last slot) and could mark a
+        # base-only batch as active.
+        local_active = any(
+            wi >= 0 and lora_ranks[wi] > 0 for wi in weight_indices
+        )
 
         # MoE-expert LoRA under --enable-dp-attention: the MoE runs on DP-GATHERED tokens, so this
         # rank's local experts also process OTHER ranks' tokens, whose adapter identity is not known

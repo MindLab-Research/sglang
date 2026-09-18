@@ -45,6 +45,10 @@ def _chunked_embedding_lora_a_kernel(
         return
     # Load LoRA adapter index for this segment, then look up the rank
     lora_index = tl.load(weight_indices + chunk_idx)
+    # [PAD-NO-DELTA] -1 = "no adapter" (base / CP padding rows): skip before
+    # the lora_ranks load, a negative index would read out of bounds.
+    if lora_index < 0:
+        return
     rank_val = tl.load(lora_ranks + lora_index)
     # If rank is 0, skip
     if rank_val == 0:

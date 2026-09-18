@@ -61,6 +61,10 @@ def _gate_up_lora_b_kernel(
     # gate_up_id decides which of gate or up (0: gate, 1: up)
     batch_id = tl.program_id(axis=2)
     w_index = tl.load(weight_indices + batch_id)
+    # [PAD-NO-DELTA] -1 = "no adapter" (base / CP padding rows): skip before
+    # the lora_ranks load, a negative index would read out of bounds.
+    if w_index < 0:
+        return
     rank = tl.load(lora_ranks + w_index)
 
     # If rank is 0, this kernel is a no-op.

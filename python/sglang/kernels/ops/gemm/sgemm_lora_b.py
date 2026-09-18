@@ -58,6 +58,10 @@ def _sgemm_lora_b_kernel(
     # which starts from row seg_start of x with length seg_len
     batch_id = tl.program_id(axis=1)
     w_index = tl.load(weight_indices + batch_id)
+    # [PAD-NO-DELTA] -1 = "no adapter" (base / CP padding rows): skip before
+    # the lora_ranks load, a negative index would read out of bounds.
+    if w_index < 0:
+        return
     rank = tl.load(lora_ranks + w_index)
 
     # If rank is 0, this kernel is a no-op.
