@@ -1156,7 +1156,12 @@ def _invoke_fused_lora_delta(
         hidden_states: [num_tokens, K] input
         lora_a: [num_experts, rank, K] shrink weights for this half
         lora_b: [num_experts, N, rank] expand weights for this half
-        output: [num_tokens * top_k, N] base output (delta added in-place)
+        output: [num_tokens * top_k, N] base output (delta added in-place).
+            A 3D ``[num_tokens, top_k, N]`` tensor (``intermediate_cache1`` /
+            ``intermediate_cache3``) is accepted and collapsed to 2D here --
+            the kernel indexes flattened slots, so passing 3D straight
+            through would misread ``stride(0)=topk*N`` as the row stride and
+            read far out of range (Triton IMA).
         sorted_token_ids, expert_ids, num_tokens_post_padded: routing
         token_lora_mapping: [num_tokens] -1 = no LoRA
         top_k: number of experts per token
@@ -1168,6 +1173,9 @@ def _invoke_fused_lora_delta(
             pass a too-loose upper bound and drive out-of-range reads
             (observed as a Triton IMA during CUDA-graph capture).
     """
+    if output.dim() == 3:
+        output = output.reshape(-1, output.shape[-1])
+
     N = lora_b.shape[1]
     K = hidden_states.shape[1]
 
@@ -1339,7 +1347,18 @@ def _invoke_fused_lora_delta_all_groups(
     token-expert slot count), NOT ``sorted_token_ids.numel()`` -- the latter
     is a worst-case-sized buffer whose slack holds garbage values that would
     pass an over-loose bound and cause out-of-range reads (Triton IMA).
+
+    ``output`` may be **3D** ``[num_tokens, topk, N]`` (that is what the MoE
+    runner hands the hooks: ``intermediate_cache1`` / ``intermediate_cache3``).
+    The kernel indexes it as the flattened ``[num_tokens*topk, N]``, so the
+    token dims are collapsed here. Feeding the 3D tensor straight through
+    would make the kernel read ``stride(0)=topk*N`` as the *row* stride and
+    ``stride(1)=N`` as the *column* stride -- every access then lands far
+    outside the buffer and the launch dies with a Triton IMA.
     """
+    if output.dim() == 3:
+        output = output.reshape(-1, output.shape[-1])
+
     N = lora_b.shape[2]
     K = hidden_states.shape[1]
     grid = (
