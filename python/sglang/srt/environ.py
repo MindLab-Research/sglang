@@ -1056,6 +1056,12 @@ class Envs:
     # buffer HBM write+read, hidden_states re-read for shrink.
     # Measured: ~3-5ms/step saved at bs=11 with 3 LoRAs.
     SGLANG_LORA_FUSED_DELTA = EnvBool(True)
+
+    # Zero-copy mmap load for single-file safetensors LoRA adapters + grouped
+    # H2D of MoE expert slabs. B300 GLM MoE adapters carry 116k tensors
+    # (~15.27 GB BF16); the old path materialised every tensor per TP rank and
+    # copied them to the GPU one launch at a time. Unset = legacy loader.
+    SGLANG_LORA_FAST_LOAD = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
     SGLANG_DSV4_MHC_PREWARM = EnvBool(True)

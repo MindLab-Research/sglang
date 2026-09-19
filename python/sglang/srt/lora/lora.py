@@ -29,6 +29,7 @@ from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.lora_config import LoRAConfig
+from sglang.srt.lora.mmap_weights import fast_load_enabled
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
@@ -142,8 +143,6 @@ class LoRAAdapter(nn.Module):
 
     def initialize_weights(self):
         model_path = self.config.path
-        loader = DefaultModelLoader(self.load_config)
-        revision = getattr(self.config.hf_config, "revision", None)
 
         # Get normalized target modules once (not per-weight) to avoid O(n^2)
         # when adapters use fully-expanded PEFT target_modules (e.g. 58k paths
@@ -155,13 +154,53 @@ class LoRAAdapter(nn.Module):
             self.config.target_modules
         )
 
-        # Get normalized target modules for filtering
+        import time as _time
+
+        t0 = _time.perf_counter()
+
+        # Fast path: single-file safetensors adapter -> zero-copy mmap views.
+        # The old path materialised EVERY tensor into fresh CPU RAM (~15.27 GB
+        # per rank on our MoE adapters — 116k `get_tensor` copies × 8 TP ranks
+        # read the same file), and the file is already fully in the page cache
+        # (extracted moments ago; >3 TB free RAM). Views skip the copy
+        # altogether. Any layout the reader can't handle falls back to the
+        # standard loader below, unchanged.
+        reader = None
+        if fast_load_enabled():
+            from sglang.srt.lora.mmap_weights import open_adapter
+
+            reader = open_adapter(model_path)
+            # Keep the mapping alive for the adapter's lifetime: every weight
+            # in self.layers[..].weights is a *view* into this mapping.
+            self._mmap_reader = reader
+
+        if reader is not None:
+            for name in reader.keys():
+                self._process_weight(name, reader.get(name))
+            logger.info(
+                "LoRA adapter '%s' weights opened via mmap fast path: "
+                "%d tensors, %.2f GB payload, read_ms=%.0f",
+                model_path,
+                len(reader),
+                reader.payload_bytes / 1e9,
+                (_time.perf_counter() - t0) * 1e3,
+            )
+            self._normalize_weights()
+            return
+
+        loader = DefaultModelLoader(self.load_config)
+        revision = getattr(self.config.hf_config, "revision", None)
         for name, loaded_weight in loader._get_weights_iterator(
             DefaultModelLoader.Source(
                 model_path, revision=revision, fall_back_to_pt=True
             )
         ):
             self._process_weight(name, loaded_weight)
+        logger.info(
+            "LoRA adapter '%s' weights read via standard loader, read_ms=%.0f",
+            model_path,
+            (_time.perf_counter() - t0) * 1e3,
+        )
 
         self._normalize_weights()
 
