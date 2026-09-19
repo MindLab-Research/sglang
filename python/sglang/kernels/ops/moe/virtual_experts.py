@@ -769,7 +769,7 @@ def _merged_experts_fused_moe_lora_add_impl(
         block_size: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # Check routing_cache for cross-call reuse (gate_up and down share routing)
-        cache_key = (num_experts, shared_outer, block_size)
+        cache_key = (num_experts, shared_outer, block_size, topk_ids.numel())
         if routing_cache is not None:
             cached = routing_cache.get(cache_key)
             if cached is not None:
@@ -1573,7 +1573,7 @@ def _merged_experts_fused_moe_lora_add_per_group_impl(
     # Cache routing by (num_experts, block_size) — gate_up and down may share
     # if block sizes match.
     def _get_per_group_routing(num_experts, block_size):
-        cache_key = (num_experts, block_size)
+        cache_key = (num_experts, block_size, topk_ids.numel())
         if routing_cache is not None:
             cached = routing_cache.get(cache_key)
             if cached is not None:
