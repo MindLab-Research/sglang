@@ -342,6 +342,10 @@ def _moe_lora_shrink_splitk_kernel(
     if off_expert == -1:
         return
 
+    # Clamp offs_token to 0 for masked-out elements — see comment in
+    # _fused_lora_delta_kernel for why this is needed on Blackwell.
+    offs_token = tl.where(token_mask, offs_token, 0)
+
     # Pointers
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
     offs_k = pid_sk * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
@@ -1060,6 +1064,14 @@ def _fused_lora_delta_kernel(
     if off_expert == -1:
         return
 
+    # Clamp offs_token to 0 for masked-out elements.  Without this, garbage
+    # values in sorted_token_ids slack (e.g. 2**30 from the negative clamp in
+    # _get_routing) produce addresses like ptr + 2**30 * stride that land in
+    # unmapped GPU pages.  On Blackwell (SM103), masked loads to fully
+    # unmapped addresses still raise IMA even when the predicate is False.
+    # Clamping to 0 keeps every computed address inside the base allocation.
+    offs_token = tl.where(token_mask, offs_token, 0)
+
     # Actual token rows in hidden_states (sorted_token_ids indexes the
     # flattened [num_tokens * top_k] array, so // top_k gives the row).
     token_rows = offs_token // top_k
@@ -1180,6 +1192,13 @@ def _invoke_fused_lora_delta(
     # stride(0)=top_k*N would cause offs_token*(top_k*N) to read far OOB.
     # This matches the upstream invoke_fused_moe_kernel which uses C.stride(-2),
     # C.stride(-1) for the same reason.
+    #
+    # The reshape to 2D is kept as a belt-and-suspenders: even though
+    # stride(-2)/stride(-1) resolves correctly for 3D, the reshape guarantees
+    # the kernel always sees a 2D layout, eliminating any edge case where
+    # a non-contiguous 3D view might have unexpected strides.
+    if output.dim() == 3:
+        output = output.reshape(-1, output.shape[-1])
 
     N = lora_b.shape[1]
     K = hidden_states.shape[1]
@@ -1269,6 +1288,9 @@ def _fused_lora_delta_all_groups_kernel(
     off_expert = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
     if off_expert == -1:
         return
+    # Clamp offs_token to 0 for masked-out elements — see comment in
+    # _fused_lora_delta_kernel for why this is needed on Blackwell.
+    offs_token = tl.where(token_mask, offs_token, 0)
     token_rows = offs_token // top_k
 
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(tl.int64)
