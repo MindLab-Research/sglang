@@ -38,20 +38,6 @@ class EnvField:
         assert EnvField._allow_set_name, "Usage like `a = envs.A` is not allowed"
         self.name = name
 
-    def get(self) -> Any:
-        value = os.getenv(self.name)
-
-        # Explicitly set to None
-        if self._set_to_none:
-            assert value == str(None)
-            return None
-
-        # Not set, return default
-        if value is None:
-            return self._resolve_default()
-
-        return self.parse(value)
-
     def parse(self, value: str) -> Any:
         raise NotImplementedError()
 

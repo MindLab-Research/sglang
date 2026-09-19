@@ -1383,29 +1383,22 @@ def _invoke_fused_lora_delta_all_groups(
 
 
 def _per_group_routing_enabled() -> bool:
-    """Read SGLANG_LORA_PER_GROUP_ROUTING (2 calls per layer)."""
-    global _PER_GROUP_ROUTING_ENV
-    if _PER_GROUP_ROUTING_ENV is None:
-        from sglang.srt.environ import envs
+    """Read SGLANG_LORA_PER_GROUP_ROUTING.
 
-        _PER_GROUP_ROUTING_ENV = envs.SGLANG_LORA_PER_GROUP_ROUTING
-    return _PER_GROUP_ROUTING_ENV
+    Must call `.get()`: accessing `envs.NAME` yields the EnvField object and
+    `bool(field)` raises RuntimeError. Not cached so it can be toggled at
+    runtime (A/B verification).
+    """
+    from sglang.srt.environ import envs
 
-
-_PER_GROUP_ROUTING_ENV: bool | None = None
+    return envs.SGLANG_LORA_PER_GROUP_ROUTING.get()
 
 
 def _fused_delta_enabled() -> bool:
-    """Read SGLANG_LORA_FUSED_DELTA (2 calls per layer)."""
-    global _FUSED_DELTA_ENV
-    if _FUSED_DELTA_ENV is None:
-        from sglang.srt.environ import envs
+    """Read SGLANG_LORA_FUSED_DELTA (see _per_group_routing_enabled)."""
+    from sglang.srt.environ import envs
 
-        _FUSED_DELTA_ENV = envs.SGLANG_LORA_FUSED_DELTA
-    return _FUSED_DELTA_ENV
-
-
-_FUSED_DELTA_ENV: bool | None = None
+    return envs.SGLANG_LORA_FUSED_DELTA.get()
 
 
 def _merged_experts_fused_moe_lora_add_per_group_impl(
