@@ -202,3 +202,36 @@ contiguous 的 3D `reshape(-1, N)` 是 view，原地写入仍然生效。
 - PR #31 `feat/lora-per-group-routing`（修复 commit `025a4b6000`）
 - 复现脚本：`/nvme/tmp/repro_ima_real_shapes.py`（b300-4）
 - micro bench：`/nvme/tmp/micro_bench_lora_delta.py`（b300-4）
+
+## 根因 5：fused delta kernel 用 stride(0)/stride(1) 而非 stride(-2)/stride(-1)
+
+修完根因 1-4 后，EAGLE + LoRA 仍然 SIGQUIT 崩溃（base 正常 837 tok/s，
+3-LoRA 全部 CUDA error）。崩溃栈异步报告在 `_write_mla_kv_buffer` 的 loc
+断言，真正的 IMA 来自前面的 fused delta kernel。
+
+**根因**：我们的 `_fused_lora_delta_kernel` 用 `output.stride(0)` 和
+`output.stride(1)` 传递行/列 stride。当 output 是 **3D** `[M, topk, N]`
+（EAGLE TARGET_VERIFY 的 `intermediate_cache1`/`intermediate_cache3`）时：
+
+- `stride(0) = topk * N`（不是行 stride！）
+- `stride(1) = N`（不是列 stride！）
+
+→ `offs_token * (topk * N)` 严重越界 → IMA。
+
+**为什么原版不崩**：上游 `invoke_fused_moe_kernel` 用 `C.stride(-2)` 和
+`C.stride(-1)`：
+- 3D `[M, topk, N]`：`stride(-2) = stride(1) = N`，`stride(-1) = stride(2) = 1` ✓
+- 2D `[M*topk, N]`：`stride(-2) = stride(0) = N`，`stride(-1) = stride(1) = 1` ✓
+
+`stride(-2)/stride(-1)` 对 2D 和 3D 都取到正确的行/列 stride。
+
+**修复**：两个 wrapper 的 `output.stride(0), output.stride(1)` →
+`output.stride(-2), output.stride(-1)`，与原版一致。同时删掉 3D reshape
+（不再需要，因为 stride(-2)/(-1) 对 3D 正确）。
+
+**验证**：micro bench（NE=1024 + 2D/3D 双路径）ALL PASS，2D vs 3D agreement
+= 0.000000（逐位一致）。
+
+**教训**：自定义 kernel 的 stride 传递要用 `stride(-2)/stride(-1)` 而非
+`stride(0)/stride(1)`，与上游 `invoke_fused_moe_kernel` 一致——前者对 N-D
+tensor 取最后两维的 stride（始终是行/列），后者只对 2D 正确。

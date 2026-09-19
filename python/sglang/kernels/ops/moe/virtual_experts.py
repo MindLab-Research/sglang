@@ -1173,8 +1173,13 @@ def _invoke_fused_lora_delta(
             pass a too-loose upper bound and drive out-of-range reads
             (observed as a Triton IMA during CUDA-graph capture).
     """
-    if output.dim() == 3:
-        output = output.reshape(-1, output.shape[-1])
+    # Use stride(-2)/stride(-1) instead of stride(0)/stride(1) so the kernel
+    # works with both 2D [num_tokens*top_k, N] and 3D [num_tokens, top_k, N]
+    # output tensors.  For 3D, stride(-2)=stride(1)=N and stride(-1)=stride(2)=1
+    # (the correct row/col strides for flattened token-expert slots), whereas
+    # stride(0)=top_k*N would cause offs_token*(top_k*N) to read far OOB.
+    # This matches the upstream invoke_fused_moe_kernel which uses C.stride(-2),
+    # C.stride(-1) for the same reason.
 
     N = lora_b.shape[1]
     K = hidden_states.shape[1]
@@ -1203,8 +1208,8 @@ def _invoke_fused_lora_delta(
         lora_b.stride(0),
         lora_b.stride(1),
         lora_b.stride(2),
-        output.stride(0),
-        output.stride(1),
+        output.stride(-2),
+        output.stride(-1),
         token_lora_mapping.stride(0),
         top_k=top_k,
         RANK=rank,
@@ -1356,8 +1361,10 @@ def _invoke_fused_lora_delta_all_groups(
     ``stride(1)=N`` as the *column* stride -- every access then lands far
     outside the buffer and the launch dies with a Triton IMA.
     """
-    if output.dim() == 3:
-        output = output.reshape(-1, output.shape[-1])
+    # Use stride(-2)/stride(-1) instead of stride(0)/stride(1) so the kernel
+    # works with both 2D [num_tokens*top_k, N] and 3D [num_tokens, top_k, N]
+    # output tensors (same fix as _invoke_fused_lora_delta; matches upstream
+    # invoke_fused_moe_kernel's C.stride(-2), C.stride(-1)).
 
     N = lora_b.shape[2]
     K = hidden_states.shape[1]
@@ -1387,8 +1394,8 @@ def _invoke_fused_lora_delta_all_groups(
         lora_b.stride(1),
         lora_b.stride(2),
         lora_b.stride(3),
-        output.stride(0),
-        output.stride(1),
+        output.stride(-2),
+        output.stride(-1),
         token_lora_mapping.stride(0),
         top_k=top_k,
         RANK=rank,
