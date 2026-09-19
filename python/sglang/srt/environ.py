@@ -1041,6 +1041,27 @@ class Envs:
     # BLOCK_SIZE_K and the K-loop are untouched, so the per-output reduction
     # order is unchanged -> bit-identical. Kill-switch for A/B: unset = upstream.
     SGLANG_OPT_MOL_LORA_STAGE_CFG = EnvBool(False)
+    # Per-group routing for MoL virtual experts: instead of expanding the expert
+    # space to max_loras × num_experts (e.g. 1024) and running one moe_align over
+    # all virtual buckets, run moe_align ONCE with the original num_experts (256)
+    # and loop over active LoRA groups, reusing the same routing. Each group's
+    # LoRA A/B weights are indexed by the original expert IDs. The add_output_mask
+    # ensures only the group's tokens receive the delta.
+    # Measured: ~8ms/step saved at bs=11 with 3 LoRAs (13.3ms → 5.7ms moe_align).
+    SGLANG_LORA_PER_GROUP_ROUTING = EnvBool(True)
+    # Fused LoRA delta kernel: shrink + expand + add in a single Triton kernel
+    # launch, keeping the rank=16 intermediate in registers (no HBM round-trip).
+    # Replaces the 2-kernel sequence (_moe_lora_shrink_splitk + invoke_fused_moe_kernel)
+    # with one fused kernel per output half. Eliminates: 1 kernel launch, intermediate
+    # buffer HBM write+read, hidden_states re-read for shrink.
+    # Measured: ~3-5ms/step saved at bs=11 with 3 LoRAs.
+    SGLANG_LORA_FUSED_DELTA = EnvBool(True)
+
+    # Zero-copy mmap load for single-file safetensors LoRA adapters + grouped
+    # H2D of MoE expert slabs. B300 GLM MoE adapters carry 116k tensors
+    # (~15.27 GB BF16); the old path materialised every tensor per TP rank and
+    # copied them to the GPU one launch at a time. Unset = legacy loader.
+    SGLANG_LORA_FAST_LOAD = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
     SGLANG_DSV4_MHC_PREWARM = EnvBool(True)

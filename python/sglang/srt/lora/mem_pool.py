@@ -126,6 +126,56 @@ def _moe_runner_keeps_global_expert_ids() -> bool:
         return False
 
 
+from sglang.srt.lora.mmap_weights import fast_load_enabled as _fast_load_enabled
+
+
+def _moe_fast_load_ok(weights) -> bool:
+    """True when the per-expert MoE weight dict can take the grouped H2D fast path."""
+    if not _fast_load_enabled():
+        return False
+    if not isinstance(weights, dict) or len(weights) == 0:
+        return False
+    return all(
+        isinstance(w, torch.Tensor) and w.dim() <= 2 for w in weights.values()
+    )
+
+
+def _stage_expert_slab_a(
+    staging: torch.Tensor,
+    local_eid: int,
+    expert_weight: torch.Tensor,
+    lora_rank: int,
+    max_r: int,
+    ci: int,
+) -> None:
+    """Write expert_weight into the A staging slab at the correct rank slot.
+
+    Mirrors ``target_buffer[buffer_id, local_eid, ci*max_r : ci*max_r+lora_rank, :]
+    = expert_weight[ci*lora_rank : (ci+1)*lora_rank, :]`` exactly.
+    """
+    staging[local_eid, ci * max_r : ci * max_r + lora_rank, :].copy_(
+        expert_weight[ci * lora_rank : (ci + 1) * lora_rank, :]
+    )
+
+
+def _stage_expert_slab_b(
+    staging: torch.Tensor,
+    local_eid: int,
+    expert_weight,
+    lora_rank: int,
+    scaling: float,
+) -> None:
+    """Write scaled expert_weight into the B staging slab (zero if None).
+
+    Mirrors ``w * scaling -> target_buffer[buffer_id, local_eid, :, :lora_rank]``.
+    """
+    view = staging[local_eid, :, :lora_rank]
+    if expert_weight is None:
+        view.zero_()
+    else:
+        view.copy_(expert_weight * scaling)
+
+
 class LoRAMemoryPool:
     """Class for memory pool management of lora modules"""
 
@@ -1119,6 +1169,13 @@ class LoRAMemoryPool:
         lora_embed_tokens_module: Optional[BaseLayerWithLoRA],
         lora_lm_head_module: Optional[BaseLayerWithLoRA],
     ):
+        # Keep pinned staging tensors alive until all queued H2D copies are
+        # consumed; freed on function exit after the last copy_ was enqueued.
+        # `non_blocking=True` from pinned CPU memory means the copy may still
+        # be in flight when this scope ends, so we must not let Python GC the
+        # staging tensor while the DMA may still be reading from it.
+        staged_h2d_events: List[torch.Tensor] = []
+
         def load_lora_weight_tensor(
             buffer_view: torch.Tensor, weight: Optional[torch.Tensor]
         ):
@@ -1473,37 +1530,73 @@ class LoRAMemoryPool:
                         # then load owned slots at max_rank-spaced offsets so
                         # the MoE kernel's [:max_r] / [max_r:2*max_r] slicing
                         # is correct.
-                        target_buffer[buffer_id].zero_()
-                        assert isinstance(weights_cache_key, (str, dict))
-                        for (
-                            local_eid,
-                            expert_weight,
-                            expert_cache_key,
-                        ) in self._iter_local_expert_weights(
-                            weights,
-                            weights_cache_key,
-                            localize=not self.is_shared_moe_module(name),
-                        ):
-                            if expert_weight is None:
-                                continue
-                            expert_weight = self._get_maybe_cached_weight_for_transfer(
-                                pinned_layer_weights,
-                                expert_cache_key,
-                                expert_weight,
+                        if _moe_fast_load_ok(weights):
+                            # Grouped H2D: fill one CPU staging slab (= the whole
+                            # [E, c*max_r, D] GPU slice) in RAM, then ONE
+                            # cudaMemcpy. Replaces the per-expert-per-c small
+                            # copies (256 experts x ~64 rows x 78 layers x
+                            # <5 modules = tens of thousands of tiny launches)
+                            # with ~4 large contiguous copies per layer.
+                            staging = torch.zeros(
+                                target_buffer[buffer_id].shape,
+                                dtype=target_buffer.dtype,
+                                device="cpu",
+                                pin_memory=True,
                             )
-                            for ci in range(c):
-                                buffer_view = target_buffer[
-                                    buffer_id,
-                                    local_eid,
-                                    ci * max_r : ci * max_r + lora_rank,
-                                    :,
-                                ]
-                                load_lora_weight_tensor(
-                                    buffer_view,
-                                    expert_weight[
-                                        ci * lora_rank : (ci + 1) * lora_rank, :
-                                    ],
+                            for (
+                                local_eid,
+                                expert_weight,
+                                _unused_key,
+                            ) in self._iter_local_expert_weights(
+                                weights,
+                                weights if isinstance(weights, dict) else {},
+                                localize=not self.is_shared_moe_module(name),
+                            ):
+                                if expert_weight is None:
+                                    continue
+                                for ci in range(c):
+                                    _stage_expert_slab_a(
+                                        staging,
+                                        local_eid,
+                                        expert_weight,
+                                        lora_rank,
+                                        max_r,
+                                        ci,
+                                    )
+                            target_buffer[buffer_id].copy_(staging, non_blocking=True)
+                            staged_h2d_events.append(staging)
+                        else:
+                            target_buffer[buffer_id].zero_()
+                            assert isinstance(weights_cache_key, (str, dict))
+                            for (
+                                local_eid,
+                                expert_weight,
+                                expert_cache_key,
+                            ) in self._iter_local_expert_weights(
+                                weights,
+                                weights_cache_key,
+                                localize=not self.is_shared_moe_module(name),
+                            ):
+                                if expert_weight is None:
+                                    continue
+                                expert_weight = self._get_maybe_cached_weight_for_transfer(
+                                    pinned_layer_weights,
+                                    expert_cache_key,
+                                    expert_weight,
                                 )
+                                for ci in range(c):
+                                    buffer_view = target_buffer[
+                                        buffer_id,
+                                        local_eid,
+                                        ci * max_r : ci * max_r + lora_rank,
+                                        :,
+                                    ]
+                                    load_lora_weight_tensor(
+                                        buffer_view,
+                                        expert_weight[
+                                            ci * lora_rank : (ci + 1) * lora_rank, :
+                                        ],
+                                    )
                 else:
                     buffer_view = target_buffer[buffer_id, : lora_rank * c, :]
                     if weights is not None:
@@ -1589,28 +1682,51 @@ class LoRAMemoryPool:
                         # Zero out slots this rank owns but the adapter
                         # doesn't fill (padded-out / out-of-rank experts);
                         # then scale+load the ones it does.
-                        target_buffer[buffer_id].zero_()
-                        assert isinstance(weights_cache_key, (str, dict))
-                        for (
-                            local_eid,
-                            w,
-                            w_cache_key,
-                        ) in self._iter_local_expert_weights(
-                            weights,
-                            weights_cache_key,
-                            localize=not self.is_shared_moe_module(name),
-                        ):
-                            if w is not None:
-                                w = w * lora_adapter.scaling
-                                w = self._get_maybe_cached_weight_for_transfer(
-                                    pinned_layer_weights,
-                                    w_cache_key,
-                                    w,
+                        if _moe_fast_load_ok(weights):
+                            staging = torch.zeros(
+                                target_buffer[buffer_id].shape,
+                                dtype=target_buffer.dtype,
+                                device="cpu",
+                                pin_memory=True,
+                            )
+                            for (
+                                local_eid,
+                                w,
+                                _unused_key,
+                            ) in self._iter_local_expert_weights(
+                                weights,
+                                weights if isinstance(weights, dict) else {},
+                                localize=not self.is_shared_moe_module(name),
+                            ):
+                                _stage_expert_slab_b(
+                                    staging, local_eid, w,
+                                    lora_rank, lora_adapter.scaling,
                                 )
-                            buffer_view = target_buffer[
-                                buffer_id, local_eid, :, :lora_rank
-                            ]
-                            load_lora_weight_tensor(buffer_view, w)
+                            target_buffer[buffer_id].copy_(staging, non_blocking=True)
+                            staged_h2d_events.append(staging)
+                        else:
+                            target_buffer[buffer_id].zero_()
+                            assert isinstance(weights_cache_key, (str, dict))
+                            for (
+                                local_eid,
+                                w,
+                                w_cache_key,
+                            ) in self._iter_local_expert_weights(
+                                weights,
+                                weights_cache_key,
+                                localize=not self.is_shared_moe_module(name),
+                            ):
+                                if w is not None:
+                                    w = w * lora_adapter.scaling
+                                    w = self._get_maybe_cached_weight_for_transfer(
+                                        pinned_layer_weights,
+                                        w_cache_key,
+                                        w,
+                                    )
+                                buffer_view = target_buffer[
+                                    buffer_id, local_eid, :, :lora_rank
+                                ]
+                                load_lora_weight_tensor(buffer_view, w)
                 else:
                     buffer_view = target_buffer[buffer_id, :, :lora_rank]
                     if weights is not None:
@@ -1767,6 +1883,16 @@ class LoRAMemoryPool:
                 and "input_embeddings" in self.new_embeddings_buffer
             ):
                 self.new_embeddings_buffer["input_embeddings"][buffer_id].zero_()
+
+        if staged_h2d_events:
+            # There is no explicit CUDA-event wait here: the caller either
+            # runs on the same (compute) stream — ordering guarantees the H2D
+            # completes before the next kernel that reads the buffer — or it
+            # already synchronizes via `pending_lora_load_events`. Keeping
+            # the staging list alive across the function scope is sufficient
+            # for PyTorch's caching host allocator (it won't return pinned
+            # pages to the OS while a tensor view still references them).
+            del staged_h2d_events
 
     def get_embedding_tensor(
         self, target_module: str, lora_type: LoRAType

@@ -91,8 +91,12 @@ def _probe_mol_stage_cfg(a_cfg: dict, b_cfg: dict) -> None:
     logging.getLogger(__name__).info(
         "[MOL-PROBE] flag=%s shrink(BM=%s BN=%s BK=%s) expand(BM=%s BN=%s BK=%s)",
         _mol_lora_stage_cfg_enabled(),
-        a_cfg.get("BLOCK_SIZE_M"), a_cfg.get("BLOCK_SIZE_N"), a_cfg.get("BLOCK_SIZE_K"),
-        b_cfg.get("BLOCK_SIZE_M"), b_cfg.get("BLOCK_SIZE_N"), b_cfg.get("BLOCK_SIZE_K"),
+        a_cfg.get("BLOCK_SIZE_M"),
+        a_cfg.get("BLOCK_SIZE_N"),
+        a_cfg.get("BLOCK_SIZE_K"),
+        b_cfg.get("BLOCK_SIZE_M"),
+        b_cfg.get("BLOCK_SIZE_N"),
+        b_cfg.get("BLOCK_SIZE_K"),
     )
 
 
@@ -121,8 +125,6 @@ def _log_mol_lora_stage_cfg_once(cfg: dict, tuned: dict, n_dim: int) -> None:
         cfg.get("BLOCK_SIZE_K"),
         old_n / max(1, new_n),
     )
-
-
 
 
 @triton.jit
@@ -170,9 +172,7 @@ def _fused_virtual_topk_ids_kernel(
     # any out-of-range value produces a wild pointer (Xid 31 FAULT_PDE).
     # Everything outside [0, E) maps to the designed -1 sentinel.
     if num_experts_for_weight > 0:
-        base = tl.where(
-            (base < 0) | (base >= num_experts_for_weight), -1, base
-        )
+        base = tl.where((base < 0) | (base >= num_experts_for_weight), -1, base)
     shifted = base + safe_lora * num_experts_for_weight
     result = tl.where(base < 0, base, shifted)
     tl.store(virtual_topk_ids_ptr + offs, result, mask=valid)
@@ -229,7 +229,6 @@ def _fused_virtual_topk_ids(
         M,
         top_k,
         BLOCK_SIZE,
-    
         max_loras,
     )
 
@@ -342,6 +341,10 @@ def _moe_lora_shrink_splitk_kernel(
     off_expert = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
     if off_expert == -1:
         return
+
+    # Clamp offs_token to 0 for masked-out elements — see comment in
+    # _fused_lora_delta_kernel for why this is needed on Blackwell.
+    offs_token = tl.where(token_mask, offs_token, 0)
 
     # Pointers
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
@@ -679,14 +682,14 @@ def _merged_experts_fused_moe_lora_add_impl(
     assert n_b in (1, 2), f"lora_b must be length 1 or 2, got {n_b}"
     b_rank = lora_b_list[0].shape[3]
     for b in lora_b_list[1:]:
-        assert (
-            b.shape == lora_b_list[0].shape
-        ), f"all lora_b tensors must share shape; got {[tuple(t.shape) for t in lora_b_list]}"
+        assert b.shape == lora_b_list[0].shape, (
+            f"all lora_b tensors must share shape; got {[tuple(t.shape) for t in lora_b_list]}"
+        )
 
     max_loras, _, max_lora_rank, _ = lora_a.shape
-    assert (
-        max_lora_rank == n_b * b_rank
-    ), f"lora_a rank {max_lora_rank} != n_b ({n_b}) * lora_b rank {b_rank}"
+    assert max_lora_rank == n_b * b_rank, (
+        f"lora_a rank {max_lora_rank} != n_b ({n_b}) * lora_b rank {b_rank}"
+    )
     input_top_k = 1 if hidden_states.shape[0] == topk_ids.numel() else topk_ids.shape[1]
 
     def _merge_lora_expert_weight(t: torch.Tensor) -> torch.Tensor:
@@ -770,7 +773,7 @@ def _merged_experts_fused_moe_lora_add_impl(
         block_size: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # Check routing_cache for cross-call reuse (gate_up and down share routing)
-        cache_key = (num_experts, shared_outer, block_size)
+        cache_key = (num_experts, shared_outer, block_size, topk_ids.numel())
         if routing_cache is not None:
             cached = routing_cache.get(cache_key)
             if cached is not None:
@@ -848,17 +851,66 @@ def _merged_experts_fused_moe_lora_add_impl(
             topk_ids.shape[0] - _mapping_numel,
             token_lora_mapping[:8].tolist() if token_lora_mapping is not None else None,
         )
+    # --- Fused path: shrink + expand + add in one kernel (no intermediate) ---
+    if _fused_delta_enabled():
+        b_stage_config = _get_stage_config(lora_b_virtuals[0], 1, half_out)
+        _probe_mol_stage_cfg(
+            _get_stage_config(lora_a_virtual, input_top_k, lora_a_virtual.shape[1]),
+            b_stage_config,
+        )
+        (
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            token_lora_mask,
+        ) = _get_routing(
+            topk_ids,
+            token_lora_mapping,
+            num_experts_b,
+            experts_shared_outer_loras_b,
+            b_stage_config["BLOCK_SIZE_M"],
+        )
+        block_m = b_stage_config["BLOCK_SIZE_M"]
+        block_n = b_stage_config.get("BLOCK_SIZE_N", 64)
+        block_k = b_stage_config.get("BLOCK_SIZE_K", 64)
+        for b_idx, b_virtual in enumerate(lora_b_virtuals):
+            if n_b == 1:
+                a_half = lora_a_virtual  # [E, rank, K]
+                out_arg = output
+            else:
+                a_half = lora_a_virtual[
+                    :, b_idx * b_rank : (b_idx + 1) * b_rank, :
+                ]  # [E, b_rank, K]
+                out_arg = output[
+                    ..., b_idx * half_out : (b_idx + 1) * half_out
+                ].contiguous()
+            _invoke_fused_lora_delta(
+                hidden_states,
+                a_half,
+                b_virtual,
+                out_arg,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                token_lora_mapping,
+                topk_ids.shape[1] if input_top_k > 1 else 1,
+                b_rank,
+                topk_ids.numel(),
+                block_size_m=block_m,
+                block_size_n=min(block_n, b_virtual.shape[1]),
+                block_size_k=block_k,
+            )
+            if n_b != 1:
+                output[..., b_idx * half_out : (b_idx + 1) * half_out].copy_(out_arg)
+        return
+
+    # --- Original path: separate shrink + expand (fallback) ---
     intermediate = torch.zeros(
         [topk_ids.shape[0], topk_ids.shape[1], max_lora_rank],
         dtype=hidden_states.dtype,
         device=hidden_states.device,
     )
 
-    # Shrink GEMM: the kernel documents its weight as B[E, N, K] (b_ptr is walked
-    # as offs_k * stride_bk + offs_bn * stride_bn), and _invoke_moe_lora_shrink_splitk
-    # itself reads N = weight.shape[1] -- same for the merged 4-D view
-    # [max_loras, num_experts, rank, in] -> [E, rank, in]. So the stage N is
-    # shape[1] (the LoRA rank), not shape[2] (the contraction dim).
     a_stage_config = _get_stage_config(
         lora_a_virtual, input_top_k, lora_a_virtual.shape[1]
     )
@@ -887,8 +939,6 @@ def _merged_experts_fused_moe_lora_add_impl(
         a_stage_config,
     )
 
-    # Expand GEMM: B is [E, N=output width, K=rank] -> stage N is the output width
-    # per B tensor (gate/up half for gate_up, full hidden for down).
     b_stage_config = _get_stage_config(lora_b_virtuals[0], 1, half_out)
     _probe_mol_stage_cfg(a_stage_config, b_stage_config)
     (
@@ -904,11 +954,6 @@ def _merged_experts_fused_moe_lora_add_impl(
         b_stage_config["BLOCK_SIZE_M"],
     )
 
-    # n_b expands. For len 1: K=b_rank covers full intermediate, write full output.
-    # For len 2 (gate_up): split intermediate along rank into [gate, up] halves
-    # (each contiguous, K=b_rank=r) and output along last dim into [gate, up]
-    # halves (each of width half_out). Each B in lora_b_virtuals is its own
-    # half's weight tensor, naturally K=b_rank.
     for b_idx, b_virtual in enumerate(lora_b_virtuals):
         if n_b == 1:
             inter_arg = intermediate.view(-1, b_rank)
@@ -953,6 +998,676 @@ def _merged_experts_fused_moe_lora_add_impl(
             output[..., b_idx * half_out : (b_idx + 1) * half_out].copy_(out_arg)
 
 
+@triton.jit
+def _fused_lora_delta_kernel(
+    # Pointers
+    hidden_ptr,  # [num_tokens, K] input hidden states
+    lora_a_ptr,  # [num_experts, rank, K] shrink weights (this half's A)
+    lora_b_ptr,  # [num_experts, N, rank] expand weights (this half's B)
+    output_ptr,  # [num_tokens * top_k, N] base output (add delta in-place)
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    token_lora_mapping_ptr,  # [num_tokens] -1=no LoRA
+    # Dimensions
+    N,  # output dim (this half)
+    K,  # hidden dim
+    num_valid_tokens,
+    # Strides
+    stride_hm,
+    stride_hk,
+    stride_ae,
+    stride_ar,
+    stride_ak,
+    stride_be,
+    stride_bn,
+    stride_br,
+    stride_om,
+    stride_on,
+    stride_lm,
+    # Constexprs
+    top_k: tl.constexpr,
+    RANK: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Fused LoRA delta kernel: shrink + expand + add in one launch.
+
+    Replaces the 2-kernel sequence (_moe_lora_shrink_splitk + invoke_fused_moe_kernel)
+    with a single kernel that keeps the rank=16 intermediate in registers.
+
+    For each (expert_block, N_block):
+      1. Load hidden_states for this block's tokens from HBM
+      2. Shrink: intermediate = lora_a[expert] × hidden  → [BLOCK_M, RANK] (registers)
+      3. Expand: delta = lora_b[expert] × intermediate    → [BLOCK_M, BLOCK_N] (registers)
+      4. Read base output, add delta (masked by token_lora_mapping), write back
+    """
+    pid = tl.program_id(0)
+
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    num_pid_m = tl.cdiv(num_tokens_post_padded, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+
+    pid_m = pid // num_pid_n
+    pid_n = pid % num_pid_n
+
+    if pid_m * BLOCK_M >= num_tokens_post_padded:
+        return
+
+    # --- Token routing (same as _moe_lora_shrink_splitk_kernel) ---
+    offs_token_id = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int64)
+    offs_token = tl.load(sorted_token_ids_ptr + offs_token_id).to(tl.int64)
+    token_mask = (offs_token >= 0) & (offs_token < num_valid_tokens)
+
+    off_expert = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+    if off_expert == -1:
+        return
+
+    # Clamp offs_token to 0 for masked-out elements.  Without this, garbage
+    # values in sorted_token_ids slack (e.g. 2**30 from the negative clamp in
+    # _get_routing) produce addresses like ptr + 2**30 * stride that land in
+    # unmapped GPU pages.  On Blackwell (SM103), masked loads to fully
+    # unmapped addresses still raise IMA even when the predicate is False.
+    # Clamping to 0 keeps every computed address inside the base allocation.
+    offs_token = tl.where(token_mask, offs_token, 0)
+
+    # Actual token rows in hidden_states (sorted_token_ids indexes the
+    # flattened [num_tokens * top_k] array, so // top_k gives the row).
+    token_rows = offs_token // top_k
+
+    # --- 1. Shrink: intermediate = lora_a[expert] × hidden[token] ---
+    # lora_a: [num_experts, RANK, K], we load [RANK, BLOCK_K] tiles
+    offs_r = tl.arange(0, RANK)  # rank dimension (16, fits in registers)
+    intermediate = tl.zeros([BLOCK_M, RANK], dtype=tl.float32)
+
+    for k_start in range(0, K, BLOCK_K):
+        offs_k = k_start + tl.arange(0, BLOCK_K)
+        k_mask = offs_k < K
+
+        # Load hidden states: [BLOCK_M, BLOCK_K]
+        a = tl.load(
+            hidden_ptr + token_rows[:, None] * stride_hm + offs_k[None, :] * stride_hk,
+            mask=token_mask[:, None] & k_mask[None, :],
+            other=0.0,
+        )
+
+        # Load lora_a weights: [RANK, BLOCK_K]
+        b = tl.load(
+            lora_a_ptr
+            + off_expert * stride_ae
+            + offs_r[:, None] * stride_ar
+            + offs_k[None, :] * stride_ak,
+            mask=k_mask[None, :],
+            other=0.0,
+        )
+
+        intermediate += tl.dot(a, b.T.to(a.dtype))  # [BLOCK_M, RANK]
+
+    intermediate = intermediate.to(hidden_ptr.dtype.element_ty)
+
+    # --- 2. Expand: delta = lora_b[expert] × intermediate ---
+    # lora_b: [num_experts, N, RANK], we load [BLOCK_N, RANK] tile
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(tl.int64)
+    n_mask = offs_n < N
+
+    lora_b = tl.load(
+        lora_b_ptr
+        + off_expert * stride_be
+        + offs_n[:, None] * stride_bn
+        + offs_r[None, :] * stride_br,
+        mask=n_mask[:, None],
+        other=0.0,
+    )  # [BLOCK_N, RANK]
+
+    # delta = intermediate @ lora_b^T: [BLOCK_M, RANK] × [RANK, BLOCK_N]
+    delta = tl.dot(intermediate, lora_b.T.to(intermediate.dtype))  # [BLOCK_M, BLOCK_N]
+
+    # --- 3. Add delta to base output (masked) ---
+    lora_ids = tl.load(
+        token_lora_mapping_ptr + token_rows,
+        mask=token_mask,
+        other=-1,
+    )
+    has_lora = lora_ids >= 0  # [BLOCK_M]
+
+    base_out = tl.load(
+        output_ptr + offs_token[:, None] * stride_om + offs_n[None, :] * stride_on,
+        mask=token_mask[:, None] & n_mask[None, :],
+        other=0.0,
+    )
+
+    result = tl.where(has_lora[:, None], base_out + delta.to(base_out.dtype), base_out)
+
+    tl.store(
+        output_ptr + offs_token[:, None] * stride_om + offs_n[None, :] * stride_on,
+        result,
+        mask=token_mask[:, None] & n_mask[None, :],
+    )
+
+
+def _invoke_fused_lora_delta(
+    hidden_states: torch.Tensor,
+    lora_a: torch.Tensor,
+    lora_b: torch.Tensor,
+    output: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    token_lora_mapping: torch.Tensor,
+    top_k: int,
+    rank: int,
+    num_valid_tokens: int,
+    block_size_m: int = 64,
+    block_size_n: int = 64,
+    block_size_k: int = 64,
+) -> None:
+    """Launch the fused LoRA delta kernel (shrink + expand + add).
+
+    Args:
+        hidden_states: [num_tokens, K] input
+        lora_a: [num_experts, rank, K] shrink weights for this half
+        lora_b: [num_experts, N, rank] expand weights for this half
+        output: [num_tokens * top_k, N] base output (delta added in-place).
+            A 3D ``[num_tokens, top_k, N]`` tensor (``intermediate_cache1`` /
+            ``intermediate_cache3``) is accepted and collapsed to 2D here --
+            the kernel indexes flattened slots, so passing 3D straight
+            through would misread ``stride(0)=topk*N`` as the row stride and
+            read far out of range (Triton IMA).
+        sorted_token_ids, expert_ids, num_tokens_post_padded: routing
+        token_lora_mapping: [num_tokens] -1 = no LoRA
+        top_k: number of experts per token
+        rank: LoRA rank (typically 16)
+        num_valid_tokens: number of *valid* flattened token-expert slots,
+            i.e. ``topk_ids.numel()``. Must NOT be derived from the
+            worst-case-sized ``sorted_token_ids`` buffer -- its slack past
+            the real tokens holds uninitialized/garbage values that would
+            pass a too-loose upper bound and drive out-of-range reads
+            (observed as a Triton IMA during CUDA-graph capture).
+    """
+    # Use stride(-2)/stride(-1) instead of stride(0)/stride(1) so the kernel
+    # works with both 2D [num_tokens*top_k, N] and 3D [num_tokens, top_k, N]
+    # output tensors.  For 3D, stride(-2)=stride(1)=N and stride(-1)=stride(2)=1
+    # (the correct row/col strides for flattened token-expert slots), whereas
+    # stride(0)=top_k*N would cause offs_token*(top_k*N) to read far OOB.
+    # This matches the upstream invoke_fused_moe_kernel which uses C.stride(-2),
+    # C.stride(-1) for the same reason.
+    #
+    # The reshape to 2D is kept as a belt-and-suspenders: even though
+    # stride(-2)/stride(-1) resolves correctly for 3D, the reshape guarantees
+    # the kernel always sees a 2D layout, eliminating any edge case where
+    # a non-contiguous 3D view might have unexpected strides.
+    if output.dim() == 3:
+        output = output.reshape(-1, output.shape[-1])
+
+    N = lora_b.shape[1]
+    K = hidden_states.shape[1]
+
+    num_m_blocks = triton.cdiv(sorted_token_ids.shape[0], block_size_m)
+    num_n_blocks = triton.cdiv(N, block_size_n)
+    grid = (num_m_blocks * num_n_blocks,)
+
+    _fused_lora_delta_kernel[grid](
+        hidden_states,
+        lora_a,
+        lora_b,
+        output,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        token_lora_mapping,
+        N,
+        K,
+        num_valid_tokens,
+        hidden_states.stride(0),
+        hidden_states.stride(1),
+        lora_a.stride(0),
+        lora_a.stride(1),
+        lora_a.stride(2),
+        lora_b.stride(0),
+        lora_b.stride(1),
+        lora_b.stride(2),
+        output.stride(-2),
+        output.stride(-1),
+        token_lora_mapping.stride(0),
+        top_k=top_k,
+        RANK=rank,
+        BLOCK_M=block_size_m,
+        BLOCK_N=block_size_n,
+        BLOCK_K=block_size_k,
+        num_warps=4,
+        num_stages=2,
+    )
+
+
+@triton.jit
+def _fused_lora_delta_all_groups_kernel(
+    hidden_ptr,
+    lora_a_ptr,  # [max_loras, num_experts, rank, K]
+    lora_b_ptr,  # [max_loras, num_experts, N, rank]
+    output_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    token_lora_mapping_ptr,
+    N,
+    K,
+    num_valid_tokens,
+    stride_hm,
+    stride_hk,
+    stride_la_l,
+    stride_la_e,
+    stride_la_r,
+    stride_la_k,
+    stride_lb_l,
+    stride_lb_e,
+    stride_lb_n,
+    stride_lb_r,
+    stride_om,
+    stride_on,
+    stride_lm,
+    top_k: tl.constexpr,
+    RANK: tl.constexpr,
+    MAX_LORAS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    num_pid_m = tl.cdiv(num_tokens_post_padded, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    pid_m = pid // num_pid_n
+    pid_n = pid % num_pid_n
+    if pid_m * BLOCK_M >= num_tokens_post_padded:
+        return
+
+    offs_token_id = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int64)
+    offs_token = tl.load(sorted_token_ids_ptr + offs_token_id).to(tl.int64)
+    token_mask = (offs_token >= 0) & (offs_token < num_valid_tokens)
+    off_expert = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+    if off_expert == -1:
+        return
+    # Clamp offs_token to 0 for masked-out elements — see comment in
+    # _fused_lora_delta_kernel for why this is needed on Blackwell.
+    offs_token = tl.where(token_mask, offs_token, 0)
+    token_rows = offs_token // top_k
+
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(tl.int64)
+    n_mask = offs_n < N
+
+    lora_ids = tl.load(
+        token_lora_mapping_ptr + token_rows,
+        mask=token_mask,
+        other=-1,
+    )
+    result = tl.load(
+        output_ptr + offs_token[:, None] * stride_om + offs_n[None, :] * stride_on,
+        mask=token_mask[:, None] & n_mask[None, :],
+        other=0.0,
+    )
+
+    for lora_id in tl.static_range(MAX_LORAS):
+        group_mask = (lora_ids == lora_id) & token_mask
+        offs_r = tl.arange(0, RANK)
+        intermediate = tl.zeros([BLOCK_M, RANK], dtype=tl.float32)
+        for k_start in range(0, K, BLOCK_K):
+            offs_k = k_start + tl.arange(0, BLOCK_K)
+            k_mask = offs_k < K
+            a = tl.load(
+                hidden_ptr
+                + token_rows[:, None] * stride_hm
+                + offs_k[None, :] * stride_hk,
+                mask=token_mask[:, None] & k_mask[None, :],
+                other=0.0,
+            )
+            b = tl.load(
+                lora_a_ptr
+                + lora_id * stride_la_l
+                + off_expert * stride_la_e
+                + offs_r[:, None] * stride_la_r
+                + offs_k[None, :] * stride_la_k,
+                mask=k_mask[None, :],
+                other=0.0,
+            )
+            intermediate += tl.dot(a, b.T.to(a.dtype))
+        intermediate = intermediate.to(hidden_ptr.dtype.element_ty)
+        lora_b = tl.load(
+            lora_b_ptr
+            + lora_id * stride_lb_l
+            + off_expert * stride_lb_e
+            + offs_n[:, None] * stride_lb_n
+            + offs_r[None, :] * stride_lb_r,
+            mask=n_mask[:, None],
+            other=0.0,
+        )
+        delta = tl.dot(intermediate, lora_b.T.to(intermediate.dtype))
+        result = tl.where(group_mask[:, None], result + delta.to(result.dtype), result)
+
+    tl.store(
+        output_ptr + offs_token[:, None] * stride_om + offs_n[None, :] * stride_on,
+        result,
+        mask=token_mask[:, None] & n_mask[None, :],
+    )
+
+
+def _invoke_fused_lora_delta_all_groups(
+    hidden_states,
+    lora_a,
+    lora_b,
+    output,
+    sorted_token_ids,
+    expert_ids,
+    num_tokens_post_padded,
+    token_lora_mapping,
+    top_k,
+    rank,
+    max_loras,
+    num_valid_tokens,
+    block_size_m=64,
+    block_size_n=64,
+    block_size_k=64,
+):
+    """Launch the all-groups fused LoRA delta kernel.
+
+    ``num_valid_tokens`` must be ``topk_ids.numel()`` (the real flattened
+    token-expert slot count), NOT ``sorted_token_ids.numel()`` -- the latter
+    is a worst-case-sized buffer whose slack holds garbage values that would
+    pass an over-loose bound and cause out-of-range reads (Triton IMA).
+
+    ``output`` may be **3D** ``[num_tokens, topk, N]`` (that is what the MoE
+    runner hands the hooks: ``intermediate_cache1`` / ``intermediate_cache3``).
+    The kernel indexes it as the flattened ``[num_tokens*topk, N]``, so the
+    token dims are collapsed here. Feeding the 3D tensor straight through
+    would make the kernel read ``stride(0)=topk*N`` as the *row* stride and
+    ``stride(1)=N`` as the *column* stride -- every access then lands far
+    outside the buffer and the launch dies with a Triton IMA.
+    """
+    # Use stride(-2)/stride(-1) instead of stride(0)/stride(1) so the kernel
+    # works with both 2D [num_tokens*top_k, N] and 3D [num_tokens, top_k, N]
+    # output tensors (same fix as _invoke_fused_lora_delta; matches upstream
+    # invoke_fused_moe_kernel's C.stride(-2), C.stride(-1)).
+
+    N = lora_b.shape[2]
+    K = hidden_states.shape[1]
+    grid = (
+        triton.cdiv(sorted_token_ids.shape[0], block_size_m)
+        * triton.cdiv(N, block_size_n),
+    )
+    _fused_lora_delta_all_groups_kernel[grid](
+        hidden_states,
+        lora_a,
+        lora_b,
+        output,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        token_lora_mapping,
+        N,
+        K,
+        num_valid_tokens,
+        hidden_states.stride(0),
+        hidden_states.stride(1),
+        lora_a.stride(0),
+        lora_a.stride(1),
+        lora_a.stride(2),
+        lora_a.stride(3),
+        lora_b.stride(0),
+        lora_b.stride(1),
+        lora_b.stride(2),
+        lora_b.stride(3),
+        output.stride(-2),
+        output.stride(-1),
+        token_lora_mapping.stride(0),
+        top_k=top_k,
+        RANK=rank,
+        MAX_LORAS=max_loras,
+        BLOCK_M=block_size_m,
+        BLOCK_N=min(block_size_n, N),
+        BLOCK_K=block_size_k,
+        num_warps=4,
+        num_stages=2,
+    )
+
+
+def _per_group_routing_enabled() -> bool:
+    """Read SGLANG_LORA_PER_GROUP_ROUTING.
+
+    Must call `.get()`: accessing `envs.NAME` yields the EnvField object and
+    `bool(field)` raises RuntimeError. Not cached so it can be toggled at
+    runtime (A/B verification).
+    """
+    from sglang.srt.environ import envs
+
+    return envs.SGLANG_LORA_PER_GROUP_ROUTING.get()
+
+
+def _fused_delta_enabled() -> bool:
+    """Read SGLANG_LORA_FUSED_DELTA (see _per_group_routing_enabled)."""
+    from sglang.srt.environ import envs
+
+    return envs.SGLANG_LORA_FUSED_DELTA.get()
+
+
+def _merged_experts_fused_moe_lora_add_per_group_impl(
+    output: torch.Tensor,
+    hidden_states: torch.Tensor,
+    lora_a: torch.Tensor,
+    lora_b: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    token_lora_mapping: torch.Tensor,
+    mul_routed_weight: bool,
+    experts_shared_outer_loras_a: bool,
+    experts_shared_outer_loras_b: bool,
+    routing_cache: dict | None = None,
+) -> None:
+    """Per-group routing: use original num_experts moe_align instead of
+    expanding to max_loras × num_experts virtual experts.
+
+    Instead of one moe_align over 1024 virtual expert buckets, run moe_align
+    ONCE with the original num_experts (e.g. 256) and loop over active LoRA
+    groups. Each group reuses the same 256-bucket routing but indexes its own
+    LoRA A/B weights. The add_output_mask ensures only the group's tokens
+    receive the LoRA delta.
+
+    For shared_outer=True (LoRA weights shared across experts), the virtual
+    expert space is already small (= max_loras), so we fall back to the
+    original virtual-experts path which is efficient for that case.
+    """
+    # shared_outer: LoRA weights are [max_loras, 1, ...] (shared across experts),
+    # but expert_ids from 256-bucket moe_align index 0..255 -> OOB.
+    # Fall back to original virtual-experts path for either stage.
+    if experts_shared_outer_loras_a or experts_shared_outer_loras_b:
+        _merged_experts_fused_moe_lora_add_impl(
+            output,
+            hidden_states,
+            lora_a,
+            lora_b,
+            topk_ids,
+            topk_weights,
+            token_lora_mapping,
+            mul_routed_weight,
+            experts_shared_outer_loras_a,
+            experts_shared_outer_loras_b,
+            routing_cache,
+        )
+        return
+
+    # Performance guard: per-group launches max_loras × (shrink+expand) kernels.
+    # With 256 buckets each call saves ~25μs moe_align vs 1024, but each extra
+    # group adds ~50-70μs of launch+HBM overhead. Net positive only when
+    # max_loras is small. Fall back for large max_loras to avoid regression.
+    _max_loras = lora_a.shape[0]
+    if _max_loras > 3:
+        _merged_experts_fused_moe_lora_add_impl(
+            output,
+            hidden_states,
+            lora_a,
+            lora_b,
+            topk_ids,
+            topk_weights,
+            token_lora_mapping,
+            mul_routed_weight,
+            experts_shared_outer_loras_a,
+            experts_shared_outer_loras_b,
+            routing_cache,
+        )
+        return
+
+    lora_b_list: list[torch.Tensor] = (
+        list(lora_b) if isinstance(lora_b, (list, tuple)) else [lora_b]
+    )
+    n_b = len(lora_b_list)
+    b_rank = lora_b_list[0].shape[3]
+    max_loras, num_experts_a, max_lora_rank, _ = lora_a.shape
+    num_experts_b = lora_b_list[0].shape[1]
+    half_out = lora_b_list[0].shape[2]
+    input_top_k = 1 if hidden_states.shape[0] == topk_ids.numel() else topk_ids.shape[1]
+
+    # --- stage configs (same as original, using per-expert weight shape) ---
+    def _get_stage_config(
+        weight: torch.Tensor,
+        stage_top_k: int,
+        n_dim: int,
+    ) -> dict[str, Any]:
+        from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
+            get_config_dtype_str,
+            try_get_optimal_moe_config,
+        )
+
+        config_dtype = get_config_dtype_str(dtype=hidden_states.dtype)
+        get_config_func = functools.partial(
+            try_get_optimal_moe_config,
+            weight.shape,
+            weight.shape,
+            stage_top_k,
+            config_dtype,
+        )
+        try:
+            cfg = get_config_func(token_lora_mapping.shape[0])
+        except ValueError:
+            K_dim = weight.shape[2]
+            N_dim = weight.shape[1]
+            if K_dim >= 1024:
+                default_block_k = 256
+            elif K_dim >= 64:
+                default_block_k = 64
+            else:
+                default_block_k = max(16, K_dim)
+            cfg = {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": min(64, max(16, N_dim)),
+                "BLOCK_SIZE_K": min(default_block_k, max(16, K_dim)),
+                "GROUP_SIZE_M": 1,
+                "num_warps": 4,
+                "num_stages": 4,
+            }
+        if _mol_lora_stage_cfg_enabled():
+            tuned = _apply_mol_lora_stage_cfg(cfg, n_dim)
+            if tuned != cfg:
+                _log_mol_lora_stage_cfg_once(cfg, tuned, n_dim)
+            cfg = tuned
+        return cfg
+
+    def _align_block_size_native(
+        topk_ids: torch.Tensor,
+        block_size: int,
+        num_experts: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if num_experts < 1024:
+            from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
+                moe_align_block_size as native_moe_align_block_size,
+            )
+
+            return native_moe_align_block_size(topk_ids, block_size, num_experts)
+        return _align_block_size_large(topk_ids, block_size, num_experts)
+
+    # --- routing: moe_align ONCE with original num_experts (256) ---
+    # Use lora_a[0] / lora_b_list[0][0] for config (all have same per-expert shape)
+    a_stage_config = _get_stage_config(lora_a[0], input_top_k, lora_a[0].shape[1])
+    b_stage_config = _get_stage_config(lora_b_list[0][0], 1, half_out)
+    _probe_mol_stage_cfg(a_stage_config, b_stage_config)
+
+    block_size_a = a_stage_config["BLOCK_SIZE_M"]
+    block_size_b = b_stage_config["BLOCK_SIZE_M"]
+
+    # Cache routing by (num_experts, block_size) — gate_up and down may share
+    # if block sizes match.
+    def _get_per_group_routing(num_experts, block_size):
+        cache_key = (num_experts, block_size, topk_ids.numel())
+        if routing_cache is not None:
+            cached = routing_cache.get(cache_key)
+            if cached is not None:
+                return cached
+        sorted_token_ids, expert_ids, num_tokens_post_padded = _align_block_size_native(
+            topk_ids, block_size, num_experts
+        )
+        # Clamp negatives (same defense as original path)
+        sorted_token_ids = torch.where(
+            sorted_token_ids < 0,
+            sorted_token_ids.new_full((), 2**30),
+            sorted_token_ids,
+        )
+        result = (sorted_token_ids, expert_ids, num_tokens_post_padded)
+        if routing_cache is not None:
+            routing_cache[cache_key] = result
+        return result
+
+    sorted_token_ids_a, expert_ids_a, num_tokens_post_padded_a = _get_per_group_routing(
+        num_experts_a, block_size_a
+    )
+    if block_size_b == block_size_a and num_experts_b == num_experts_a:
+        sorted_token_ids_b = sorted_token_ids_a
+        expert_ids_b = expert_ids_a
+        num_tokens_post_padded_b = num_tokens_post_padded_a
+    else:
+        sorted_token_ids_b, expert_ids_b, num_tokens_post_padded_b = (
+            _get_per_group_routing(num_experts_b, block_size_b)
+        )
+
+    # --- all-groups kernel: single launch, compile-time loop over MAX_LORAS ---
+    # Replaces the Python `for lora_id in range(max_loras)` loop with a
+    # Triton `tl.static_range(MAX_LORAS)` compile-time unrolled loop.
+    # hidden_states is loaded once per K-tile and reused across groups via
+    # L2 cache; base output is loaded+written once. No intermediate HBM buffer.
+    block_m = b_stage_config["BLOCK_SIZE_M"]
+    block_n = b_stage_config.get("BLOCK_SIZE_N", 64)
+    block_k = b_stage_config.get("BLOCK_SIZE_K", 64)
+
+    for b_idx in range(n_b):
+        if n_b == 1:
+            a_half = lora_a  # [max_loras, num_experts, rank, K]
+            b_half = lora_b_list[0]  # [max_loras, num_experts, N, rank]
+            out_half = output
+        else:
+            a_half = lora_a[:, :, b_idx * b_rank : (b_idx + 1) * b_rank, :]
+            b_half = lora_b_list[b_idx]
+            out_half = output[
+                ..., b_idx * half_out : (b_idx + 1) * half_out
+            ].contiguous()
+
+        _invoke_fused_lora_delta_all_groups(
+            hidden_states,
+            a_half,
+            b_half,
+            out_half,
+            sorted_token_ids_b,
+            expert_ids_b,
+            num_tokens_post_padded_b,
+            token_lora_mapping,
+            topk_ids.shape[1] if input_top_k > 1 else 1,
+            b_rank,
+            max_loras,
+            topk_ids.numel(),
+            block_size_m=block_m,
+            block_size_n=min(block_n, b_half.shape[2]),
+            block_size_k=block_k,
+        )
+        if n_b != 1:
+            output[..., b_idx * half_out : (b_idx + 1) * half_out].copy_(out_half)
+
+
 def _merged_experts_fused_moe_lora_add_op(
     output: torch.Tensor,
     hidden_states: torch.Tensor,
@@ -965,18 +1680,32 @@ def _merged_experts_fused_moe_lora_add_op(
     experts_shared_outer_loras_a: bool,
     experts_shared_outer_loras_b: bool,
 ) -> None:
-    _merged_experts_fused_moe_lora_add_impl(
-        output,
-        hidden_states,
-        lora_a,
-        lora_b,
-        topk_ids,
-        topk_weights,
-        token_lora_mapping,
-        mul_routed_weight,
-        experts_shared_outer_loras_a,
-        experts_shared_outer_loras_b,
-    )
+    if _per_group_routing_enabled():
+        _merged_experts_fused_moe_lora_add_per_group_impl(
+            output,
+            hidden_states,
+            lora_a,
+            lora_b,
+            topk_ids,
+            topk_weights,
+            token_lora_mapping,
+            mul_routed_weight,
+            experts_shared_outer_loras_a,
+            experts_shared_outer_loras_b,
+        )
+    else:
+        _merged_experts_fused_moe_lora_add_impl(
+            output,
+            hidden_states,
+            lora_a,
+            lora_b,
+            topk_ids,
+            topk_weights,
+            token_lora_mapping,
+            mul_routed_weight,
+            experts_shared_outer_loras_a,
+            experts_shared_outer_loras_b,
+        )
 
 
 from sglang.srt.utils.common import direct_register_custom_op
@@ -1008,16 +1737,31 @@ def merged_experts_fused_moe_lora_add(
     holds one half of the stacked output, rank ``r``, with A's rank ``2*r``);
     a single tensor is used for the down case.
     """
-    _merged_experts_fused_moe_lora_add_impl(
-        output,
-        hidden_states,
-        lora_a,
-        lora_b,
-        topk_ids,
-        topk_weights,
-        token_lora_mapping,
-        mul_routed_weight,
-        experts_shared_outer_loras_a,
-        experts_shared_outer_loras_b,
-        routing_cache,
-    )
+    if _per_group_routing_enabled():
+        _merged_experts_fused_moe_lora_add_per_group_impl(
+            output,
+            hidden_states,
+            lora_a,
+            lora_b,
+            topk_ids,
+            topk_weights,
+            token_lora_mapping,
+            mul_routed_weight,
+            experts_shared_outer_loras_a,
+            experts_shared_outer_loras_b,
+            routing_cache,
+        )
+    else:
+        _merged_experts_fused_moe_lora_add_impl(
+            output,
+            hidden_states,
+            lora_a,
+            lora_b,
+            topk_ids,
+            topk_weights,
+            token_lora_mapping,
+            mul_routed_weight,
+            experts_shared_outer_loras_a,
+            experts_shared_outer_loras_b,
+            routing_cache,
+        )
