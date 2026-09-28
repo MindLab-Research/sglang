@@ -18,6 +18,23 @@ from sglang.kernels.ops.attention.fused_store_index_cache import (
     can_use_dsa_fused_store,
     fused_store_index_k_cache,
 )
+
+
+def _use_dsa_indexer_fusion() -> bool:
+    """Module-level gate for DSA indexer Q/K fusion (upstream #38798 family).
+
+    The instance-level check is ``self.use_dsa_indexer_fusion`` (see
+    ``__init__``), which additionally considers model-specific conditions
+    such as ``is_neox_style``. This module-level function is the coarse
+    platform gate used by the LoRA manager: if the fusion path is available
+    on this platform and not disabled via env, and a LoRA adapter targets
+    the indexer modules (``wk`` / ``weights_proj``), the adapter would be
+    silently dropped because fusion folds those modules away.
+    """
+    from sglang.srt.environ import envs
+    from sglang.srt.utils import is_cuda
+
+    return is_cuda() and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.environ import envs

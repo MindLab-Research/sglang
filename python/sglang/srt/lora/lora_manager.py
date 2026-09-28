@@ -869,14 +869,9 @@ class LoRAManager:
         # LoRA wraps are absent and an indexer-targeted adapter is silently dropped.
         indexer_targets = self.target_modules & DSA_INDEXER_LORA_NAMES
         if indexer_targets:
-            # dsv4.1 port: guard against missing _use_dsa_indexer_fusion
-            # (the upstream dsa_indexer.py doesn't define it for V4.1 Flash)
-            try:
-                from sglang.srt.layers.attention.dsa.dsa_indexer import (
-                    _use_dsa_indexer_fusion,
-                )
-            except ImportError:
-                _use_dsa_indexer_fusion = False
+            from sglang.srt.layers.attention.dsa.dsa_indexer import (
+                _use_dsa_indexer_fusion,
+            )
 
             if _use_dsa_indexer_fusion:
                 raise ValueError(
