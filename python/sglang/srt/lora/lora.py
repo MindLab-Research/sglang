@@ -286,24 +286,37 @@ class LoRAAdapter(nn.Module):
                 v_name = weight_name.replace("q_proj", "v_proj")
                 qkv_name = weight_name.replace("q_proj", "qkv_proj")
 
-                # If k_proj doesn't have lora, initialize it to zero
-                k_proj_weight = (
-                    weights[k_name]
-                    if "k_proj" in target_module
-                    else torch.zeros_like(weights[v_name])
-                )
+                q_weight = weights[q_name]
+                # k/v parts are optional: zero-fill any missing part so a bare
+                # q_proj adapter loads (its k/v contribute no delta — e.g. a
+                # kv_shared adapter that must not alter K/V). lora_A shapes are
+                # identical across q/k/v (same input dim), so q is always a
+                # valid zero template there. lora_B output dims can differ on
+                # GQA models; q's shape is used as the template, which is exact
+                # for MHA/MQA geometries (e.g. DeepSeek-V4.1 projects q/k/v to
+                # hidden_size). A GQA q-only adapter must ship full k/v weights
+                # — the buffer shape check fails loudly otherwise.
+                if k_name in weights:
+                    k_proj_weight = weights[k_name]
+                else:
+                    k_proj_weight = torch.zeros_like(q_weight)
+                if v_name in weights:
+                    v_proj_weight = weights[v_name]
+                else:
+                    v_proj_weight = torch.zeros_like(q_weight)
                 weights[qkv_name] = torch.cat(
                     (
-                        weights[q_name],
+                        q_weight,
                         k_proj_weight,
-                        weights[v_name],
+                        v_proj_weight,
                     ),
                     0,
                 )
                 weights.pop(q_name)
-                if "k_proj" in target_module:
+                if k_name in weights:
                     weights.pop(k_name)
-                weights.pop(v_name)
+                if v_name in weights:
+                    weights.pop(v_name)
             elif "qkv_proj" in weight_name:
                 # If qkv_proj is already stacked, we normalize it following the SGL convention.
                 qkv_name = weight_name
