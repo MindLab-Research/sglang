@@ -351,7 +351,11 @@ def _add_lora_gate_up_delta(
             output=intermediate_cache,
             hidden_states=hidden_states,
             lora_a=gate_up_a,
-            lora_b=gate_up_b,
+            # Gated gate_up carries 2R rows in lora_a (gate+up stacked); the VE
+            # kernel asserts max_lora_rank == n_b * b_rank, so the B side must
+            # be the (gate, up) tuple (n_b=2, b_rank=R). Non-gated passes the
+            # single stacked tensor. Mirrors the fork caller exactly.
+            lora_b=tuple(lora_b_stacked) if is_gated else gate_up_b,
             topk_ids=topk_ids,
             topk_weights=topk_weights,
             token_lora_mapping=token_lora_mapping,
