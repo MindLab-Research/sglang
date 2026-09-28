@@ -1125,13 +1125,19 @@ class DeepseekV4AttnBackend(
         self.has_c128: bool = 128 in self.present_ratios
         cfg = model_runner.model_config.hf_text_config
         self.is_dsv41: bool = getattr(cfg, "model_type", None) == "deepseek_v41"
-        self.prefill_candidates, self.decode_candidates = make_candidate_indexer(
+        _candidates = make_candidate_indexer(
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
             page_size=self.page_size,
             candidate_topk_blocks=getattr(cfg, "candidate_topk_blocks", 0),
             candidate_block_size=getattr(cfg, "candidate_block_size", 0),
         )
+        # make_candidate_indexer returns None when the sparse MQA logits API
+        # is unavailable (sgl-deep-gemm < 0.2.0) — use single-level selection.
+        if _candidates is not None:
+            self.prefill_candidates, self.decode_candidates = _candidates
+        else:
+            self.prefill_candidates, self.decode_candidates = None, None
         self.full_topk_indexer = make_full_topk_indexer(
             token_to_kv_pool=self.token_to_kv_pool, req_to_token=self.req_to_token
         )

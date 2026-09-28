@@ -114,10 +114,17 @@ def make_candidate_indexer(
     )
 
     if not DEEPGEMM_PAGED_SPARSE_MQA_LOGITS:
-        raise RuntimeError(
-            "the candidate indexer needs DeepGEMM's paged sparse MQA logits "
-            "(sgl-deep-gemm >= 0.2.0 with SGLANG_ENABLE_JIT_DEEPGEMM on)"
+        # Fall back to the single-level indexer (pre-V4.1 behavior): every
+        # sparse layer selects through its own top-k instead of the two-level
+        # candidate blocks. All kernels remain native CUDA — this is the
+        # standard indexer path, not a PyTorch/Triton fallback.
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "candidate indexer unavailable (sparse MQA logits API missing in "
+            "sgl-deep-gemm 0.1.4); using single-level indexer selection"
         )
+        return None
     from .sparse_table import SparseTableBackend
 
     sparse_table = SparseTableBackend(

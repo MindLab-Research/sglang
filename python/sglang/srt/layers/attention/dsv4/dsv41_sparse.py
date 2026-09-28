@@ -187,8 +187,19 @@ class DeepseekV41Indexer(nn.Module):
         self.rope_head_dim = config.qk_rope_head_dim
         self.index_topk = config.index_topk
         self.owns_k = layer_id in config.kv_source_layer_ids
-        self.is_candidate_source = layer_id == config.candidate_source_layer_id
-        self.uses_candidates = 0 <= config.candidate_source_layer_id < layer_id
+        # Gate the two-level candidate path on the sparse MQA logits API
+        # availability; without it every layer falls back to single-level
+        # selection (pre-V4.1 behavior, still native CUDA kernels).
+        from sglang.srt.layers.deep_gemm_wrapper.configurer import (
+            DEEPGEMM_PAGED_SPARSE_MQA_LOGITS as _HAS_SPARSE_API,
+        )
+
+        self.is_candidate_source = (
+            layer_id == config.candidate_source_layer_id and _HAS_SPARSE_API
+        )
+        self.uses_candidates = (
+            0 <= config.candidate_source_layer_id < layer_id and _HAS_SPARSE_API
+        )
         self.candidate_topk_blocks = config.candidate_topk_blocks
         self.candidate_block_size = config.candidate_block_size
         self.softmax_scale = self.index_head_dim**-0.5
