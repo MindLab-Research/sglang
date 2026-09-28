@@ -346,6 +346,43 @@ class LoRAManager:
                 f"Failed to load {lora_ref.lora_name} because LoRA serving currently doesn't support DoRA adapters"
             )
 
+        # kv_shared promises the adapter never writes K/V, so its requests can
+        # share the base model's radix namespace. Reject any target module that
+        # feeds the KV cache — a v_proj/k_proj/... adapter through a shared
+        # namespace would serve one adapter's KV to another (the historical
+        # cross-adapter pollution bug: garbled continuations). Check the raw
+        # (pre-normalization) target names: "q_proj" alone is safe because the
+        # qkv merge zero-fills its k/v parts, but anything touching a K/V
+        # projection directly is not.
+        if lora_config.lora_kv_shared:
+            from sglang.srt.lora.utils import get_normalized_target_modules
+
+            normalized = get_normalized_target_modules(lora_config.target_modules)
+            # Modules whose output feeds the KV cache (post-normalization names
+            # used by the buffer pool). qkv_proj is excluded here: a bare
+            # "q_proj" adapter normalizes to qkv_proj with zero-filled k/v and
+            # is safe; only an adapter that itself targets a K/V projection
+            # (v_proj/k_proj/kv_a_*/kv_b_*/wkv) is rejected.
+            kv_producing_modules = {
+                "v_proj",
+                "k_proj",
+                "kv_a_proj_with_mqa",
+                "fused_qkv_a_proj_with_mqa",
+                "kv_b_proj",
+                "wkv",
+                "indexer.wk",
+                "indexer.weights_proj",
+            }
+            bad = normalized & kv_producing_modules
+            if bad:
+                raise ValueError(
+                    f"Failed to load {lora_ref.lora_name}: adapter declares "
+                    f"lora_kv_shared=true but targets K/V-producing module(s) "
+                    f"{sorted(bad)}. A kv_shared adapter must not alter any K/V "
+                    f"projection (its requests share the base model's prefix "
+                    f"KV cache). Remove lora_kv_shared or retarget the adapter."
+                )
+
         # Check if this LoRA adapter is already loaded
         for existing_lora_ref in self.lora_refs.values():
             if lora_ref.lora_name == existing_lora_ref.lora_name:
@@ -418,6 +455,22 @@ class LoRAManager:
             )
 
         return self.create_lora_update_result(success=True)
+
+    def is_lora_kv_shared(self, lora_id: Optional[str]) -> bool:
+        """Whether requests using ``lora_id`` share the base model's radix
+        namespace (prefix KV cache).
+
+        A kv_shared adapter promises (enforced at load time) that it never
+        alters any K/V projection, so the KV it would write is bit-identical
+        to the base model's — its requests can share the base radix tree and
+        each other's prefixes instead of being isolated per-adapter.
+
+        ``None``/unknown ids are the base model → shared by definition.
+        """
+        if lora_id is None:
+            return True
+        config = self.configs.get(lora_id)
+        return bool(config is not None and config.lora_kv_shared)
 
     def validate_lora_batch(self, lora_ids: set[Optional[str]]) -> bool:
         """

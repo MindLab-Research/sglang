@@ -2784,6 +2784,7 @@ class Scheduler(
                 return_flat_raw_top_logprobs=recv_req.return_flat_raw_top_logprobs,
                 stream=recv_req.stream,
                 lora_id=recv_req.lora_id,
+                lora_kv_shared=self.resolve_lora_kv_shared(recv_req.lora_id),
                 session_id=recv_req.session_id,
                 input_embeds=recv_req.input_embeds,
                 positional_embed_overrides=recv_req.positional_embed_overrides,
@@ -3446,6 +3447,7 @@ class Scheduler(
             priority=recv_req.priority,
             dimensions=recv_req.dimensions,
             lora_id=recv_req.lora_id,
+            lora_kv_shared=self.resolve_lora_kv_shared(recv_req.lora_id),
             http_worker_ipc=recv_req.http_worker_ipc,
             time_stats=recv_req.time_stats,
             return_pooled_hidden_states=recv_req.return_pooled_hidden_states,
@@ -4159,6 +4161,22 @@ class Scheduler(
             new_batch.decoding_reqs = None
 
         return new_batch, running_batch
+
+    def resolve_lora_kv_shared(self, lora_id: Optional[str]) -> bool:
+        """Whether a request using ``lora_id`` shares the base model's radix
+        namespace (prefix KV cache).
+
+        Safe to call before the LoRA manager exists / with LoRA disabled:
+        base-model requests (lora_id None) are shared by definition, and an
+        unknown lora_id falls back to the historical isolated behavior (it
+        will be resolved when the adapter is actually loaded).
+        """
+        if lora_id is None:
+            return False
+        lora_manager = getattr(self.tp_worker.model_runner, "lora_manager", None)
+        if lora_manager is None:
+            return False
+        return lora_manager.is_lora_kv_shared(lora_id)
 
     def can_schedule_lora_req(
         self, req: Req, running_loras: set[Optional[str]]

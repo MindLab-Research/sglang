@@ -43,6 +43,12 @@ class LoRAConfig:
         self.r = self.hf_config["r"]
         self.lora_alpha = self.hf_config["lora_alpha"]
         self.use_dora = self.hf_config.get("use_dora", False)
+        # kv_shared: the adapter promises it never alters any K/V projection,
+        # so requests using it can share the base model's prefix KV cache
+        # (radix namespace) with the base model and with each other instead of
+        # being isolated per-adapter. Validated at load time against the
+        # target modules (see lora_manager.validate_new_adapter).
+        self.lora_kv_shared = self.hf_config.get("lora_kv_shared", False)
 
         # Filter fake added tokens: tokens with ID < base_vocab_size are already
         # part of the base vocabulary and should not be treated as added tokens.

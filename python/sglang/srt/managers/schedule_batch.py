@@ -1015,6 +1015,7 @@ class Req(ReqDllmMixin):
         stream: bool = False,
         origin_input_ids_unpadded: Optional[array[int]] = None,
         lora_id: Optional[str] = None,
+        lora_kv_shared: bool = False,
         input_embeds: Optional[List[List[float]]] = None,
         positional_embed_overrides: Optional[PositionalEmbeds] = None,
         token_type_ids: List[int] = None,
@@ -1119,7 +1120,16 @@ class Req(ReqDllmMixin):
         )
 
         # Extra key for caller-defined request classification.
-        if lora_id is not None:
+        # A kv_shared LoRA adapter (lora_manager.is_lora_kv_shared) never alters
+        # any K/V projection, so its requests write KV that is bit-identical to
+        # the base model's. Their prefix KV therefore lives in the SAME radix
+        # namespace as the base model (extra_key without the lora_id suffix):
+        # shared prefixes with the base and with each other, maximal cache hit.
+        # Non-kv_shared adapters keep the historical per-adapter isolation —
+        # their KV differs from the base and from each other, so a shared
+        # namespace would serve one adapter's KV to another (cross-adapter
+        # pollution → garbled continuations, see mem_cache/utils.py).
+        if lora_id is not None and not lora_kv_shared:
             extra_key = (
                 extra_key or ""
             ) + lora_id  # lora_id is concatenated to the extra key
@@ -1127,6 +1137,7 @@ class Req(ReqDllmMixin):
         self.extra_key = extra_key
         self.cache_salt = cache_salt or None
         self.lora_id = lora_id
+        self.lora_kv_shared = lora_kv_shared
         self.routing_key = routing_key
 
         # Lazy extra buffer: skip radix cache insert when prealloc failed at
