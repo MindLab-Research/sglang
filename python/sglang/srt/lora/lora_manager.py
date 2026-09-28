@@ -350,22 +350,33 @@ class LoRAManager:
         # share the base model's radix namespace. Reject any target module that
         # feeds the KV cache — a v_proj/k_proj/... adapter through a shared
         # namespace would serve one adapter's KV to another (the historical
-        # cross-adapter pollution bug: garbled continuations). Check the raw
-        # (pre-normalization) target names: "q_proj" alone is safe because the
-        # qkv merge zero-fills its k/v parts, but anything touching a K/V
-        # projection directly is not.
+        # cross-adapter pollution bug: garbled continuations).
+        #
+        # Check the RAW (pre-normalization) target names. Normalization maps
+        # v_proj/k_proj → qkv_proj, which would silently bypass a
+        # post-normalization check (qkv_proj is also the normalized form of a
+        # safe bare q_proj adapter). A bare "q_proj" declaration is safe: the
+        # qkv merge zero-fills its k/v parts, so it never writes K/V. An
+        # explicit qkv_proj/kv_* declaration targets the merged K/V projection
+        # directly and is NOT safe.
         if lora_config.lora_kv_shared:
-            from sglang.srt.lora.utils import get_normalized_target_modules
-
-            normalized = get_normalized_target_modules(lora_config.target_modules)
-            # Modules whose output feeds the KV cache (post-normalization names
-            # used by the buffer pool). qkv_proj is excluded here: a bare
-            # "q_proj" adapter normalizes to qkv_proj with zero-filled k/v and
-            # is safe; only an adapter that itself targets a K/V projection
-            # (v_proj/k_proj/kv_a_*/kv_b_*/wkv) is rejected.
+            raw_targets = lora_config.target_modules
+            if isinstance(raw_targets, str):
+                # "all"/"all-linear" resolve against the model graph and would
+                # include K/V projections; a kv_shared adapter must declare
+                # explicit targets.
+                raise ValueError(
+                    f"Failed to load {lora_ref.lora_name}: a kv_shared adapter "
+                    f"must declare explicit target_modules (got "
+                    f"{raw_targets!r}); 'all'/'all-linear' would include K/V "
+                    f"projections and cannot be shared."
+                )
+            raw_set = set(raw_targets)
             kv_producing_modules = {
                 "v_proj",
                 "k_proj",
+                "qkv_proj",
+                "kv_proj",
                 "kv_a_proj_with_mqa",
                 "fused_qkv_a_proj_with_mqa",
                 "kv_b_proj",
@@ -373,14 +384,15 @@ class LoRAManager:
                 "indexer.wk",
                 "indexer.weights_proj",
             }
-            bad = normalized & kv_producing_modules
+            bad = raw_set & kv_producing_modules
             if bad:
                 raise ValueError(
                     f"Failed to load {lora_ref.lora_name}: adapter declares "
                     f"lora_kv_shared=true but targets K/V-producing module(s) "
                     f"{sorted(bad)}. A kv_shared adapter must not alter any K/V "
                     f"projection (its requests share the base model's prefix "
-                    f"KV cache). Remove lora_kv_shared or retarget the adapter."
+                    f"KV cache). Remove lora_kv_shared or retarget the adapter "
+                    f"(e.g. use q_proj only — its k/v parts are zero-filled)."
                 )
 
         # Check if this LoRA adapter is already loaded
