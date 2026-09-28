@@ -164,6 +164,11 @@ class _DeprecatedEnvFallback:
 
     Usage:
         SGLANG_NEW_NAME = EnvBoolWithAlias(True, deprecated_name="SGLANG_OLD_NAME")
+
+# dsv4.1 port: LoRA remote-artifact content-addressed cache (lora_cache.py)
+SGLANG_LORA_CACHE_TTL_SEC = EnvInt(86400)
+SGLANG_LORA_CACHE_GC = EnvInt(1)
+SGLANG_LORA_CACHE_DEDUPE = EnvInt(1)
     """
 
     def __init__(self, default: Any, deprecated_name: str, secret: bool = False):
