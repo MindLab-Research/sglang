@@ -29,6 +29,7 @@ from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.lora_config import LoRAConfig
+from sglang.srt.lora.mmap_weights import fast_load_enabled
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
@@ -142,31 +143,89 @@ class LoRAAdapter(nn.Module):
 
     def initialize_weights(self):
         model_path = self.config.path
+
+        # Get normalized target modules once (not per-weight) to avoid O(n^2)
+        # when adapters use fully-expanded PEFT target_modules (e.g. 58k paths
+        # for a 78-layer x 256-expert MoE), where the old per-weight call made
+        # load_lora_adapter take ~19 minutes.
+        from sglang.srt.lora.utils import get_normalized_target_modules
+
+        self._normalized_target_modules = get_normalized_target_modules(
+            self.config.target_modules
+        )
+
+        import time as _time
+
+        t0 = _time.perf_counter()
+
+        # Fast path: single-file safetensors adapter -> zero-copy mmap views.
+        # The old path materialised EVERY tensor into fresh CPU RAM (~15.27 GB
+        # per rank on our MoE adapters — 116k `get_tensor` copies × 8 TP ranks
+        # read the same file), and the file is already fully in the page cache
+        # (extracted moments ago; >3 TB free RAM). Views skip the copy
+        # altogether. Any layout the reader can't handle falls back to the
+        # standard loader below, unchanged.
+        reader = None
+        if fast_load_enabled():
+            from sglang.srt.lora.mmap_weights import open_adapter
+
+            reader = open_adapter(model_path)
+            # Keep the mapping alive for the adapter's lifetime: every weight
+            # in self.layers[..].weights is a *view* into this mapping.
+            self._mmap_reader = reader
+
+        if reader is not None:
+            for name in reader.keys():
+                self._process_weight(name, reader.get(name))
+            logger.info(
+                "LoRA adapter '%s' weights opened via mmap fast path: "
+                "%d tensors, %.2f GB payload, read_ms=%.0f",
+                model_path,
+                len(reader),
+                reader.payload_bytes / 1e9,
+                (_time.perf_counter() - t0) * 1e3,
+            )
+            self._normalize_weights()
+            return
+
         loader = DefaultModelLoader(self.load_config)
         revision = getattr(self.config.hf_config, "revision", None)
-
-        # Get normalized target modules for filtering
         for name, loaded_weight in loader._get_weights_iterator(
             DefaultModelLoader.Source(
                 model_path, revision=revision, fall_back_to_pt=True
             )
         ):
             self._process_weight(name, loaded_weight)
+        logger.info(
+            "LoRA adapter '%s' weights read via standard loader, read_ms=%.0f",
+            model_path,
+            (_time.perf_counter() - t0) * 1e3,
+        )
 
         self._normalize_weights()
 
     def initialize_weights_from_tensors(self, tensors: Dict[str, torch.Tensor]):
+        from sglang.srt.lora.utils import get_normalized_target_modules
+
+        self._normalized_target_modules = get_normalized_target_modules(
+            self.config.target_modules
+        )
         for name, tensor in tensors.items():
             self._process_weight(name, tensor)
 
         self._normalize_weights()
 
     def _process_weight(self, name: str, loaded_weight: torch.Tensor):
-        from sglang.srt.lora.utils import get_normalized_target_modules
-
-        normalized_target_modules = get_normalized_target_modules(
-            self.config.target_modules
+        normalized_target_modules = getattr(
+            self, "_normalized_target_modules", None
         )
+        if normalized_target_modules is None:
+            from sglang.srt.lora.utils import get_normalized_target_modules
+
+            normalized_target_modules = get_normalized_target_modules(
+                self.config.target_modules
+            )
+            self._normalized_target_modules = normalized_target_modules
 
         # Remap PEFT "unembed_tokens" key to "lm_head" so the weight is
         # recognized and loaded into the correct buffer.
@@ -210,6 +269,8 @@ class LoRAAdapter(nn.Module):
             self._normalize_in_proj(layer.weights)
             # Stack in_proj_q + in_proj_k + in_proj_v + in_proj_z → in_proj_qkvz for GDN layers
             self._normalize_in_proj_qkvz(layer.weights)
+            # Stack in_proj_b + in_proj_a → in_proj_ba for GDN layers
+            self._normalize_in_proj_ba(layer.weights)
             weight_names = list(layer.weights.keys())
             self.normalize_gate_up_proj(weight_names, layer.weights)
             weight_names = list(layer.weights.keys())
@@ -450,6 +511,25 @@ class LoRAAdapter(nn.Module):
                 weights.pop(k_name)
                 weights.pop(v_name)
                 weights.pop(z_name)
+            elif "in_proj_qkv." in weight_name:
+                # 2-way split (Megatron-Bridge adapter export): in_proj_qkv
+                # covers the q|k|v rows and in_proj_z the z rows, with one
+                # shared lora_A. The stacked buffer expects one A block per
+                # slice, so repeat the qkv A block 3x (q, k, v) before
+                # appending the z block; B rows concatenate directly.
+                z_name = weight_name.replace("in_proj_qkv.", "in_proj_z.")
+                if z_name not in weights:
+                    continue
+                qkvz_name = weight_name.replace("in_proj_qkv.", "in_proj_qkvz.")
+                cat_dim = weights[weight_name].dim() - 2
+                qkv_w = weights[weight_name]
+                if "lora_A" in weight_name:
+                    repeat_dims = [1] * qkv_w.dim()
+                    repeat_dims[cat_dim] = 3
+                    qkv_w = qkv_w.repeat(*repeat_dims)
+                weights[qkvz_name] = torch.cat((qkv_w, weights[z_name]), cat_dim)
+                weights.pop(weight_name)
+                weights.pop(z_name)
             elif "in_proj_qkvz" in weight_name and "lora_A" in weight_name:
                 # Already-merged adapter: replicate the shared A across the 4
                 # stacked slots the buffer expects (q, k, v, z).
@@ -458,6 +538,45 @@ class LoRAAdapter(nn.Module):
                 repeat_dims[ndim - 2] = 4
                 weights[weight_name] = weights[weight_name].repeat(*repeat_dims)
             # else (in_proj_qkvz lora_B, or unrelated): no-op.
+
+    def _normalize_in_proj_ba(self, weights: Dict[str, torch.Tensor]):
+        """Normalize in_proj_ba weights for GDN (GatedDeltaNet) layers like
+        Qwen3.5.
+
+        Two adapter formats are handled:
+
+        1. Split: ``in_proj_b + in_proj_a`` (HF checkpoint naming, also the
+           Megatron-Bridge adapter export) are present as separate weights →
+           concatenate them into ``in_proj_ba`` (B rows b|a; A blocks b, a).
+
+        2. Already-merged: the adapter has a single ``in_proj_ba`` weight
+           (PEFT trained against SGLang's fused Linear). The stacked buffer
+           expects two per-slice ``A`` blocks, so repeat ``lora_A`` 2x along
+           the rank dim. ``lora_B`` is already full-output-dim and matches
+           the buffer directly.
+        """
+        for weight_name in list(weights.keys()):
+            # NB: match with the trailing dot so the merged "in_proj_ba."
+            # names don't take the split branch.
+            if "in_proj_b." in weight_name:
+                a_name = weight_name.replace("in_proj_b.", "in_proj_a.")
+                if a_name not in weights:
+                    continue
+                ba_name = weight_name.replace("in_proj_b.", "in_proj_ba.")
+                cat_dim = weights[weight_name].dim() - 2
+                weights[ba_name] = torch.cat(
+                    (weights[weight_name], weights[a_name]), cat_dim
+                )
+                weights.pop(weight_name)
+                weights.pop(a_name)
+            elif "in_proj_ba" in weight_name and "lora_A" in weight_name:
+                # Already-merged adapter: replicate the shared A across the 2
+                # stacked slots the buffer expects (b, a).
+                ndim = weights[weight_name].dim()
+                repeat_dims = [1] * ndim
+                repeat_dims[ndim - 2] = 2
+                weights[weight_name] = weights[weight_name].repeat(*repeat_dims)
+            # else (in_proj_ba lora_B, or unrelated): no-op.
 
     def normalize_gate_up_proj(
         self, weight_names: List[str], weights: Dict[str, torch.Tensor]
