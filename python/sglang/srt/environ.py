@@ -164,11 +164,6 @@ class _DeprecatedEnvFallback:
 
     Usage:
         SGLANG_NEW_NAME = EnvBoolWithAlias(True, deprecated_name="SGLANG_OLD_NAME")
-
-# dsv4.1 port: LoRA remote-artifact content-addressed cache (lora_cache.py)
-SGLANG_LORA_CACHE_TTL_SEC = EnvInt(86400)
-SGLANG_LORA_CACHE_GC = EnvInt(1)
-SGLANG_LORA_CACHE_DEDUPE = EnvInt(1)
     """
 
     def __init__(self, default: Any, deprecated_name: str, secret: bool = False):
@@ -1102,6 +1097,36 @@ class Envs:
     # warmup. Opt-in: the extra forward needs transient activation headroom
     # that small-VRAM or tightly-packed configs may not have.
     SGLANG_FLASHINFER_AUTOTUNE_EXTEND = EnvBool(False)
+
+    # ===================================================================
+    # MoL virtual-expert LoRA (MoE LoRA)
+    # ===================================================================
+    # Stage-config tuning for the MoL virtual-experts LoRA kernels: overrides
+    # the Triton BLOCK_SIZE_N (a clean ~4x lever; BLOCK_SIZE_M/BLOCK_SIZE_K and
+    # the K-loop stay untouched so the per-output reduction order is unchanged
+    # -> bit-identical). Kill-switch for A/B: unset = upstream defaults.
+    SGLANG_OPT_MOL_LORA_STAGE_CFG = EnvBool(False)
+    # Per-group routing for MoL virtual experts: instead of expanding the expert
+    # space to max_loras × num_experts (e.g. 1024) and running one moe_align over
+    # all virtual buckets, run moe_align ONCE with the original num_experts (256)
+    # and loop over active LoRA groups, reusing the same routing. Each group's
+    # LoRA A/B weights are indexed by the original expert IDs. The add_output_mask
+    # ensures only the group's tokens receive the delta.
+    # Measured: ~8ms/step saved at bs=11 with 3 LoRAs (13.3ms → 5.7ms moe_align).
+    # Default OFF (2026-09-21): both fused-delta kernels were written and tuned
+    # for LoRA rank 16 only ("rank=16 intermediate in registers"). Other ranks
+    # are either broken (prefill Xid/IMA at rank 32) or much slower. Turn this
+    # on only after the rank-generic rework; unset = master 2-kernel path.
+    SGLANG_LORA_PER_GROUP_ROUTING = EnvBool(False)
+    # Fused LoRA delta kernel: shrink + expand + add in a single Triton kernel
+    # launch, keeping the rank=16 intermediate in registers (no HBM round-trip).
+    # Replaces the 2-kernel sequence (_moe_lora_shrink_splitk + invoke_fused_moe_kernel)
+    # with one fused kernel per output half. Eliminates: 1 kernel launch, intermediate
+    # buffer HBM write+read, hidden_states re-read for shrink.
+    # Measured: ~3-5ms/step saved at bs=11 with 3 LoRAs.
+    # Default OFF (2026-09-21): rank-16-only fast path; rank 32 crashes prefill
+    # with a Triton IMA (Xid) and other ranks are slower. Unset = master path.
+    SGLANG_LORA_FUSED_DELTA = EnvBool(False)
 
     # ===================================================================
     # Triton and Torch compilation
