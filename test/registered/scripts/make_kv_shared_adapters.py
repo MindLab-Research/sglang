@@ -61,11 +61,25 @@ def make_adapter(name, layers, target_modules, kv_shared, seed):
 def main():
     all_layers = list(range(40))
     last20 = list(range(FIRST_KV_LAYER, 40))
+    # 后 20 层中的非 source 层（21-39：ratio=1 且 layer 20 是唯一 source）——
+    # 按层判定安全（不写持久化 KV），任何 target 模块名都放行
+    safe_last19 = list(range(FIRST_KV_LAYER + 1, 40))
 
     make_adapter("kv_shared_a", last20, ["q_proj"], True, seed=101)
     make_adapter("kv_shared_b", last20, ["q_proj"], True, seed=202)
     make_adapter("normal_isolated", all_layers, ["q_proj"], False, seed=303)
+    # 防呆反例：v_proj target 落在 dense/source 层（0-5 含 dense 0-1）→ 拒绝
     make_adapter("bad_kv_vproj", last20, ["v_proj"], True, seed=404)
+    # 按层放行：v_proj target 只落在安全层（21-39，无 dense/source）→ 放行
+    make_adapter("layer_safe_vproj", safe_last19, ["v_proj"], True, seed=505)
+    # 按层拒绝：v_proj target 含 dense 层（layer 1）→ 拒绝（层不安全 + 模块名黑名单）
+    make_adapter(
+        "layer_unsafe_vproj",
+        [1] + safe_last19,
+        ["v_proj"],
+        True,
+        seed=606,
+    )
 
 
 if __name__ == "__main__":

@@ -80,6 +80,17 @@ def main():
     check("fail-safe rejects kv_shared+v_proj", not r.get("success"),
           r.get("error_message", "")[:90])
 
+    # 1b. layer-level safety: v_proj weights only on safe layers (21-39,
+    # non-source compressed) must be ALLOWED despite the v_proj target name
+    r = load_lora("layer_safe_vproj")
+    check("layer-safe v_proj (21-39) allowed", r.get("success"),
+          r.get("error_message", "")[:90])
+
+    # 1c. v_proj weights landing on a dense layer (layer 1) must be REJECTED
+    r = load_lora("layer_unsafe_vproj")
+    check("layer-unsafe v_proj (dense layer) rejected", not r.get("success"),
+          r.get("error_message", "")[:90])
+
     # 2. shared namespace across kv_shared adapters
     r = load_lora("kv_shared_a")
     check("load kv_shared_a", r.get("success"), r.get("error_message", "")[:60])

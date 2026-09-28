@@ -329,6 +329,74 @@ class LoRAManager:
 
         return self.create_lora_update_result(success=True)
 
+    def _kv_shared_safe_layers(self) -> Optional[set]:
+        """Layers whose LoRA cannot change the persistent (radix-cached) KV.
+
+        DeepSeek-V4.1 layer layout (from config):
+          compress_ratios[i] in (0, 1, 2, 4, 128); kv_source_layer_ids are the
+          layers owning compressed storage. The persistent KV is the compressed
+          KV + index K + candidate blocks, written only by kv_source layers'
+          compressor/indexer. A ratio-1/2 layer that is NOT a kv_source layer
+          writes no persistent KV: it reads its source layer's compressed KV and
+          rebuilds its SWA window every forward. So LoRA on such a layer can
+          never change anything the radix cache holds.
+
+        Returns None when the model carries no V4.1 compression config (non
+        V4.1 models), in which case the caller falls back to the module-name
+        blocklist.
+        """
+        cfg = self.base_hf_config
+        compress_ratios = getattr(cfg, "compress_ratios", None)
+        kv_sources = getattr(cfg, "kv_source_layer_ids", None)
+        if not compress_ratios or kv_sources is None:
+            return None
+        num_layers = getattr(cfg, "num_hidden_layers", None) or len(compress_ratios)
+        kv_source_set = set(kv_sources)
+        return {
+            layer_id
+            for layer_id in range(num_layers)
+            if compress_ratios[layer_id] in (1, 2)
+            and layer_id not in kv_source_set
+        }
+
+    def _adapter_weight_layers(self, lora_config) -> Optional[set]:
+        """Layer ids that actually carry adapter weights, read from the
+        adapter's safetensors headers (no tensors loaded).
+
+        Returns None when the weights cannot be inspected (remote path, non
+        safetensors format) — the caller then falls back to the module-name
+        blocklist for every layer.
+        """
+        import glob
+        import os
+
+        from safetensors import safe_open
+
+        path = getattr(lora_config, "path", None)
+        if not path or not os.path.isdir(path):
+            return None
+        files = sorted(glob.glob(os.path.join(path, "*.safetensors")))
+        if not files:
+            return None
+        layers: set = set()
+        for file in files:
+            try:
+                with safe_open(file, framework="pt") as f:
+                    keys = list(f.keys())
+            except Exception as e:
+                logger.warning(
+                    "kv_shared layer check: cannot read %s (%s); falling back "
+                    "to module-name blocklist for all layers.",
+                    file,
+                    e,
+                )
+                return None
+            for name in keys:
+                layer_id = get_layer_id(name)
+                if layer_id is not None:
+                    layers.add(layer_id)
+        return layers or None
+
     def validate_new_adapter(self, lora_config: LoRAConfig, lora_ref: LoRARef):
         """
         Validate if an adapter can be loaded into the current LoRA memory pool and generate error if it is incompatible.
@@ -346,19 +414,21 @@ class LoRAManager:
                 f"Failed to load {lora_ref.lora_name} because LoRA serving currently doesn't support DoRA adapters"
             )
 
-        # kv_shared promises the adapter never writes K/V, so its requests can
-        # share the base model's radix namespace. Reject any target module that
-        # feeds the KV cache — a v_proj/k_proj/... adapter through a shared
-        # namespace would serve one adapter's KV to another (the historical
-        # cross-adapter pollution bug: garbled continuations).
+        # kv_shared promises the adapter never writes persistent KV, so its
+        # requests can share the base model's radix namespace.
         #
-        # Check the RAW (pre-normalization) target names. Normalization maps
-        # v_proj/k_proj → qkv_proj, which would silently bypass a
-        # post-normalization check (qkv_proj is also the normalized form of a
-        # safe bare q_proj adapter). A bare "q_proj" declaration is safe: the
-        # qkv merge zero-fills its k/v parts, so it never writes K/V. An
-        # explicit qkv_proj/kv_* declaration targets the merged K/V projection
-        # directly and is NOT safe.
+        # Correctness is decided PER LAYER, from the model architecture:
+        #  - DeepSeek-V4.1: the persistent (radix-cached) KV is the compressed
+        #    KV + index K + candidate blocks, written ONLY by the
+        #    kv_source_layer_ids layers' compressor/indexer. ratio-1/2 layers
+        #    that are NOT kv_source write no persistent KV at all (they read
+        #    their source layer's compressed KV, and their SWA window is
+        #    rebuilt every forward — not persisted). So a LoRA whose weights
+        #    all land on those non-source layers cannot change any shared KV,
+        #    regardless of which module it targets.
+        #  - dense (ratio-0) layers and the kv_source layers themselves DO
+        #    write persistent KV; for those, fall back to the module-name
+        #    blocklist below.
         if lora_config.lora_kv_shared:
             raw_targets = lora_config.target_modules
             if isinstance(raw_targets, str):
@@ -371,29 +441,67 @@ class LoRAManager:
                     f"{raw_targets!r}); 'all'/'all-linear' would include K/V "
                     f"projections and cannot be shared."
                 )
-            raw_set = set(raw_targets)
-            kv_producing_modules = {
-                "v_proj",
-                "k_proj",
-                "qkv_proj",
-                "kv_proj",
-                "kv_a_proj_with_mqa",
-                "fused_qkv_a_proj_with_mqa",
-                "kv_b_proj",
-                "wkv",
-                "indexer.wk",
-                "indexer.weights_proj",
-            }
-            bad = raw_set & kv_producing_modules
-            if bad:
-                raise ValueError(
-                    f"Failed to load {lora_ref.lora_name}: adapter declares "
-                    f"lora_kv_shared=true but targets K/V-producing module(s) "
-                    f"{sorted(bad)}. A kv_shared adapter must not alter any K/V "
-                    f"projection (its requests share the base model's prefix "
-                    f"KV cache). Remove lora_kv_shared or retarget the adapter "
-                    f"(e.g. use q_proj only — its k/v parts are zero-filled)."
+            # Layer-level safety: if every layer carrying adapter weights is a
+            # non-source compressed layer (writes no persistent KV), the adapter
+            # cannot affect the shared KV no matter which module it targets.
+            safe_layers = self._kv_shared_safe_layers()
+            weight_layers = self._adapter_weight_layers(lora_config)
+            if (
+                safe_layers is not None
+                and weight_layers is not None
+                and weight_layers
+                and weight_layers <= safe_layers
+            ):
+                logger.info(
+                    "kv_shared adapter %s: all target layers %s are non-source "
+                    "compressed layers (no persistent KV written) — module "
+                    "names unrestricted.",
+                    lora_ref.lora_name,
+                    sorted(weight_layers),
                 )
+            else:
+                # At least one target layer writes persistent KV (dense /
+                # kv_source, or a non-V4.1 model): enforce the module-name
+                # blocklist. Check the RAW (pre-normalization) names —
+                # normalization maps v_proj/k_proj → qkv_proj, which would
+                # silently bypass the check (qkv_proj is also the normalized
+                # form of a safe bare q_proj adapter). A bare "q_proj"
+                # declaration is safe: the qkv merge zero-fills its k/v parts.
+                # An explicit qkv_proj/kv_* declaration targets the merged K/V
+                # projection directly and is NOT safe.
+                raw_set = set(raw_targets)
+                kv_producing_modules = {
+                    "v_proj",
+                    "k_proj",
+                    "qkv_proj",
+                    "kv_proj",
+                    "kv_a_proj_with_mqa",
+                    "fused_qkv_a_proj_with_mqa",
+                    "kv_b_proj",
+                    "wkv",
+                    "indexer.wk",
+                    "indexer.weights_proj",
+                }
+                bad = raw_set & kv_producing_modules
+                if bad:
+                    detail = ""
+                    if safe_layers is not None and weight_layers:
+                        unsafe = sorted(
+                            weight_layers - safe_layers
+                        )
+                        detail = (
+                            f" Adapter weights land on persistent-KV layer(s) "
+                            f"{unsafe} (dense/kv_source)."
+                        )
+                    raise ValueError(
+                        f"Failed to load {lora_ref.lora_name}: adapter declares "
+                        f"lora_kv_shared=true but targets K/V-producing module(s) "
+                        f"{sorted(bad)}.{detail} A kv_shared adapter must not "
+                        f"alter any K/V projection (its requests share the base "
+                        f"model's prefix KV cache). Remove lora_kv_shared, "
+                        f"retarget the adapter (e.g. q_proj only), or restrict "
+                        f"its weights to non-source compressed layers."
+                    )
 
         # Check if this LoRA adapter is already loaded
         for existing_lora_ref in self.lora_refs.values():
