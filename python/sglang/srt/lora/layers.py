@@ -1084,6 +1084,23 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             self._quant_info = base_layer.quant_method.get_triton_quant_info(base_layer)
         else:
             assert base_layer.quant_method is not None, "Quant method must be set"
+            if not hasattr(
+                base_layer.quant_method, "get_moe_quant_info"
+            ):
+                raise ValueError(
+                    f"MoE LoRA is not supported by the "
+                    f"{runner_backend.value} MoE runner backend "
+                    f"(quant method {type(base_layer.quant_method).__name__} "
+                    f"exposes no get_moe_quant_info). MoE-targeted LoRA "
+                    f"(gate_up_proj/down_proj, incl. the virtual-experts "
+                    f"path) is only wired up for Triton-family runner "
+                    f"backends; fused-path backends such as "
+                    f"flashinfer_mxfp4 (required by FP4 experts, e.g. "
+                    f"DeepSeek-V4.1-Flash) run the whole MoE as one fused "
+                    f"kernel that LoRA hooks cannot intercept. Remove "
+                    f"gate_up_proj/down_proj from --lora-target-modules "
+                    f"to serve attention-only LoRA on this model."
+                )
             self._quant_info = base_layer.quant_method.get_moe_quant_info(
                 base_layer, runner_backend
             )
