@@ -30,10 +30,15 @@ from sglang.srt.lora.trtllm_lora_temp import (
 
 def merged_column_lora_forward(self, input_: torch.Tensor):
     """O9 — side-stream LoRA-A shrink ‖ base merged-column GEMM."""
+    # `_sgemm_info` is a TRITON-backend hook (host-side LoRABatchInfo). Other
+    # backends (e.g. ChunkedSgmvLoRABackend, which DeepSeek-V4.1 uses) do not
+    # expose it, so this two-stream path cannot serve them — fall back to the
+    # stock forward instead of crashing on the missing hook.
     if (
         not self.lora_active
         or not is_two_stream_active(input_)
         or not supports_two_stream_dense_lora(self.A_buffer, self.B_buffer)
+        or not hasattr(self.lora_backend, "_sgemm_info")
     ):
         return get_original_merged_column_forward()(self, input_)
 

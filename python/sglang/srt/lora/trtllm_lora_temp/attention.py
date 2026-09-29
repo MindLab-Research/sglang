@@ -39,7 +39,7 @@ def qkv_proj_lora_forward(self, input_: torch.Tensor):
         not self.lora_active
         or not is_two_stream_active(input_)
         or not supports_two_stream_dense_lora(self.A_buffer_qkv, self.B_buffer_qkv)
-    ):
+        or not hasattr(self.lora_backend, "_sgemm_info")    ):
         return get_original_qkv_forward()(self, input_)
 
     from sglang.kernels.ops.gemm.trtllm_lora_temp.qkv_lora_b import qkv_lora_b_fwd
@@ -107,7 +107,7 @@ def row_parallel_lora_forward(
         not self.lora_active
         or not is_two_stream_active(input_parallel)
         or not supports_two_stream_dense_lora(self.A_buffer, self.B_buffer)
-    ):
+        or not hasattr(self.lora_backend, "_sgemm_info")    ):
         return get_original_row_forward()(self, input_, skip_all_reduce, forward_batch)
 
     bias_ = (
@@ -179,7 +179,7 @@ def column_parallel_lora_forward(self, input_: torch.Tensor):
         not self.lora_active
         or not is_two_stream_active(input_)
         or not supports_two_stream_dense_lora(self.A_buffer, self.B_buffer)
-    ):
+        or not hasattr(self.lora_backend, "_sgemm_info")    ):
         return get_original_column_forward()(self, input_)
 
     bias = self.base_layer.bias if not self.base_layer.skip_bias_add else None
@@ -234,7 +234,7 @@ def replicated_lora_forward(self, x: torch.Tensor):
         not self.lora_active
         or not is_two_stream_active(x)
         or not supports_two_stream_dense_lora(self.A_buffer, self.B_buffer)
-    ):
+        or not hasattr(self.lora_backend, "_sgemm_info")    ):
         return get_original_replicated_forward()(self, x)
 
     bias = self.base_layer.bias if not self.base_layer.skip_bias_add else None
