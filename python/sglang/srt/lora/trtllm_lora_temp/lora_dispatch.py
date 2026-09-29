@@ -661,6 +661,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora(
     )
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
+    from sglang.srt.layers.moe.utils import RoutingMethodType
     from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 
     assert runner_config.is_gated, (
