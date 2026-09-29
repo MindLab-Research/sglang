@@ -405,6 +405,11 @@ class FusedMoE(torch.nn.Module):
         self._pending_fp8_shared_scales: dict[tuple[int, str], torch.Tensor] = {}
 
         assert intermediate_size % self.moe_tp_size == 0
+        # Keep the raw (unpadded) sizes: the trtllm-gen 128-alignment pad below
+        # overwrites intermediate_size_per_partition (e.g. V4.1: 576 -> 640),
+        # and LoRA buffers/slices must use the unpadded value to match the
+        # adapter's real width.
+        self.intermediate_size = intermediate_size
         self.intermediate_size_per_partition = intermediate_size // self.moe_tp_size
         self.reduce_results = reduce_results
         self.use_presharded_weights = use_presharded_weights

@@ -1009,8 +1009,16 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
         self.tp_size = base_layer.moe_tp_size
         self.tp_rank = base_layer.moe_tp_rank
+        # Slice adapter weights by the UNPADDED per-rank width. The base
+        # FusedMoE pads its own intermediate_size_per_partition up to a
+        # multiple of 128 for the trtllm-gen kernel (V4.1: 2304/4=576 -> 640),
+        # but LoRA buffers are sized by the model's unpadded width
+        # (get_hidden_dim). Slicing by the padded value hands the buffer a
+        # [16, 640] slice its [16, 576] shape check rejects — and the last TP
+        # rank reads past the adapter's global width, silently truncating to
+        # [16, 384]. Recompute from the raw size FusedMoE keeps for us.
         self.intermediate_size_per_partition = (
-            base_layer.intermediate_size_per_partition
+            base_layer.intermediate_size // base_layer.moe_tp_size
         )
         # Stock MoE LoRA buffers are split gate/up except for GPT-OSS-style weights.
         self._uses_interleaved_gate_up = (
