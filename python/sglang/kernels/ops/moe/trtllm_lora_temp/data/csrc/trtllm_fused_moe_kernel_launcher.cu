@@ -3018,13 +3018,15 @@ public:
         btg::Dtype::Bfloat16, norm_topk_prob,
         /*routing_replay_out=*/nullptr);
 
-    // ---- 2) hidden as bf16 (path 3: dispatch feeds bf16; the op quantizes
-    // internally) ----
-    TVM_FFI_ICHECK(hidden_states_.dtype() == dl_bfloat16)
-        << "fp4 LoRA (path 3) requires bf16 hidden_states; the dispatch feeds "
-           "bf16 and the op "
-           "permutes+NvFP4-quantizes internally (no python pre-quant / dequant "
-           "round-trip).";
+    // ---- 2) hidden input: bf16 (path 3, internal quant) OR E4m3 (MXFP8
+    // pre-quantized by the dispatch, matching the non-LoRA path). ----
+    bool const is_e4m3_input = hidden_states_.dtype() == dl_float8_e4m3fn;
+    TVM_FFI_ICHECK(hidden_states_.dtype() == dl_bfloat16 || is_e4m3_input)
+        << "fp4 LoRA requires bf16 hidden_states (path 3) or E4m3+scale "
+           "(MXFP8 pre-quantized).";
+    TVM_FFI_ICHECK(is_e4m3_input == hidden_states_scale_.has_value())
+        << "E4m3 input requires hidden_states_scale; bf16 input must have "
+           "none.";
     void *hidden_bf16_ptr = hidden_states_.data_ptr();
 
     int64_t const tile = tile_tokens_dim;
@@ -3038,12 +3040,49 @@ public:
     auto gu_sfLayout = tile >= 128
                            ? tensorrt_llm::QuantizationSFLayout::SWIZZLED_128x4
                            : tensorrt_llm::QuantizationSFLayout::SWIZZLED_8x4;
+    Tensor hidden_fp4;
+    Tensor hidden_fp4_sf;
+    Tensor hidden_per_token_sf;
+    Tensor permuted_e4m3;
+    Tensor permuted_e4m3_sf;
+    if (is_e4m3_input) {
+      // ---- E4m3 (MXFP8) path: dispatch pre-quantized; just permute
+      // (gather) the E4m3 bytes and block scales. No NvFP4 quant needed —
+      // the MxE4m3 GEMM consumes E4m3 + 32-vec scale directly (matching
+      // cubins exist as Bmm_MxE4m3_MxE2m1*).
+      int64_t const sf_size_e4m3 = tensorrt_llm::computeSwizzledLayoutSFSize(
+          max_num_padded_tokens, hidden_size / 32);
+      permuted_e4m3 = alloc_tensor({max_num_padded_tokens, hidden_size},
+                                   dl_float8_e4m3fn, device);
+      permuted_e4m3_sf =
+          alloc_tensor({sf_size_e4m3}, dl_float8_e4m3fn, device);
+      {
+        moe::dev::permute::Data permData;
+        permData.mDtypeElt = btg::Dtype::E4m3;
+        permData.mUsePdl = false;
+        permData.mUseDeepSeekFp8 = true;
+        permData.inPtr = hidden_bf16_ptr;
+        permData.outPtr = permuted_e4m3.data_ptr();
+        permData.inDqSfsPtr = hidden_states_scale_.has_value()
+                                  ? hidden_states_scale_.value().data_ptr()
+                                  : nullptr;
+        permData.outDqSfsPtr = permuted_e4m3_sf.data_ptr();
+        permData.expandedIdxToPermutedIdx =
+            static_cast<int *>(expanded_idx_to_permuted_idx.data_ptr());
+        permData.hiddenDim = hidden_size;
+        permData.numTokens = num_tokens;
+        permData.topK = top_k;
+        permData.totalNumPaddedTokens =
+            static_cast<int *>(total_num_padded_tokens.data_ptr());
+        moe::dev::permute::run(permData, stream);
+      }
+    } else {
     int64_t const hidden_sf_size = tensorrt_llm::computeSwizzledLayoutSFSize(
         max_num_padded_tokens, hidden_size / 16);
-    Tensor hidden_fp4 = alloc_tensor({max_num_padded_tokens, hidden_size / 2},
+    hidden_fp4 = alloc_tensor({max_num_padded_tokens, hidden_size / 2},
                                      dl_uint8, device);
-    Tensor hidden_fp4_sf = alloc_tensor({hidden_sf_size}, dl_uint8, device);
-    Tensor hidden_per_token_sf =
+    hidden_fp4_sf = alloc_tensor({hidden_sf_size}, dl_uint8, device);
+    hidden_per_token_sf =
         alloc_tensor({max_num_padded_tokens}, dl_float32, device);
     if (use_fused_permute_quant && tile < 128) {
       // Invariants the fused kernel relies on (review hardening): hidden must
@@ -3128,8 +3167,8 @@ public:
           reinterpret_cast<uint8_t *>(hidden_fp4_sf.data_ptr()),
           reinterpret_cast<float *>(hidden_per_token_sf.data_ptr()),
           gu_sfLayout, stream);
-    } // permuted_hidden_bf16 frees here -> its ~4 GB block is reused by
-      // gemm2_output (step 8).
+    } // bf16 NvFP4 quant path
+    } // !is_e4m3_input
 
     // ---- 5) gate_up GEMM: raw Gemm2::Runner(E2m1,E2m1,bf16, K=hidden,
     // N=2*inter). ---- Per-token (hidden) scale on the act operand +
@@ -3143,10 +3182,11 @@ public:
         alloc_tensor({max_num_padded_tokens, gate_up_n}, dl_bfloat16, device);
     {
       moe_ns::Gemm2::Runner gemm_gate_up(
-          btg::Dtype::E2m1, btg::Dtype::E2m1, btg::Dtype::Bfloat16,
+          is_e4m3_input ? btg::Dtype::MxE4m3 : btg::Dtype::E2m1,
+          btg::Dtype::MxE2m1, btg::Dtype::Bfloat16,
           /*useDeepSeekFp8=*/false, (int)tile,
           /*useShuffledMatrix=*/true, batchedGemm::gemm::MatrixLayout::MajorK,
-          /*usePerTokenScaling=*/true,
+          /*usePerTokenScaling=*/!is_e4m3_input,
           /*usePerChannelScaling=*/false);
       int64_t cfg = gemm_gate_up.getDefaultValidConfigIndex(
           top_k, hidden_size, gate_up_n, local_num_experts, num_tokens);
@@ -3156,9 +3196,10 @@ public:
       // Gemm2::Runner semantics: hiddenSize is the OUTPUT N dim,
       // intermediateSize is the K dim.
       gemm_gate_up.run(
-          hidden_fp4.data_ptr(), hidden_fp4_sf.data_ptr(),
+          is_e4m3_input ? permuted_e4m3.data_ptr() : hidden_fp4.data_ptr(),
+          is_e4m3_input ? permuted_e4m3_sf.data_ptr() : hidden_fp4_sf.data_ptr(),
           gemm1_weights_.data_ptr(), gemm1_weights_scale_.data_ptr(),
-          /*perTokenScales=*/hidden_per_token_sf.data_ptr(),
+          /*perTokenScales=*/is_e4m3_input ? nullptr : hidden_per_token_sf.data_ptr(),
           /*perChannelScales=*/nullptr,
           output1_scales_gate_scalar_.has_value()
               ? static_cast<float *>(
