@@ -623,3 +623,174 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp4_lora(
         local_num_experts=quant_info.local_num_experts,
     )
     return StandardCombineInput(hidden_states=output)
+
+
+def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora(
+    dispatch_output: StandardDispatchOutput,
+    quant_info: FlashInferTrtllmGenMxfp4MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    lora_info,
+) -> StandardCombineInput:
+    """DeepSeek-V4.1 MXFP4 (SM100 trtllm-gen) MoE-LoRA dispatch.
+
+    Sibling of ``fused_experts_none_to_experimental_sgl_trtllm_fp4_lora`` for the
+    sglang MXFP4 checkpoint format and its gated SwiGLU with the OAI / GPT-OSS
+    activation controls (alpha=1.702, beta=1.0, clamp_limit=7.0 — the same
+    parameters the non-LoRA ``_fused_experts_flashinfer_mxfp4_sm100_trtllm_gen``
+    path passes to the trtllm-gen kernel).
+
+    Decomposed (unfused-activation) pipeline: routing -> gather -> gate_up grouped
+    GEMM (raw 2*inter) -> activation that adds ``gate_up_lora_delta`` pre-SwiGLU
+    and captures ``activation_lora_input`` -> MXFP8 quant -> down grouped GEMM ->
+    finalize, then the virtual-experts down-LoRA is merged into the output.
+
+    Weight/scale layout (see ``mxfp4.py``): ``w13_weight``/``w2_weight`` are packed
+    e2m1, ``w13_weight_scale`` is e4m3x2, ``w2_weight_scale`` is ue8m0, and both
+    biases are fp32 per-expert. The kernel consumes them as-is.
+    """
+    from sglang.kernels.ops.moe.trtllm_lora_temp import (
+        trtllm_fp4_block_scale_routed_moe_lora,
+    )
+    from sglang.kernels.ops.moe.trtllm_lora_temp.topk_pack import fused_pack_topk
+    from sglang.kernels.ops.moe.trtllm_lora_temp.virtual_experts import (
+        merged_experts_fused_moe_lora_add,
+    )
+    from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+        _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen,
+        get_activation_type,
+    )
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+    from sglang.srt.layers.moe.topk import TopKOutputChecker
+    from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
+
+    assert runner_config.is_gated, (
+        "experimental_sgl_trtllm MXFP4 LoRA requires a gated activation."
+    )
+
+    hidden_states = dispatch_output.hidden_states
+    topk_output = dispatch_output.topk_output
+    assert TopKOutputChecker.format_is_standard(topk_output), (
+        "experimental_sgl_trtllm MXFP4 LoRA needs materialized topk_ids; the "
+        "logits-based (bypassed) routing does not expose them."
+    )
+    assert runner_config.top_k is not None
+
+    # No active LoRA in a non-capture decode -> plain (fast) MXFP4 path.
+    if not get_is_capture_mode() and not lora_info.has_active_lora:
+        return _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
+            dispatch_output, quant_info, runner_config
+        )
+
+    topk_ids = topk_output.topk_ids
+    topk_weights = topk_output.topk_weights
+    use_virtual_lora_store = bool(
+        lora_info.lora_use_virtual_experts and lora_info.max_lora_rank > 0
+    )
+    assert use_virtual_lora_store, "MXFP4 trtllm LoRA requires virtual-experts."
+    token_lora_mapping = lora_info.token_lora_mapping
+    fused_lora_routing_cache: dict = {}
+
+    inter = quant_info.intermediate_size_per_partition
+
+    # Gated gate_up LoRA delta against the bf16 hidden (path 3 feeds the bf16
+    # hidden straight to the op, which permutes + MXFP8-quantizes internally).
+    gate_up_delta = hidden_states.new_empty(
+        (hidden_states.shape[0], runner_config.top_k, quant_info.w13_weight.shape[1])
+    )
+    merged_experts_fused_moe_lora_add(
+        output=gate_up_delta,
+        hidden_states=hidden_states,
+        lora_a=lora_info.gate_up_lora_a_weights,
+        lora_b=lora_info.gate_up_lora_b_weights,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        token_lora_mapping=token_lora_mapping,
+        mul_routed_weight=False,
+        experts_shared_outer_loras_a=lora_info.experts_shared_outer_loras,
+        experts_shared_outer_loras_b=False,
+        routing_cache=fused_lora_routing_cache,
+        fuse_add_to_output=False,
+        use_direct_expand_add=lora_info.max_lora_rank <= 64,
+        local_expert_offset=quant_info.local_expert_offset,
+        local_num_experts=quant_info.local_num_experts,
+    )
+
+    activation_lora_input = torch.empty(
+        (hidden_states.shape[0], runner_config.top_k, inter),
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
+    )
+
+    packed_topk_ids = fused_pack_topk(
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+    )
+
+    with use_symmetric_memory(
+        get_parallel().tp_group, disabled=not is_allocation_symmetric()
+    ):
+        direct_down_output = torch.empty(
+            hidden_states.shape[0],
+            hidden_states.shape[1],
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+
+    output = trtllm_fp4_block_scale_routed_moe_lora(
+        topk_ids=packed_topk_ids,
+        routing_bias=None,
+        hidden_states=hidden_states,
+        hidden_states_scale=None,
+        gemm1_weights=quant_info.w13_weight,
+        gemm1_weights_scale=quant_info.w13_weight_scale,
+        gemm2_weights=quant_info.w2_weight,
+        gemm2_weights_scale=quant_info.w2_weight_scale,
+        output1_scales_scalar=None,
+        output1_scales_gate_scalar=None,
+        output2_scales_scalar=None,
+        gate_up_lora_delta=gate_up_delta,
+        activation_lora_input=activation_lora_input,
+        num_experts=quant_info.global_num_experts,
+        top_k=runner_config.top_k,
+        intermediate_size=inter,
+        local_expert_offset=quant_info.local_expert_offset,
+        local_num_experts=quant_info.local_num_experts,
+        routed_scaling_factor=(
+            runner_config.routed_scaling_factor
+            if runner_config.routed_scaling_factor is not None
+            else 1.0
+        ),
+        routing_method_type=RoutingMethodType.TopK.value,
+        do_finalize=True,
+        output=direct_down_output,
+        act_type=get_activation_type(
+            runner_config.activation, is_gated=runner_config.is_gated
+        ),
+        # OAI / GPT-OSS gated-activation controls + FC1/FC2 biases, matching the
+        # non-LoRA MXFP4 path (see _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen).
+        gemm1_bias=quant_info.w13_weight_bias,
+        gemm1_alpha=quant_info.gemm1_alpha,
+        gemm1_beta=quant_info.gemm1_beta,
+        gemm1_clamp_limit=quant_info.gemm1_clamp_limit,
+        gemm2_bias=quant_info.w2_weight_bias,
+    )
+
+    merged_experts_fused_moe_lora_add(
+        output=output,
+        hidden_states=activation_lora_input.view(-1, inter),
+        lora_a=lora_info.down_lora_a_weights,
+        lora_b=lora_info.down_lora_b_weights,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        token_lora_mapping=token_lora_mapping,
+        mul_routed_weight=True,
+        experts_shared_outer_loras_a=False,
+        experts_shared_outer_loras_b=lora_info.experts_shared_outer_loras,
+        routing_cache=fused_lora_routing_cache,
+        fuse_add_to_output=False,
+        fuse_sum_all_reduce=True,
+        use_direct_expand_add=lora_info.max_lora_rank <= 64,
+        local_expert_offset=quant_info.local_expert_offset,
+        local_num_experts=quant_info.local_num_experts,
+    )
+    return StandardCombineInput(hidden_states=output)

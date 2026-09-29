@@ -224,6 +224,18 @@ struct Data {
   // run() falls back to the scalar kernel otherwise. Output is
   // bitwise-identical.
   int32_t actOptMode = 0;
+
+  // Optional OAI / GPT-OSS gated-activation controls (per-expert fp32, or
+  // nullptr for the plain silu(xGlu)*xLinear path):
+  //   xGlu    = clamp(xGlu, max=limit)
+  //   xLinear = clamp(xLinear, -limit, limit)
+  //   out     = xGlu * sigmoid(alpha * xGlu) * (xLinear + beta)
+  // DeepSeek-V4.1 (MXFP4 trtllm-gen) always runs with alpha=1.702 / beta=1.0 /
+  // limit=7.0, so the FP4-LoRA activation must apply the same controls as the
+  // base kernel or the LoRA path diverges from the non-LoRA path.
+  float const *gatedActAlphaPtr = nullptr;
+  float const *gatedActBetaPtr = nullptr;
+  float const *gatedActClampLimitPtr = nullptr;
 };
 
 template <typename Type_, int32_t NumTokensPerCta_, bool UsePdl_>
@@ -249,6 +261,10 @@ struct KernelParams {
 
   int32_t const *totalNumPaddedTokens;
 
+  float const *gatedActAlphaPtr = nullptr;
+  float const *gatedActBetaPtr = nullptr;
+  float const *gatedActClampLimitPtr = nullptr;
+
   static KernelParams setKernelParams(Data const &data) {
     KernelParams params;
 
@@ -266,6 +282,10 @@ struct KernelParams {
     params.numTokens = data.numTokens;
     params.topK = data.topK;
     params.totalNumPaddedTokens = data.totalNumPaddedTokens;
+
+    params.gatedActAlphaPtr = data.gatedActAlphaPtr;
+    params.gatedActBetaPtr = data.gatedActBetaPtr;
+    params.gatedActClampLimitPtr = data.gatedActClampLimitPtr;
 
     return params;
   }

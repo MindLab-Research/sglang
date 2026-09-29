@@ -57,6 +57,52 @@ inline __device__ float silu(float x) { return x / (1.0f + expf(-x)); }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Gated SwiGLU with the optional OAI / GPT-OSS controls, matching the fused FC1
+// epilogue of the trtllm-gen cubins (and flashinfer's `gatedSilu`):
+//   xGlu    = clamp(xGlu, max=limit)
+//   xLinear = clamp(xLinear, -limit, limit)
+//   out     = xGlu * sigmoid(alpha * xGlu) * (xLinear + beta)
+// With no parameters set this is exactly silu(xGlu) * xLinear, bit-for-bit, so
+// the common path is unchanged. DeepSeek-V4.1 always runs the base MoE with
+// alpha=1.702 / beta=1.0 / limit=7.0, so the FP4-LoRA activation kernel must
+// apply the same controls or the LoRA path diverges from the non-LoRA path.
+//
+// The per-expert scalars are read at index 0: the FP4-LoRA activation kernels do
+// not carry the permuted->expert mapping (the base kernel derives it from
+// ctaIdxXyToBatchIdx/tileTokensDim), and sglang's MXFP4 weight prep fills every
+// expert with the same value (see mxfp4.py). A checkpoint with genuinely
+// per-expert scales would need the expert-index route wired through here.
+// Core of the OAI / GPT-OSS gated-activation controls, shared by the templated
+// kernels (via KernelParams) and the parameter-passing vectorized kernel.
+// Returns plain silu(xGlu) * xLinear, bit-for-bit, when all pointers are null.
+inline __device__ float gatedSiluScalars(float const *alphaPtr,
+                                         float const *betaPtr,
+                                         float const *clampLimitPtr,
+                                         float xLinear, float xGlu) {
+  if (alphaPtr == nullptr && betaPtr == nullptr && clampLimitPtr == nullptr) {
+    return silu(xGlu) * xLinear;
+  }
+  if (clampLimitPtr != nullptr) {
+    float const limit = clampLimitPtr[0];
+    xGlu = fminf(xGlu, limit);
+    xLinear = fmaxf(fminf(xLinear, limit), -limit);
+  }
+  float const alpha = alphaPtr != nullptr ? alphaPtr[0] : 1.0f;
+  float const beta = betaPtr != nullptr ? betaPtr[0] : 0.0f;
+  // x * sigmoid(alpha * x), i.e. silu(x) generalized by alpha.
+  float const act = xGlu / (1.0f + expf(-alpha * xGlu));
+  return act * (xLinear + beta);
+}
+
+template <typename KernelParams>
+inline __device__ float gatedSiluLoRA(KernelParams const &params, float xLinear,
+                                      float xGlu) {
+  return gatedSiluScalars(params.gatedActAlphaPtr, params.gatedActBetaPtr,
+                          params.gatedActClampLimitPtr, xLinear, xGlu);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 template <typename KernelParams>
 __global__ void activationKernel(KernelParams params) {
   using Type = typename KernelParams::Type;
@@ -113,13 +159,13 @@ __global__ void activationKernel(KernelParams params) {
           x2 += static_cast<float>(params.gateUpLoraDeltaPtr[loraBaseIdx]);
         }
 
-        float act = silu(x2);
-        Type out = (Type)(act * x1);
+        float act = gatedSiluLoRA(params, x1, x2);
+        Type out = (Type)act;
         if (params.activationLoraInputOutPtr != nullptr) {
           int64_t const activationIdx =
               (int64_t)expandedIdx * (params.innerDim / 2) + hiddenIdx;
           params.activationLoraInputOutPtr[activationIdx] =
-              static_cast<cutlass::bfloat16_t>(act * x1);
+              static_cast<cutlass::bfloat16_t>(act);
         }
 
         int64_t const outIdx =
@@ -147,6 +193,9 @@ __global__ void activationKernelOpt(
     cutlass::bfloat16_t *__restrict__ outPtr, // activated [.., innerDim/2]
     cutlass::bfloat16_t const *__restrict__ gateUpLoraDeltaPtr,  // may be null
     cutlass::bfloat16_t *__restrict__ activationLoraInputOutPtr, // may be null
+    float const *__restrict__ gatedActAlphaPtr,                  // may be null
+    float const *__restrict__ gatedActBetaPtr,                   // may be null
+    float const *__restrict__ gatedActClampLimitPtr,             // may be null
     int const *__restrict__ expandedIdxToPermutedIdx, int innerDim,
     int numTokens, int topK) {
   int const innerHalf = innerDim / 2;
@@ -200,7 +249,9 @@ __global__ void activationKernelOpt(
         __align__(8) cutlass::bfloat16_t res[4];
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-          res[j] = (cutlass::bfloat16_t)(silu(up[j]) * gate[j]);
+          res[j] = (cutlass::bfloat16_t)gatedSiluScalars(
+              gatedActAlphaPtr, gatedActBetaPtr, gatedActClampLimitPtr, gate[j],
+              up[j]);
         }
         int2 const packed = *reinterpret_cast<int2 const *>(res);
 
@@ -424,8 +475,7 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
                 params.gateUpLoraDeltaPtr[loraBaseIdx + params.innerDim / 2]);
             x2 += static_cast<float>(params.gateUpLoraDeltaPtr[loraBaseIdx]);
           }
-          float act = silu(x2);
-          float out = act * x1;
+          float out = gatedSiluLoRA(params, x1, x2);
           outArr[tokenInCtaIdx] = out;
           absOutArr[tokenInCtaIdx] = fabsf(out);
         }
@@ -556,8 +606,9 @@ void run(Data const &data, void *stream) {
         static_cast<cutlass::bfloat16_t const *>(data.inPtr),
         static_cast<cutlass::bfloat16_t *>(data.outPtr),
         data.gateUpLoraDeltaPtr, data.activationLoraInputOutPtr,
-        data.expandedIdxToPermutedIdx, data.innerDim, data.numTokens,
-        data.topK);
+        data.gatedActAlphaPtr, data.gatedActBetaPtr,
+        data.gatedActClampLimitPtr, data.expandedIdxToPermutedIdx,
+        data.innerDim, data.numTokens, data.topK);
   } else {
     int const numThreads = 256;
     int const gridX = data.actGridXOverride > 0 ? data.actGridXOverride

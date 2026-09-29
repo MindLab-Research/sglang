@@ -132,6 +132,28 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         # FusedMoEMethodBase subclass so it inherits no default.
         self.runner = None
 
+        # LoRA needs the experimental_sgl_trtllm MoeRunner: the non-LoRA path
+        # applies flashinfer trtllm directly (no MoeRunner, hence no LoRA hook),
+        # while the LoRA layer wrapper requires a runner whose fused func routes
+        # to the LoRA-aware decomposed kernels (gate_up GEMM -> activation +
+        # delta -> quant -> down GEMM -> finalize).
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
+        from sglang.srt.layers.moe.utils import MoeRunnerBackend
+        from sglang.srt.runtime_context import get_lora as _get_lora_cfg
+
+        if getattr(_get_lora_cfg(), "enable_lora", False):
+            if not envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get():
+                raise ValueError(
+                    "MXFP4 trtllm-gen MoE LoRA requires "
+                    "SGLANG_EXPERIMENTAL_LORA_OPTI=1: the LoRA-aware decomposed "
+                    "MoE kernels live behind that master switch, and without it "
+                    "the MXFP4 path has no LoRA hook at all."
+                )
+            self.runner = MoeRunner(
+                MoeRunnerBackend.EXPERIMENTAL_SGL_TRTLLM, moe_runner_config
+            )
+
         swiglu_limit = moe_runner_config.swiglu_limit
         self._gemm1_clamp_limit_tensor = (
             torch.full(

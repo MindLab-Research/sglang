@@ -63,6 +63,51 @@ def init_experimental_sgl_trtllm_lora(layer, base_layer) -> None:
 
     _warm_sgl_trtllm_moe_module()
 
+    # ---- MXFP4 (sglang DeepSeek-V4.1) path ----
+    # The sglang MXFP4 loader leaves the trtllm-gen layout on the layer (packed
+    # e2m1 weights; e4m3x2 w13 / ue8m0 w2 scales; fp32 biases; per-expert
+    # gemm1_alpha/beta/clamp). Mirror the non-LoRA construction in
+    # Mxfp4FlashinferTrtllmMoEMethod.apply so the LoRA dispatch gets the same
+    # payload (see _apply_sm100_trtllm_gen). Detected by the gemm1_* tensors the
+    # trtllm-gen path installs; the NVFP4/modelopt path below (g1_scale_c) and the
+    # FP8 path are unaffected.
+    if getattr(base_layer, "gemm1_alpha", None) is not None and hasattr(
+        base_layer, "w13_weight_bias"
+    ):
+        from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+            FlashInferTrtllmGenMxfp4MoeQuantInfo,
+        )
+
+        _qm = base_layer.quant_method
+        layer._lora_runner = None
+        layer._quant_info = FlashInferTrtllmGenMxfp4MoeQuantInfo(
+            w13_weight=base_layer.w13_weight.data,
+            w2_weight=base_layer.w2_weight.data,
+            w13_weight_scale=base_layer.w13_weight_scale.data,
+            w2_weight_scale=base_layer.w2_weight_scale.data,
+            w13_weight_bias=base_layer.w13_weight_bias.data,
+            w2_weight_bias=base_layer.w2_weight_bias.data,
+            gemm1_alpha=base_layer.gemm1_alpha.data,
+            gemm1_beta=base_layer.gemm1_beta.data,
+            gemm1_clamp_limit=base_layer.gemm1_clamp_limit.data,
+            global_num_experts=int(base_layer.num_experts),
+            local_expert_offset=int(base_layer.moe_ep_rank)
+            * int(base_layer.num_local_experts),
+            local_num_experts=int(base_layer.num_local_experts),
+            intermediate_size_per_partition=int(
+                getattr(
+                    _qm,
+                    "intermediate_size_per_partition",
+                    base_layer.intermediate_size_per_partition,
+                )
+            ),
+            hidden_size=int(getattr(_qm, "hidden_size", 0)),
+            flashinfer_mxfp4_moe_precision=getattr(
+                _qm, "flashinfer_mxfp4_moe_precision", "default"
+            ),
+        )
+        return
+
     # ---- NVFP4 (modelopt) path ----
     # The fp4 weight loader sets ``g1_scale_c`` on the FusedMoE layer (see
     # ModelOptNvFp4FusedMoEMethod.apply). Mirror the non-LoRA construction in
@@ -194,12 +239,16 @@ def dispatch_experimental_sgl_trtllm_lora(
     from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
         FlashInferTrtllmBf16MoeQuantInfo,
         FlashInferTrtllmFp4MoeQuantInfo,
+        FlashInferTrtllmGenMxfp4MoeQuantInfo,
     )
 
     # Resolve the fused-experts fn on the module at CALL TIME so the install-time
     # two-stream monkey-patch (sglang.srt.lora.trtllm_lora_temp) takes effect. Route by
-    # quant dtype: NVFP4 -> fp4 LoRA op, BF16 (unquantized) -> bf16 LoRA op, else FP8.
-    if isinstance(quant_info, FlashInferTrtllmFp4MoeQuantInfo):
+    # quant dtype: MXFP4 (sglang DeepSeek-V4.1) -> mxfp4 LoRA op, NVFP4 -> fp4 LoRA
+    # op, BF16 (unquantized) -> bf16 LoRA op, else FP8.
+    if isinstance(quant_info, FlashInferTrtllmGenMxfp4MoeQuantInfo):
+        fused_fn = ft.fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora
+    elif isinstance(quant_info, FlashInferTrtllmFp4MoeQuantInfo):
         fused_fn = ft.fused_experts_none_to_experimental_sgl_trtllm_fp4_lora
     elif isinstance(quant_info, FlashInferTrtllmBf16MoeQuantInfo):
         fused_fn = ft.fused_experts_none_to_experimental_sgl_trtllm_bf16_lora

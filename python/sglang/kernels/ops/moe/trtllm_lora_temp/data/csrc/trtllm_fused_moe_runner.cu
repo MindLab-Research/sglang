@@ -704,6 +704,13 @@ void Runner::setOpsData(MoERunnerArgs const &args,
       reinterpret_cast<cutlass::bfloat16_t const *>(args.gate_up_lora_delta);
   activationData.activationLoraInputOutPtr =
       reinterpret_cast<cutlass::bfloat16_t *>(args.activation_lora_input);
+  // OAI / GPT-OSS gated-activation controls. nullptr on the plain path, so the
+  // activation stays bit-for-bit silu(xGlu)*xLinear there. DeepSeek-V4.1 always
+  // sets these (alpha=1.702, beta=1.0, limit=7.0) on the base trtllm-gen MoE,
+  // so the LoRA activation must consume them too or the two paths diverge.
+  activationData.gatedActAlphaPtr = args.gemm1_alpha;
+  activationData.gatedActBetaPtr = args.gemm1_beta;
+  activationData.gatedActClampLimitPtr = args.gemm1_clamp_limit;
   activationData.innerDim = args.intermediate_size *
                             (isGatedActivation(args.activation_type) ? 2 : 1);
   activationData.topK = args.top_k;

@@ -407,6 +407,11 @@ def trtllm_fp4_block_scale_routed_moe_lora(
     norm_topk_prob: bool = True,
     lora_ready_event: int = 0,
     gemm2_done_event: int = 0,
+    gemm1_bias: Optional[torch.Tensor] = None,
+    gemm1_alpha: Optional[torch.Tensor] = None,
+    gemm1_beta: Optional[torch.Tensor] = None,
+    gemm1_clamp_limit: Optional[torch.Tensor] = None,
+    gemm2_bias: Optional[torch.Tensor] = None,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     """NVFP4 sibling of :func:`trtllm_fp8_block_scale_routed_moe_lora`.
 
@@ -420,6 +425,11 @@ def trtllm_fp4_block_scale_routed_moe_lora(
     NvFP4-quantizes it internally, ``hidden_states_scale=None``) or, legacy, packed NvFP4
     (uint8 ``[num_tokens, hidden//2]``) with ``hidden_states_scale`` the fp8-e4m3 block
     scale ``[num_tokens, hidden//16]``.
+
+    ``gemm1_bias``/``gemm1_alpha``/``gemm1_beta``/``gemm1_clamp_limit``/``gemm2_bias``
+    feed the OAI / GPT-OSS gated-activation controls (per-expert fp32) and the FC1/FC2
+    biases. They default to None, which keeps the plain silu(xGlu)*xLinear activation
+    and bias-free GEMMs. DeepSeek-V4.1 passes all of them.
     """
     from flashinfer.fused_moe.core import ActivationType
     from flashinfer.utils import device_support_pdl
@@ -455,13 +465,13 @@ def trtllm_fp4_block_scale_routed_moe_lora(
         hidden_states_scale,
         gemm1_weights,
         gemm1_weights_scale,
-        None,  # gemm1_bias
-        None,  # gemm1_alpha
-        None,  # gemm1_beta
-        None,  # gemm1_clamp_limit
+        gemm1_bias,
+        gemm1_alpha,
+        gemm1_beta,
+        gemm1_clamp_limit,
         gemm2_weights,
         gemm2_weights_scale,
-        None,  # gemm2_bias
+        gemm2_bias,
         output1_scales_scalar,
         output1_scales_gate_scalar,
         output2_scales_scalar,
