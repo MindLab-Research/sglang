@@ -101,7 +101,14 @@ def init_experimental_sgl_trtllm_lora(layer, base_layer) -> None:
                     base_layer.intermediate_size_per_partition,
                 )
             ),
-            hidden_size=int(getattr(_qm, "hidden_size", 0)),
+            # The trtllm-gen payload needs the (unpadded) model hidden size. The
+            # quant method may not expose it (Mxfp4FlashinferTrtllmMoEMethod
+            # delegates to the FP8 method), so read it off w2_weight, whose shape
+            # is [E, hidden, intermediate/2].
+            hidden_size=int(
+                getattr(_qm, "hidden_size", 0)
+                or base_layer.w2_weight.shape[1]
+            ),
             flashinfer_mxfp4_moe_precision=getattr(
                 _qm, "flashinfer_mxfp4_moe_precision", "default"
             ),
