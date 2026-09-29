@@ -705,20 +705,27 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora(
 
     inter = quant_info.intermediate_size_per_partition
 
-    # The gate_up GEMM produces 2*inter (gate + up). NOTE: on the sglang MXFP4
-    # path w13_weight is packed uint8 e2m1 x2 along BOTH dims, so
-    # w13_weight.shape[1] is the *packed* width (inter), not the 2*inter the
-    # activation consumes — sizing the delta by it under-allocates and the VE
-    # shrink kernel writes out of bounds.
-    gate_up_delta = hidden_states.new_empty(
-        (hidden_states.shape[0], runner_config.top_k, 2 * inter)
+    # --- Pad/unpad bridge: the VE world and the C++ op world use different
+    # intermediate widths on the trtllm-gen MXFP4 path. The flashinfer C++ op
+    # consumes the PADDED per-rank width (128-aligned, V4.1: 2304/4=576 -> 640)
+    # because its gemm1 output is laid out padded; the VE/LoRA buffers are
+    # sized by get_hidden_dim (UNPADDED 576). Derive the VE width from the
+    # actual B buffer (the two must always agree) and bridge explicitly:
+    #   gate_up: VE writes 2*576=1152 -> zero-pad to 2*640=1280 for the C++
+    #            activation kernel (the padded tail has no LoRA weights).
+    #   down:    the C++ activation kernel writes 640 (padded) columns of
+    #            activation_lora_input; down VE reads the first 576 (the A
+    #            buffer's input width).
+    _inter = quant_info.intermediate_size_per_partition  # padded (C++ op)
+    _inter_ve = (
+        lora_info.gate_up_lora_b_weights.shape[2] // 2
+    )  # unpadded, from the shared gate_up B buffer (N = 2 * inter_ve)
+
+    gate_up_delta_ve = hidden_states.new_empty(
+        (hidden_states.shape[0], runner_config.top_k, 2 * _inter_ve)
     )
-    # TEMP-DEBUG(bisect): mxfp4 gate_up VE short-circuit — RE-ENABLED after
-    # the down-A shared fix (all four tensors shared => all virtual buckets
-    # = max_loras, no large align).
-    if True:
-      merged_experts_fused_moe_lora_add(
-        output=gate_up_delta,
+    merged_experts_fused_moe_lora_add(
+        output=gate_up_delta_ve,
         hidden_states=hidden_states,
         lora_a=lora_info.gate_up_lora_a_weights,
         lora_b=lora_info.gate_up_lora_b_weights,
@@ -727,17 +734,20 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora(
         token_lora_mapping=token_lora_mapping,
         mul_routed_weight=False,
         experts_shared_outer_loras_a=lora_info.experts_shared_outer_loras,
-        # V4.1 ships gate_up B shared too (3-D [1, N, r]); a per-expert B
-        # would explode the expand routing to n_routed(384) * max_loras
-        # virtual buckets (>=1024 -> _align_block_size_large, whose JIT
-        # kernel faults) and the B buffer to ~450MB/layer/rank.
         experts_shared_outer_loras_b=lora_info.experts_shared_outer_loras,
         routing_cache=fused_lora_routing_cache,
         fuse_add_to_output=False,
         use_direct_expand_add=lora_info.max_lora_rank <= 64,
         local_expert_offset=quant_info.local_expert_offset,
         local_num_experts=quant_info.local_num_experts,
-      )
+    )
+    gate_up_delta = (
+        torch.nn.functional.pad(
+            gate_up_delta_ve, (0, 2 * _inter - 2 * _inter_ve)
+        )
+        if _inter > _inter_ve
+        else gate_up_delta_ve
+    )
 
     activation_lora_input = torch.empty(
         (hidden_states.shape[0], runner_config.top_k, inter),
@@ -809,12 +819,17 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora(
         gemm2_bias=quant_info.w2_weight_bias,
     )
 
-    # TEMP-DEBUG(bisect): mxfp4 down VE short-circuit — RE-ENABLED after the
-    # down-A shared fix; pure C++ op run verified healthy.
-    if True:
-      merged_experts_fused_moe_lora_add(
+    # Down VE: the C++ activation kernel wrote PADDED inter (640) columns of
+    # activation_lora_input; the down A buffer is UNPADDED (576) wide, so read
+    # the first 576 columns (the padded tail has no LoRA weights). The slice
+    # must be contiguous for the VE kernel's stride assumptions.
+    merged_experts_fused_moe_lora_add(
         output=output,
-        hidden_states=activation_lora_input.view(-1, inter),
+        hidden_states=(
+            activation_lora_input[..., :_inter_ve]
+            if _inter > _inter_ve
+            else activation_lora_input
+        ).contiguous().view(-1, min(_inter, _inter_ve)),
         lora_a=lora_info.down_lora_a_weights,
         lora_b=lora_info.down_lora_b_weights,
         topk_ids=topk_ids,
@@ -829,5 +844,5 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora(
         use_direct_expand_add=lora_info.max_lora_rank <= 64,
         local_expert_offset=quant_info.local_expert_offset,
         local_num_experts=quant_info.local_num_experts,
-      )
+    )
     return StandardCombineInput(hidden_states=output)
