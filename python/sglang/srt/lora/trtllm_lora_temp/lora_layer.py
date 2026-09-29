@@ -93,7 +93,12 @@ def init_experimental_sgl_trtllm_lora(layer, base_layer) -> None:
             w2_scale = base_layer.w2_weight_scale
 
         _num_local = int(base_layer.num_local_experts)
-        _inter = w2.shape[2] * 2 if w2.dtype == torch.uint8 else w2.shape[2]
+        # Use the UNPADDED per-rank intermediate: the LoRA buffers are sized
+        # from get_hidden_dim (unpadded), while w2_weight carries the
+        # trtllm-gen 128-alignment pad (V4.1: 576 -> 640). Sizing
+        # gate_up_delta by the padded value produces [T, k, 1280] against a
+        # [.., 1152]-wide B buffer and the expand kernel walks out of bounds.
+        _inter = base_layer.intermediate_size // base_layer.moe_tp_size
         _hidden = routed_hidden_size(base_layer)
         # apply() reshapes the flat 2-D scale buffers to [E, N, K]; do the same so
         # the LoRA kernel sees the layout the non-LoRA path feeds.
