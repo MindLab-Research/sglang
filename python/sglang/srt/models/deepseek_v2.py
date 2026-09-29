@@ -1083,6 +1083,10 @@ class DeepseekV2MoE(nn.Module):
             and should_use_fuse_finalize_all_reduce(
                 self.experts, hidden_states.shape[0], hidden_states.shape[-1]
             )
+            # LoRA swaps self.experts for a FusedMoEWithLoRA wrapper, which has no
+            # forward_deferred_finalize; the LoRA dispatch finalizes the routed
+            # output itself (and needs the ids materialized, hence STANDARD topk).
+            and not _lora_forces_standard_topk()
         )
         deferred_finalize = use_fused_finalize_all_reduce or (
             has_shared_output

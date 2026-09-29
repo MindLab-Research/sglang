@@ -999,6 +999,10 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.moe_runner_config.inplace = False
         self.dispatcher = base_layer.dispatcher
         self.num_local_experts = base_layer.num_local_experts
+        # The wrapper has no forward_deferred_finalize: the LoRA dispatch owns the
+        # routed finalize. Explicit False keeps deepseek_v2's deferred-finalize
+        # gate well-defined (it reads this attribute on self.experts).
+        self.supports_deferred_finalize = False
         self.should_fuse_routed_scaling_factor_in_topk = (
             base_layer.should_fuse_routed_scaling_factor_in_topk
         )
