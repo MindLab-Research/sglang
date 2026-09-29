@@ -107,6 +107,20 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutput,
 )
 from sglang.srt.layers.moe.topk import BypassedTopKOutput, TopK, TopKOutputFormat
+
+
+def _lora_forces_standard_topk() -> bool:
+    """Whether LoRA is enabled, which forces MATERIALIZED topk ids.
+
+    The MoE-LoRA kernels are the routed variants: they consume topk_ids/topk_weights
+    (the virtual-experts delta routing needs the ids), not router_logits. The plain
+    FP4 path prefers the bypassed format (the trtllm-gen kernel routes internally),
+    so LoRA-enabled serving must switch the topk format or the base (no-adapter)
+    requests of an MXFP4 LoRA deployment would hit the routed path without ids.
+    """
+    from sglang.srt.runtime_context import get_lora
+
+    return bool(getattr(get_lora(), "enable_lora", False))
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
@@ -705,10 +719,18 @@ class DeepseekV2MoE(nn.Module):
                 fused_shared_experts_scaling_factor=fused_shared_experts_scaling_factor,
                 # Some Fp4 MoE backends require the output format to be bypassed but the MTP layers are unquantized
                 # and requires the output format to be standard (except trtllm). We use quant_config to determine the output format.
+                # LoRA additionally forces STANDARD: the MoE-LoRA kernels are the
+                # routed variants, which consume materialized topk_ids rather than
+                # router_logits (the virtual-experts delta routing needs the ids).
                 output_format=(
                     TopKOutputFormat.STANDARD
-                    if (quant_config is None)
-                    and (not get_moe_runner_backend().is_flashinfer_trtllm())
+                    if (
+                        (
+                            (quant_config is None)
+                            and (not get_moe_runner_backend().is_flashinfer_trtllm())
+                        )
+                        or _lora_forces_standard_topk()
+                    )
                     else None
                 ),
             )

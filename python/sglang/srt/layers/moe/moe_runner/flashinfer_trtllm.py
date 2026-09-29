@@ -1064,8 +1064,12 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
         f"unsupported topk format: {topk_output.format}"
     )
     if is_standard:
-        assert runner_config.activation == "situ", (
-            "standard topk output only wired for the situ path"
+        # The routed (materialized-topk) variant is used by situ AND by the OAI
+        # gated-swish (silu) path — the latter is what LoRA-enabled serving
+        # produces (deepseek_v2 forces STANDARD topk under LoRA) and what
+        # pass-through base requests hit on such a server.
+        assert runner_config.activation in ("situ", "silu"), (
+            "standard topk output is only wired for the situ / gated-silu paths"
         )
         top_k = topk_output.topk_ids.shape[1]
         router_logits = None
@@ -1106,6 +1110,11 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
             routed_top_k = _routing_top_k(routing)
 
             defer_finalize = _deferred_finalize_enabled.get()
+            # situ: alpha + clamp_limit-as-beta, no separate clamp, no biases.
+            # silu (OAI gated-swish — DeepSeek-V4.1 under LoRA, whose topk is
+            # forced STANDARD): the plain alpha/beta/clamp triple plus the
+            # FC1/FC2 biases, matching the bypassed path below so the two agree.
+            _is_situ = runner_config.activation == "situ"
             result = trtllm_fp4_block_scale_routed_moe(
                 topk_ids=routing,
                 routing_bias=None,
@@ -1113,13 +1122,19 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
                 hidden_states_scale=x_scale,
                 gemm1_weights=quant_info.w13_weight,
                 gemm1_weights_scale=quant_info.w13_weight_scale,
-                gemm1_bias=None,
+                gemm1_bias=None if _is_situ else quant_info.w13_weight_bias,
                 gemm1_alpha=quant_info.gemm1_alpha,
-                gemm1_beta=quant_info.gemm1_clamp_limit,
-                gemm1_clamp_limit=None,
+                gemm1_beta=(
+                    quant_info.gemm1_clamp_limit
+                    if _is_situ
+                    else quant_info.gemm1_beta
+                ),
+                gemm1_clamp_limit=(
+                    None if _is_situ else quant_info.gemm1_clamp_limit
+                ),
                 gemm2_weights=quant_info.w2_weight,
                 gemm2_weights_scale=quant_info.w2_weight_scale,
-                gemm2_bias=None,
+                gemm2_bias=None if _is_situ else quant_info.w2_weight_bias,
                 output1_scale_scalar=None,
                 output1_scale_gate_scalar=None,
                 output2_scale_scalar=None,
@@ -1132,7 +1147,13 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
                 local_num_experts=quant_info.local_num_experts,
                 routed_scaling_factor=None,
                 routing_method_type=RoutingMethodType.TopK.value,
-                activation_type=ActivationType.Situ.value,
+                activation_type=(
+                    ActivationType.Situ.value
+                    if _is_situ
+                    else get_activation_type(
+                        runner_config.activation, is_gated=runner_config.is_gated
+                    )
+                ),
                 tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
                 output=symm_output,
                 do_finalize=not defer_finalize,
