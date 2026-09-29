@@ -61,57 +61,67 @@ def init_experimental_sgl_trtllm_lora(layer, base_layer) -> None:
     )
     from sglang.srt.layers.moe.utils import RoutingMethodType
 
+    import torch
+
     _warm_sgl_trtllm_moe_module()
 
     # ---- MXFP4 (sglang DeepSeek-V4.1) path ----
-    # The sglang MXFP4 loader leaves the trtllm-gen layout on the layer (packed
-    # e2m1 weights; e4m3x2 w13 / ue8m0 w2 scales; fp32 biases; per-expert
-    # gemm1_alpha/beta/clamp). Mirror the non-LoRA construction in
-    # Mxfp4FlashinferTrtllmMoEMethod.apply so the LoRA dispatch gets the same
-    # payload (see _apply_sm100_trtllm_gen). Detected by the gemm1_* tensors the
-    # trtllm-gen path installs; the NVFP4/modelopt path below (g1_scale_c) and the
-    # FP8 path are unaffected.
-    if getattr(base_layer, "gemm1_alpha", None) is not None and hasattr(
-        base_layer, "w13_weight_bias"
+    # Mxfp4FlashinferTrtllmMoEMethod wraps the FP8 method, exposes NO
+    # quant_config (so the BF16 branch below would otherwise swallow it), and
+    # installs NO layer.gemm1_alpha: its apply() passes gemm1_clamp_limit alone
+    # (swiglu_limit from the model config) plus the FC1/FC2 biases. Identify it
+    # by its own markers and mirror apply()'s payload exactly — including the
+    # *_weight_scale_inv attribute names, which differ from the NVFP4 path's.
+    _qm = base_layer.quant_method
+    if hasattr(_qm, "flashinfer_mxfp4_moe_precision") and hasattr(
+        _qm, "_gemm1_clamp_limit_tensor"
     ):
         from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
             FlashInferTrtllmGenMxfp4MoeQuantInfo,
         )
+        from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
+            routed_hidden_size,
+        )
 
-        _qm = base_layer.quant_method
+        w13 = base_layer.w13_weight
+        w2 = base_layer.w2_weight
+        w13_scale = getattr(base_layer, "w13_weight_scale_inv", None)
+        if w13_scale is None:
+            w13_scale = base_layer.w13_weight_scale
+        w2_scale = getattr(base_layer, "w2_weight_scale_inv", None)
+        if w2_scale is None:
+            w2_scale = base_layer.w2_weight_scale
+
+        _num_local = int(base_layer.num_local_experts)
+        _inter = w2.shape[2] * 2 if w2.dtype == torch.uint8 else w2.shape[2]
+        _hidden = routed_hidden_size(base_layer)
+        # apply() reshapes the flat 2-D scale buffers to [E, N, K]; do the same so
+        # the LoRA kernel sees the layout the non-LoRA path feeds.
+        if w13_scale.dim() == 2:
+            w13_scale = w13_scale.reshape(_num_local, 2 * _inter, -1)
+        if w2_scale.dim() == 2:
+            w2_scale = w2_scale.reshape(_num_local, _hidden, -1)
+
         layer._lora_runner = None
         layer._quant_info = FlashInferTrtllmGenMxfp4MoeQuantInfo(
-            w13_weight=base_layer.w13_weight.data,
-            w2_weight=base_layer.w2_weight.data,
-            w13_weight_scale=base_layer.w13_weight_scale.data,
-            w2_weight_scale=base_layer.w2_weight_scale.data,
-            w13_weight_bias=base_layer.w13_weight_bias.data,
-            w2_weight_bias=base_layer.w2_weight_bias.data,
-            gemm1_alpha=base_layer.gemm1_alpha.data,
-            gemm1_beta=base_layer.gemm1_beta.data,
-            gemm1_clamp_limit=base_layer.gemm1_clamp_limit.data,
+            w13_weight=w13,
+            w2_weight=w2,
+            w13_weight_scale=w13_scale,
+            w2_weight_scale=w2_scale,
+            w13_weight_bias=getattr(base_layer, "w13_weight_bias", None),
+            w2_weight_bias=getattr(base_layer, "w2_weight_bias", None),
+            # None => the activation kernel's gatedSilu falls back to
+            # silu(xGlu)*xLinear with alpha=1/beta=0; only the clamp applies,
+            # exactly like Mxfp4FlashinferTrtllmMoEMethod.apply.
+            gemm1_alpha=None,
+            gemm1_beta=None,
+            gemm1_clamp_limit=_qm._gemm1_clamp_limit_tensor,
             global_num_experts=int(base_layer.num_experts),
-            local_expert_offset=int(base_layer.moe_ep_rank)
-            * int(base_layer.num_local_experts),
-            local_num_experts=int(base_layer.num_local_experts),
-            intermediate_size_per_partition=int(
-                getattr(
-                    _qm,
-                    "intermediate_size_per_partition",
-                    base_layer.intermediate_size_per_partition,
-                )
-            ),
-            # The trtllm-gen payload needs the (unpadded) model hidden size. The
-            # quant method may not expose it (Mxfp4FlashinferTrtllmMoEMethod
-            # delegates to the FP8 method), so read it off w2_weight, whose shape
-            # is [E, hidden, intermediate/2].
-            hidden_size=int(
-                getattr(_qm, "hidden_size", 0)
-                or base_layer.w2_weight.shape[1]
-            ),
-            flashinfer_mxfp4_moe_precision=getattr(
-                _qm, "flashinfer_mxfp4_moe_precision", "default"
-            ),
+            local_expert_offset=int(base_layer.moe_ep_rank) * _num_local,
+            local_num_experts=_num_local,
+            intermediate_size_per_partition=int(_inter),
+            hidden_size=int(_hidden),
+            flashinfer_mxfp4_moe_precision=_qm.flashinfer_mxfp4_moe_precision,
         )
         return
 
