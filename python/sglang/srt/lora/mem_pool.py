@@ -464,6 +464,14 @@ class LoRAMemoryPool:
             if self.experts_shared_outer_loras and module_name in (
                 "gate_up_proj_moe",
                 "gate_up_proj_shared_moe",
+                # DeepSeek-V4.1: down A shared too. The adapters ship A as 3-D
+                # [1, r, inter] (shared), and a per-expert down-A buffer would
+                # expand the shrink routing to n_routed(384) * max_loras
+                # virtual buckets (>=1024 -> _align_block_size_large, whose
+                # JIT kernel faults) while the loader only fills expert 0 of
+                # the per-expert dict anyway.
+                "down_proj_moe",
+                "down_proj_shared_moe",
             ):
                 expert_dim = 1
             return (
@@ -1193,6 +1201,12 @@ class LoRAMemoryPool:
                     if self.experts_shared_outer_loras and name in (
                         "gate_up_proj_moe",
                         "gate_up_proj_shared_moe",
+                        # down A is shared too on V4.1 (see get_lora_A_shape):
+                        # the adapters ship it 3-D [1, r, inter]; load it
+                        # through the shared slot instead of the per-expert
+                        # dict path.
+                        "down_proj_moe",
+                        "down_proj_shared_moe",
                     ):
                         if weights is None or (
                             isinstance(weights, dict) and not weights

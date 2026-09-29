@@ -363,10 +363,15 @@ def fused_experts_none_to_experimental_sgl_trtllm_bf16_lora(
 
     # Gated gate_up LoRA delta (same shape/semantics as the fp8/fp4 paths). EP args scope
     # the delta to this rank's experts, matching the EP-aware trtllm MoE base.
-    gate_up_delta = hidden_states.new_empty(
-        (hidden_states.shape[0], runner_config.top_k, 2 * inter)
+    # TEMP-DEBUG(bisect): skip the VE kernels; zero deltas isolate whether the
+    # crash is in the VE Triton path or the flashinfer C++ op.
+    gate_up_delta = torch.zeros(
+        (hidden_states.shape[0], runner_config.top_k, 2 * inter),
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
     )
-    merged_experts_fused_moe_lora_add(
+    if False:
+      merged_experts_fused_moe_lora_add(
         output=gate_up_delta,
         hidden_states=hidden_states,
         lora_a=lora_info.gate_up_lora_a_weights,
@@ -439,7 +444,9 @@ def fused_experts_none_to_experimental_sgl_trtllm_bf16_lora(
         ),
     )
 
-    merged_experts_fused_moe_lora_add(
+    # TEMP-DEBUG(bisect): skip the down VE too — pure C++ op run.
+    if False:
+      merged_experts_fused_moe_lora_add(
         output=output,
         hidden_states=activation_lora_input.view(-1, inter),
         lora_a=lora_info.down_lora_a_weights,
@@ -456,7 +463,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_bf16_lora(
         use_direct_expand_add=lora_info.max_lora_rank <= 64,
         local_expert_offset=quant_info.local_expert_offset,
         local_num_experts=runner_config.num_local_experts,
-    )
+      )
     return StandardCombineInput(hidden_states=output)
 
 
@@ -706,7 +713,11 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora(
     gate_up_delta = hidden_states.new_empty(
         (hidden_states.shape[0], runner_config.top_k, 2 * inter)
     )
-    merged_experts_fused_moe_lora_add(
+    # TEMP-DEBUG(bisect): mxfp4 gate_up VE short-circuit — RE-ENABLED after
+    # the down-A shared fix (all four tensors shared => all virtual buckets
+    # = max_loras, no large align).
+    if True:
+      merged_experts_fused_moe_lora_add(
         output=gate_up_delta,
         hidden_states=hidden_states,
         lora_a=lora_info.gate_up_lora_a_weights,
@@ -722,7 +733,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora(
         use_direct_expand_add=lora_info.max_lora_rank <= 64,
         local_expert_offset=quant_info.local_expert_offset,
         local_num_experts=quant_info.local_num_experts,
-    )
+      )
 
     activation_lora_input = torch.empty(
         (hidden_states.shape[0], runner_config.top_k, inter),
@@ -794,7 +805,10 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora(
         gemm2_bias=quant_info.w2_weight_bias,
     )
 
-    merged_experts_fused_moe_lora_add(
+    # TEMP-DEBUG(bisect): mxfp4 down VE short-circuit — RE-ENABLED after the
+    # down-A shared fix; pure C++ op run verified healthy.
+    if True:
+      merged_experts_fused_moe_lora_add(
         output=output,
         hidden_states=activation_lora_input.view(-1, inter),
         lora_a=lora_info.down_lora_a_weights,
@@ -803,7 +817,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora(
         topk_weights=topk_weights,
         token_lora_mapping=token_lora_mapping,
         mul_routed_weight=True,
-        experts_shared_outer_loras_a=False,
+        experts_shared_outer_loras_a=lora_info.experts_shared_outer_loras,
         experts_shared_outer_loras_b=lora_info.experts_shared_outer_loras,
         routing_cache=fused_lora_routing_cache,
         fuse_add_to_output=False,
@@ -811,5 +825,5 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora(
         use_direct_expand_add=lora_info.max_lora_rank <= 64,
         local_expert_offset=quant_info.local_expert_offset,
         local_num_experts=quant_info.local_num_experts,
-    )
+      )
     return StandardCombineInput(hidden_states=output)
