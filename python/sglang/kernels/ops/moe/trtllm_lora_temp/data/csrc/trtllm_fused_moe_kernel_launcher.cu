@@ -3063,10 +3063,12 @@ public:
         permData.mUseDeepSeekFp8 = true;
         permData.inPtr = hidden_bf16_ptr;
         permData.outPtr = permuted_e4m3.data_ptr();
-        permData.inDqSfsPtr = hidden_states_scale_.has_value()
-                                  ? hidden_states_scale_.value().data_ptr()
-                                  : nullptr;
-        permData.outDqSfsPtr = permuted_e4m3_sf.data_ptr();
+        permData.inDqSfsPtr = static_cast<float*>(
+            hidden_states_scale_.has_value()
+                ? hidden_states_scale_.value().data_ptr()
+                : nullptr);
+        permData.outDqSfsPtr =
+            static_cast<float*>(permuted_e4m3_sf.data_ptr());
         permData.expandedIdxToPermutedIdx =
             static_cast<int *>(expanded_idx_to_permuted_idx.data_ptr());
         permData.hiddenDim = hidden_size;
