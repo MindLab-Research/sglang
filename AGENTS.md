@@ -61,6 +61,47 @@ Non-obvious things that broke (each cost a 30-min reload to find):
 6. **`create_moe_runner` must build a MoeRunner under LoRA**
    (`MoeRunnerBackend.EXPERIMENTAL_SGL_TRTLLM`); the non-LoRA branch leaves
    `runner=None`.
+7. **`normalize_gate_up_proj` must not repeat-stack 3-D MoE weights.** Its
+   synthetic up-half repeat (x2 on the second-to-last dim) exists for 2-D
+   PEFT adapters ([r, hidden] -> [2r, hidden]); applied to a 3-D shared-outer
+   MoE weight ([1, 2r, hidden], already stacked per the mem_pool contract) it
+   doubled the rank dim and failed the buffer shape check ([1, 32, 5120] ->
+   [1, 64, 5120] on V4.1). Only 2-D weights get the repeat.
+8. **The ported O7/O8/O9 two-stream overrides assume the TRITON LoRA
+   backend** (`lora_backend._sgemm_info()`). V4.1 runs ChunkedSgmvLoRABackend
+   (csgmv), which has no such hook — guard every entry with
+   `hasattr(self.lora_backend, "_sgemm_info")` so they fall back to the stock
+   forward on csgmv-style backends (mirrors deepseek_mla_correction.py).
+9. **V4.1's LoRA fallback with STANDARD topk + gated-silu dereferenced
+   `router_logits.to(...)` (None)** — route standard-topk non-situ requests
+   through the kernel's routed entry point up front
+   (`flashinfer_trtllm._fused_experts_flashinfer_mxfp4_sm100_trtllm_gen`).
+10. **LoRA must slice adapter weights by the UNPADDED per-rank width.** The
+   base FusedMoE pads `intermediate_size_per_partition` to a multiple of 128
+   for the trtllm-gen kernel (V4.1: 2304/4=576 → 640), but LoRA buffers use
+   the model's unpadded width (get_hidden_dim). Slicing by the padded value
+   fails the buffer check ([16, 640] vs [16, 576]; the last rank even
+   truncates silently to [16, 384]). FusedMoE now keeps the raw
+   `intermediate_size`; FusedMoEWithLoRA recomputes from it.
+11. **The flashinfer JIT cache is presence-based, not content-based.** After
+   editing the overlay .cu source, the JIT loads the stale .so unless it is
+   removed/renamed — it does not hash the source to detect changes. Always
+   rename the .so in `~/.cache/sglang/.cache/flashinfer/*/cached_ops/
+   sgl_fused_moe_trtllm_sm100/` after rsync'ing overlay source changes.
+12. **The trtllm-gen cubin package must be downloaded.** The 1101 box's
+   flashinfer pip package has the checksums.txt manifest but NOT the actual
+   .cubin files (only downloaded on demand). The decomposed FP4 MoE-LoRA
+   path needs the `batched_gemm` cubins (1799 files, ~50MB total) — download
+   them from `edge.urm.nvidia.com/artifactory/sw-kernelinferencelibrary-
+   public-generic-local/<hash>/batched_gemm-*/` per the checksums.txt list.
+13. **V4.1's gate_up GEMM needs E4m3 activations, not internal E2m1 quant.**
+   The overlay's `FP4BlockScaleLoraLauncher` originally fed raw bf16 (path 3,
+   internal NvFP4 quant), which selects `Gemm2::Runner(E2m1, E2m1, BF16)` —
+   the E2m1×E2m1 tile-8 cubin does not exist ("No kernel found"). Pre-
+   quantize with `_prepare_flashinfer_mxfp8_activations` (same as the
+   non-LoRA path) and feed `Gemm2::Runner(MxE4m3, MxE2m1, BF16)` — the
+   `Bmm_MxE4m3_MxE2m1*` cubins exist. The overlay now branches on input
+   dtype; the pad/unpad intermediate bridge lives in the dispatch.
 
 ## Verification recipes
 
