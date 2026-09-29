@@ -3248,13 +3248,28 @@ public:
                         ? tensorrt_llm::QuantizationSFLayout::SWIZZLED_128x4
                         : tensorrt_llm::QuantizationSFLayout::SWIZZLED_8x4;
     float const globalScaleInv = 1.f / 448.f / 6.f;
+    // E4m3 (MXFP8) path: act operand is E4m3 + UE8M0 32-vec swizzled SF —
+    // the SAME A-side format the gate_up GEMM's MxE4m3 x MxE2m1 runner
+    // consumes. bf16 (Kimi NvFP4) path: E2m1 packed + E4M3 16-vec swizzled
+    // SF + per-token FP32 scale.
     int64_t const act_sf_size = tensorrt_llm::computeSwizzledLayoutSFSize(
-        max_num_padded_tokens, inter / 16);
-    Tensor act_fp4 =
-        alloc_tensor({max_num_padded_tokens, inter / 2}, dl_uint8, device);
-    Tensor act_fp4_sf = alloc_tensor({act_sf_size}, dl_uint8, device);
-    Tensor act_per_token_sf =
-        alloc_tensor({max_num_padded_tokens}, dl_float32, device);
+        max_num_padded_tokens, is_e4m3_input ? inter / 32 : inter / 16);
+    Tensor act_fp8;      // E4m3 path: [max_padded, inter] E4m3
+    Tensor act_fp8_sf;  // E4m3 path: swizzled UE8M0 SF
+    Tensor act_fp4;      // bf16 path: [max_padded, inter/2] packed E2m1
+    Tensor act_fp4_sf;  // bf16 path: swizzled E4M3 SF
+    Tensor act_per_token_sf; // bf16 path: per-token FP32
+    if (is_e4m3_input) {
+      act_fp8 = alloc_tensor({max_num_padded_tokens, inter},
+                             dl_float8_e4m3fn, device);
+      act_fp8_sf = alloc_tensor({act_sf_size}, dl_uint8, device);
+    } else {
+      act_fp4 = alloc_tensor({max_num_padded_tokens, inter / 2},
+                             dl_uint8, device);
+      act_fp4_sf = alloc_tensor({act_sf_size}, dl_uint8, device);
+      act_per_token_sf =
+          alloc_tensor({max_num_padded_tokens}, dl_float32, device);
+    }
 
     auto envFlag = [](char const *name) {
       char const *e = std::getenv(name);
@@ -3266,7 +3281,7 @@ public:
     static int const actOptMode =
         envFlag("SGLANG_OPT_FUSED_MOE_ACTIVATION_VEC") ? 1 : 0;
 
-    if (fuseActQuant && inter / 16 <= 512) {
+    if (!is_e4m3_input && fuseActQuant && inter / 16 <= 512) {
       // Fused: gate_up (interleaved) + lora_delta -> act_fp4/sf/per_token +
       // activation_lora_input, without materializing activated_bf16. >512 SF
       // vecs/row falls to the unfused chain below.
@@ -3284,6 +3299,16 @@ public:
     } else {
       Tensor activated_bf16 =
           alloc_tensor({max_num_padded_tokens, inter}, dl_bfloat16, device);
+      if (is_e4m3_input) {
+        // invokeMxFP8Quantization has no expanded->permuted row map (it
+        // quantizes the whole [m, n] buffer), and the activation kernel
+        // leaves padding rows UNINITIALIZED — zero the buffer FIRST so the
+        // quantizer's 32-block amax sees 0 (not NaN from garbage memory) on
+        // padding rows. Activation overwrites the valid rows right after.
+        cudaMemsetAsync(
+            activated_bf16.data_ptr(), 0,
+            static_cast<size_t>(max_num_padded_tokens) * inter * 2, stream);
+      }
       {
         moe::dev::activation::Data actData;
         actData.mDtypeElt = btg::Dtype::Bfloat16;
@@ -3308,18 +3333,35 @@ public:
         actData.actOptMode = actOptMode;
         moe::dev::activation::run(actData, stream);
       }
-      // quant#2: m = num_tokens*top_k + the expanded->permuted map so only
-      // valid (non-padding) permuted rows are quantized (padding rows of
-      // activated_bf16 are left uninitialized).
-      tensorrt_llm::kernels::invokeNvfp4QuantAndPerTokenScale<__nv_bfloat16>(
-          num_tokens * top_k, inter,
-          reinterpret_cast<__nv_bfloat16 const *>(activated_bf16.data_ptr()),
-          globalScaleInv,
-          static_cast<int *>(expanded_idx_to_permuted_idx.data_ptr()),
-          reinterpret_cast<uint8_t *>(act_fp4.data_ptr()),
-          reinterpret_cast<uint8_t *>(act_fp4_sf.data_ptr()),
-          reinterpret_cast<float *>(act_per_token_sf.data_ptr()), sfLayout,
-          stream);
+      if (is_e4m3_input) {
+        // quant#2 (MXFP8): E4m3 + UE8M0 32-vec swizzled SF via the stock
+        // trtllm-gen kernel (quantization.cu invokeMxFP8Quantization). The
+        // output is the exact A-side format Gemm2::Runner(MxE4m3, MxE2m1)
+        // expects — same as the non-LoRA fused path's internal quantize.
+        int numSms = 0;
+        cudaDeviceGetAttribute(&numSms, cudaDevAttrMultiProcessorCount,
+                               dev_id);
+        tensorrt_llm::kernels::invokeMxFP8Quantization<__nv_bfloat16>(
+            /*b=*/1, static_cast<int>(max_num_padded_tokens),
+            static_cast<int>(inter), static_cast<int>(inter),
+            reinterpret_cast<__nv_bfloat16 const *>(activated_bf16.data_ptr()),
+            reinterpret_cast<int64_t *>(act_fp8.data_ptr()),
+            reinterpret_cast<int32_t *>(act_fp8_sf.data_ptr()), sfLayout,
+            numSms, /*enable_pdl=*/false, stream);
+      } else {
+        // quant#2 (NvFP4): m = num_tokens*top_k + the expanded->permuted map
+        // so only valid (non-padding) permuted rows are quantized (padding
+        // rows of activated_bf16 are left uninitialized).
+        tensorrt_llm::kernels::invokeNvfp4QuantAndPerTokenScale<__nv_bfloat16>(
+            num_tokens * top_k, inter,
+            reinterpret_cast<__nv_bfloat16 const *>(activated_bf16.data_ptr()),
+            globalScaleInv,
+            static_cast<int *>(expanded_idx_to_permuted_idx.data_ptr()),
+            reinterpret_cast<uint8_t *>(act_fp4.data_ptr()),
+            reinterpret_cast<uint8_t *>(act_fp4_sf.data_ptr()),
+            reinterpret_cast<float *>(act_per_token_sf.data_ptr()), sfLayout,
+            stream);
+      }
     }
 
     // ---- 8) down GEMM: Gemm2::Runner(E2m1,E2m1,bf16, K=inter, N=hidden) ----
@@ -3336,10 +3378,11 @@ public:
         alloc_tensor({max_num_padded_tokens, hidden_size}, dl_bfloat16, device);
     {
       moe_ns::Gemm2::Runner gemm_down(
-          btg::Dtype::E2m1, btg::Dtype::E2m1, btg::Dtype::Bfloat16,
+          is_e4m3_input ? btg::Dtype::MxE4m3 : btg::Dtype::E2m1,
+          btg::Dtype::MxE2m1, btg::Dtype::Bfloat16,
           /*useDeepSeekFp8=*/false, (int)tile,
           /*useShuffledMatrix=*/true, batchedGemm::gemm::MatrixLayout::MajorK,
-          /*usePerTokenScaling=*/true,
+          /*usePerTokenScaling=*/!is_e4m3_input,
           /*usePerChannelScaling=*/false);
       int64_t cfg = gemm_down.getDefaultValidConfigIndex(
           top_k, hidden_size, inter, local_num_experts, num_tokens);
@@ -3350,10 +3393,14 @@ public:
           output2_scales_scalar_.has_value()
               ? static_cast<float *>(output2_scales_scalar_.value().data_ptr())
               : nullptr;
-      gemm_down.run(act_fp4.data_ptr(), act_fp4_sf.data_ptr(),
-                    gemm2_weights_.data_ptr(), gemm2_weights_scale_.data_ptr(),
-                    /*perTokenScales=*/act_per_token_sf.data_ptr(),
-                    /*perChannelScales=*/nullptr, down_scale_ptr,
+      gemm_down.run(
+          is_e4m3_input ? act_fp8.data_ptr() : act_fp4.data_ptr(),
+          is_e4m3_input ? act_fp8_sf.data_ptr() : act_fp4_sf.data_ptr(),
+          gemm2_weights_.data_ptr(), gemm2_weights_scale_.data_ptr(),
+          /*perTokenScales=*/is_e4m3_input
+              ? nullptr
+              : act_per_token_sf.data_ptr(),
+          /*perChannelScales=*/nullptr, down_scale_ptr,
                     /*ptrBias=*/nullptr, gemm2_output.data_ptr(),
                     /*outputScale=*/nullptr, top_k,
                     /*hiddenSize(N)=*/hidden_size,
