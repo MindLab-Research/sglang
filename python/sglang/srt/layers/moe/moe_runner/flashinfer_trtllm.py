@@ -1096,6 +1096,61 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
                 device=x_quant.device,
             )
 
+    if is_standard and runner_config.activation != "situ":
+        # Materialized topk with a NON-situ gated activation — the OAI gated-silu
+        # DeepSeek-V4.1 runs. LoRA-enabled serving forces STANDARD topk
+        # (deepseek_v2._lora_forces_standard_topk), so pass-through (no-adapter)
+        # requests land here with router_logits=None; the bypassed paths below
+        # would dereference it. Route through the kernel's routed entry point
+        # with the gated activation and the OAI triple + biases the base path
+        # uses, so pass-through output matches the plain model exactly.
+        from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
+        from flashinfer.tllm_enums import RoutingMethodType
+
+        routing = (
+            prepared_packed_topk
+            if prepared_packed_topk is not None
+            else _get_routing_for_flashinfer_routed(topk_output)
+        )
+        routed_top_k = _routing_top_k(routing)
+        trtllm_fp4_block_scale_routed_moe(
+            topk_ids=routing,
+            routing_bias=None,
+            hidden_states=x_quant,
+            hidden_states_scale=x_scale,
+            gemm1_weights=quant_info.w13_weight,
+            gemm1_weights_scale=quant_info.w13_weight_scale,
+            gemm1_bias=quant_info.w13_weight_bias,
+            gemm1_alpha=quant_info.gemm1_alpha,
+            gemm1_beta=quant_info.gemm1_beta,
+            gemm1_clamp_limit=quant_info.gemm1_clamp_limit,
+            gemm2_weights=quant_info.w2_weight,
+            gemm2_weights_scale=quant_info.w2_weight_scale,
+            gemm2_bias=quant_info.w2_weight_bias,
+            output1_scale_scalar=None,
+            output1_scale_gate_scalar=None,
+            output2_scale_scalar=None,
+            num_experts=quant_info.global_num_experts,
+            top_k=routed_top_k,
+            n_group=None,
+            topk_group=None,
+            intermediate_size=quant_info.intermediate_size_per_partition,
+            local_expert_offset=quant_info.local_expert_offset,
+            local_num_experts=quant_info.local_num_experts,
+            routed_scaling_factor=None,
+            routing_method_type=RoutingMethodType.TopK.value,
+            activation_type=get_activation_type(
+                runner_config.activation, is_gated=runner_config.is_gated
+            ),
+            tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
+            output=symm_output,
+            do_finalize=True,
+            enable_pdl=trtllm_moe_enable_pdl(x_quant.shape[0]),
+        )
+        # The kernel writes into the explicit output buffer; return that (same
+        # pointer contract as the situ routed branch above).
+        return StandardCombineInput(hidden_states=symm_output)
+
     if runner_config.activation == "situ":
         from flashinfer import trtllm_fp4_block_scale_moe
         from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe

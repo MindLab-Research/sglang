@@ -693,10 +693,13 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora(
 
     inter = quant_info.intermediate_size_per_partition
 
-    # Path 3: feed the bf16 hidden straight to the op (no python pre-quant); the
-    # op permutes then quantizes internally. Same contract as the NVFP4 sibling.
+    # The gate_up GEMM produces 2*inter (gate + up). NOTE: on the sglang MXFP4
+    # path w13_weight is packed uint8 e2m1 x2 along BOTH dims, so
+    # w13_weight.shape[1] is the *packed* width (inter), not the 2*inter the
+    # activation consumes — sizing the delta by it under-allocates and the VE
+    # shrink kernel writes out of bounds.
     gate_up_delta = hidden_states.new_empty(
-        (hidden_states.shape[0], runner_config.top_k, quant_info.w13_weight.shape[1])
+        (hidden_states.shape[0], runner_config.top_k, 2 * inter)
     )
     merged_experts_fused_moe_lora_add(
         output=gate_up_delta,
