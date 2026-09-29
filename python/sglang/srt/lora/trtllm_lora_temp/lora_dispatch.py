@@ -693,8 +693,8 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora(
 
     inter = quant_info.intermediate_size_per_partition
 
-    # Gated gate_up LoRA delta against the bf16 hidden (path 3 feeds the bf16
-    # hidden straight to the op, which permutes + MXFP8-quantizes internally).
+    # Path 3: feed the bf16 hidden straight to the op (no python pre-quant); the
+    # op permutes then quantizes internally. Same contract as the NVFP4 sibling.
     gate_up_delta = hidden_states.new_empty(
         (hidden_states.shape[0], runner_config.top_k, quant_info.w13_weight.shape[1])
     )
@@ -727,6 +727,16 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora(
         topk_weights=topk_weights,
     )
 
+    # The op indexes the scale buffers as fp8-e4m3, exactly like the NVFP4 LoRA
+    # path — the raw uint8 (e4m3 x2 / ue8m0) buffers must be viewed, not passed
+    # packed, or the GEMM reads out-of-range block scales.
+    def _as_fp8(t: torch.Tensor) -> torch.Tensor:
+        return (
+            t.view(torch.float8_e4m3fn)
+            if t.dtype == torch.uint8
+            else t
+        )
+
     with use_symmetric_memory(
         get_parallel().tp_group, disabled=not is_allocation_symmetric()
     ):
@@ -743,9 +753,9 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora(
         hidden_states=hidden_states,
         hidden_states_scale=None,
         gemm1_weights=quant_info.w13_weight,
-        gemm1_weights_scale=quant_info.w13_weight_scale,
+        gemm1_weights_scale=_as_fp8(quant_info.w13_weight_scale),
         gemm2_weights=quant_info.w2_weight,
-        gemm2_weights_scale=quant_info.w2_weight_scale,
+        gemm2_weights_scale=_as_fp8(quant_info.w2_weight_scale),
         output1_scales_scalar=None,
         output1_scales_gate_scalar=None,
         output2_scales_scalar=None,
