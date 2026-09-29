@@ -755,14 +755,33 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora(
         device=hidden_states.device,
     )
 
-    packed_topk_ids = fused_pack_topk(
-        topk_ids=topk_ids,
-        topk_weights=topk_weights,
+    # Pre-quantize activations to MXFP8 (E4m3), the same prep the non-LoRA
+    # path uses (_fused_experts_flashinfer_mxfp4_sm100_trtllm_gen). The overlay
+    # kernel already supports E4m3 input with a 32-vec scale
+    # (kernel_launcher.cu:2796-2802: scale vec_size==32 -> mDtypeAct=MxE4m3,
+    # no internal FP4 quant), which selects the MxE4m3_MxE2m1 GEMM cubins that
+    # exist. Passing raw bf16 (scale=None) instead would trigger the internal
+    # E2m1 quant path -> E2m1×E2m1 tile-8 GEMM -> "No kernel found" (no such
+    # cubin in the package).
+    from sglang.srt.layers.quantization.mxfp4 import (
+        _prepare_flashinfer_mxfp8_activations,
     )
 
-    # The op indexes the scale buffers as fp8-e4m3, exactly like the NVFP4 LoRA
-    # path — the raw uint8 (e4m3 x2 / ue8m0) buffers must be viewed, not passed
-    # packed, or the GEMM reads out-of-range block scales.
+    x_padded, prepared_packed_topk, x_quant, x_scale = (
+        _prepare_flashinfer_mxfp8_activations(hidden_states, quant_info.hidden_size)
+    )
+
+    # The gate_up VE delta must match the same padded layout the C++ activation
+    # kernel consumes (2 * padded inter). VE writes the unpadded 2*inter_ve
+    # wide slice; F.pad zero-pads it to the padded width (the padded tail has
+    # no LoRA weights — correct by construction).
+
+    packed_topk_ids = (
+        prepared_packed_topk
+        if prepared_packed_topk is not None
+        else fused_pack_topk(topk_ids=topk_ids, topk_weights=topk_weights)
+    )
+
     def _as_fp8(t: torch.Tensor) -> torch.Tensor:
         return (
             t.view(torch.float8_e4m3fn)
@@ -783,8 +802,8 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora(
     output = trtllm_fp4_block_scale_routed_moe_lora(
         topk_ids=packed_topk_ids,
         routing_bias=None,
-        hidden_states=hidden_states,
-        hidden_states_scale=None,
+        hidden_states=x_quant,
+        hidden_states_scale=x_scale,
         gemm1_weights=quant_info.w13_weight,
         gemm1_weights_scale=_as_fp8(quant_info.w13_weight_scale),
         gemm2_weights=quant_info.w2_weight,
