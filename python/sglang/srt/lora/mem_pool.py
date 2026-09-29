@@ -910,7 +910,9 @@ class LoRAMemoryPool:
                 buffer_view.zero_()
             else:
                 assert buffer_view.shape == weight.shape, (
-                    f"LoRA buffer shape {buffer_view.shape} does not match weight shape {weight.shape}."
+                    f"LoRA buffer shape {buffer_view.shape} does not match "
+                    f"weight shape {weight.shape}."
+                    f" [uid={uid} name={name} layer={layer_id}]"
                 )
                 copy_weight_into_buffer(buffer_view, weight)
 
@@ -1226,6 +1228,22 @@ class LoRAMemoryPool:
                             expected_shape = target_buffer[
                                 buffer_id, 0, : lora_rank * c, :
                             ].shape
+                            if representative_weight.shape != expected_shape:
+                                logger.warning(
+                                    "SHAPE-DBG uid=%s layer=%s name=%s "
+                                    "weights_type=%s weights_shape=%s rep_shape=%s "
+                                    "expected=%s shared_outer=%s c=%s rank=%s",
+                                    uid,
+                                    layer_id,
+                                    name,
+                                    type(weights).__name__,
+                                    getattr(weights, "shape", None),
+                                    tuple(representative_weight.shape),
+                                    tuple(expected_shape),
+                                    self.experts_shared_outer_loras,
+                                    c,
+                                    lora_rank,
+                                )
                             assert representative_weight.shape == expected_shape, (
                                 f"LoRA buffer shape {expected_shape} does not match "
                                 f"weight shape {representative_weight.shape}."

@@ -503,12 +503,18 @@ class LoRAAdapter(nn.Module):
             elif "gate_up_proj" in weight_name:
                 # If gate_up_proj is already stacked, we normalize it following the SGL convention
                 gate_up_name = weight_name
-                if "lora_A" in weight_name:
-                    ndim = weights[gate_up_name].dim()
-                    repeat_dims = [1] * ndim
-                    repeat_dims[ndim - 2] = 2
-                    weights[gate_up_name] = weights[gate_up_name].repeat(*repeat_dims)
-                # else: no-op as LoRA B weight is already stacked.
+                if "lora_A" in weight_name and weights[gate_up_name].dim() == 2:
+                    # Only a 2-D PEFT A ([r, hidden]) needs the synthetic
+                    # up-half repeat to reach the c=2 buffer width. A 3-D
+                    # tensor here is a shared-outer MoE weight that is ALREADY
+                    # stored stacked ([1, 2r, hidden], per the mem_pool
+                    # contract) — repeating it would double the rank dim and
+                    # fail the buffer shape check at load time (observed as
+                    # [1, 32, 5120] -> [1, 64, 5120] on DeepSeek-V4.1).
+                    w = weights[gate_up_name]
+                    weights[gate_up_name] = torch.cat((w, w), dim=0)
+                # else: no-op — 3-D shared-outer MoE A is pre-stacked; LoRA B
+                # (any dim) is already stacked per the SGL convention.
         # Orphan up_proj weights (no matching gate_proj) are kept as-is.
         # Models with non-gated MLP/shared-experts declare up_proj in
         # supported_lora_modules so they get their own buffer and wrapping.
