@@ -570,6 +570,14 @@ class LoRAMemoryPool:
             if self.experts_shared_outer_loras and module_name in (
                 "down_proj_moe",
                 "down_proj_shared_moe",
+                # DeepSeek-V4.1: gate_up B shared too. The adapters ship B as
+                # 3-D [1, N, r] (shared) like A, and a per-expert B here would
+                # explode the buffer to [max_loras, n_routed=384, N, r]
+                # (~450MB/layer/rank) and the expand routing to
+                # 384*max_loras virtual buckets >= 1024, whose
+                # _align_block_size_large JIT kernel faults.
+                "gate_up_proj_moe",
+                "gate_up_proj_shared_moe",
             ):
                 expert_dim = 1
             return (self.max_loras_per_batch, expert_dim, output_dim, max_lora_dim)
@@ -1328,6 +1336,12 @@ class LoRAMemoryPool:
                     if self.experts_shared_outer_loras and name in (
                         "down_proj_moe",
                         "down_proj_shared_moe",
+                        # gate_up B is shared too on DeepSeek-V4.1 (see
+                        # get_lora_B_shape): the adapters ship it 3-D [1, N, r],
+                        # so load it through the shared slot instead of the
+                        # per-expert dict path.
+                        "gate_up_proj_moe",
+                        "gate_up_proj_shared_moe",
                     ):
                         if weights is None or (
                             isinstance(weights, dict) and not weights

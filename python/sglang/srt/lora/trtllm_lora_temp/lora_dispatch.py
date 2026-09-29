@@ -542,7 +542,12 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp4_lora(
         token_lora_mapping=token_lora_mapping,
         mul_routed_weight=False,
         experts_shared_outer_loras_a=lora_info.experts_shared_outer_loras,
-        experts_shared_outer_loras_b=False,
+        # V4.1 ships gate_up B shared too (3-D [1, N, r], same as A): a
+        # per-expert B would explode the expand routing to
+        # n_routed(384) * max_loras virtual buckets (>=1024 →
+        # _align_block_size_large, whose JIT kernel faults) and the B buffer
+        # to ~450MB/layer/rank.
+        experts_shared_outer_loras_b=lora_info.experts_shared_outer_loras,
         routing_cache=fused_lora_routing_cache,
         fuse_add_to_output=False,
         use_direct_expand_add=lora_info.max_lora_rank <= 64,
