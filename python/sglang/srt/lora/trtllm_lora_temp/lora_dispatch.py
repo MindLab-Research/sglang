@@ -688,18 +688,24 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora(
     )
     assert runner_config.top_k is not None
 
-    # No active LoRA in a non-capture decode -> plain (fast) MXFP4 path.
-    if not get_is_capture_mode() and not lora_info.has_active_lora:
-        return _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
-            dispatch_output, quant_info, runner_config
-        )
-
+    # PASS-THROUGH PRECISION (zero-LoRA == base): no-adapter requests take the
+    # SAME decomposed pipeline with zero deltas. The previous early-return to
+    # the stock fused kernel made "zero adapter == base" structurally
+    # impossible — the fused kernel's fp32 GEMM1 epilogue never materializes
+    # the gate_up output, while the decomposed Gemm2::Runner writes bf16, so
+    # every layer rounded differently and the greedy stream diverged. With
+    # both sides on the decomposed path, a zero-weight adapter's VE delta
+    # (exactly 0.0) and a pass-through's zero delta are bit-identical into the
+    # activation's x + 0.0 -> x.
+    has_active_lora = lora_info.has_active_lora
     topk_ids = topk_output.topk_ids
     topk_weights = topk_output.topk_weights
     use_virtual_lora_store = bool(
         lora_info.lora_use_virtual_experts and lora_info.max_lora_rank > 0
     )
-    assert use_virtual_lora_store, "MXFP4 trtllm LoRA requires virtual-experts."
+    assert not has_active_lora or use_virtual_lora_store, (
+        "MXFP4 trtllm LoRA with an active adapter requires virtual-experts."
+    )
     token_lora_mapping = lora_info.token_lora_mapping
     fused_lora_routing_cache: dict = {}
 
@@ -724,23 +730,28 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora(
     gate_up_delta_ve = hidden_states.new_empty(
         (hidden_states.shape[0], runner_config.top_k, 2 * _inter_ve)
     )
-    merged_experts_fused_moe_lora_add(
-        output=gate_up_delta_ve,
-        hidden_states=hidden_states,
-        lora_a=lora_info.gate_up_lora_a_weights,
-        lora_b=lora_info.gate_up_lora_b_weights,
-        topk_ids=topk_ids,
-        topk_weights=topk_weights,
-        token_lora_mapping=token_lora_mapping,
-        mul_routed_weight=False,
-        experts_shared_outer_loras_a=lora_info.experts_shared_outer_loras,
-        experts_shared_outer_loras_b=lora_info.experts_shared_outer_loras,
-        routing_cache=fused_lora_routing_cache,
-        fuse_add_to_output=False,
-        use_direct_expand_add=lora_info.max_lora_rank <= 64,
-        local_expert_offset=quant_info.local_expert_offset,
-        local_num_experts=quant_info.local_num_experts,
-    )
+    if has_active_lora:
+        merged_experts_fused_moe_lora_add(
+            output=gate_up_delta_ve,
+            hidden_states=hidden_states,
+            lora_a=lora_info.gate_up_lora_a_weights,
+            lora_b=lora_info.gate_up_lora_b_weights,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            token_lora_mapping=token_lora_mapping,
+            mul_routed_weight=False,
+            experts_shared_outer_loras_a=lora_info.experts_shared_outer_loras,
+            experts_shared_outer_loras_b=lora_info.experts_shared_outer_loras,
+            routing_cache=fused_lora_routing_cache,
+            fuse_add_to_output=False,
+            use_direct_expand_add=lora_info.max_lora_rank <= 64,
+            local_expert_offset=quant_info.local_expert_offset,
+            local_num_experts=quant_info.local_num_experts,
+        )
+    else:
+        # Pass-through: zero delta — bit-identical to a zero-weight adapter's
+        # VE output (0.0 into the activation's x + 0.0 -> x).
+        gate_up_delta_ve.zero_()
     gate_up_delta = (
         torch.nn.functional.pad(
             gate_up_delta_ve, (0, 2 * _inter - 2 * _inter_ve)
@@ -842,26 +853,28 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora(
     # activation_lora_input; the down A buffer is UNPADDED (576) wide, so read
     # the first 576 columns (the padded tail has no LoRA weights). The slice
     # must be contiguous for the VE kernel's stride assumptions.
-    merged_experts_fused_moe_lora_add(
-        output=output,
-        hidden_states=(
-            activation_lora_input[..., :_inter_ve]
-            if _inter > _inter_ve
-            else activation_lora_input
-        ).contiguous().view(-1, min(_inter, _inter_ve)),
-        lora_a=lora_info.down_lora_a_weights,
-        lora_b=lora_info.down_lora_b_weights,
-        topk_ids=topk_ids,
-        topk_weights=topk_weights,
-        token_lora_mapping=token_lora_mapping,
-        mul_routed_weight=True,
-        experts_shared_outer_loras_a=lora_info.experts_shared_outer_loras,
-        experts_shared_outer_loras_b=lora_info.experts_shared_outer_loras,
-        routing_cache=fused_lora_routing_cache,
-        fuse_add_to_output=False,
-        fuse_sum_all_reduce=True,
-        use_direct_expand_add=lora_info.max_lora_rank <= 64,
-        local_expert_offset=quant_info.local_expert_offset,
-        local_num_experts=quant_info.local_num_experts,
-    )
+    if has_active_lora:
+        merged_experts_fused_moe_lora_add(
+            output=output,
+            hidden_states=(
+                activation_lora_input[..., :_inter_ve]
+                if _inter > _inter_ve
+                else activation_lora_input
+            ).contiguous().view(-1, min(_inter, _inter_ve)),
+            lora_a=lora_info.down_lora_a_weights,
+            lora_b=lora_info.down_lora_b_weights,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            token_lora_mapping=token_lora_mapping,
+            mul_routed_weight=True,
+            experts_shared_outer_loras_a=lora_info.experts_shared_outer_loras,
+            experts_shared_outer_loras_b=lora_info.experts_shared_outer_loras,
+            routing_cache=fused_lora_routing_cache,
+            fuse_add_to_output=False,
+            fuse_sum_all_reduce=True,
+            use_direct_expand_add=lora_info.max_lora_rank <= 64,
+            local_expert_offset=quant_info.local_expert_offset,
+            local_num_experts=quant_info.local_num_experts,
+        )
+    # else: pass-through — the down VE delta is zero, nothing to merge.
     return StandardCombineInput(hidden_states=output)

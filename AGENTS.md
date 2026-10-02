@@ -10,7 +10,7 @@ Base: upstream `main` 81f27fb3a7 (+ fork increments ported in). Branch
 | DSV4.1 inference (MXFP4 experts, SM100 trtllm-gen) | verified | stock upstream path |
 | attention LoRA (q_proj/…) | verified | upstream `chunked` backend |
 | `kv_shared` LoRA (adapter shares the base radix namespace) | verified | `lora_config.lora_kv_shared`, `lora_manager.is_lora_kv_shared`, `scheduler.resolve_lora_kv_shared` |
-| MoE LoRA on the FP4/trtllm-gen fused path | implemented, under test | `trtllm_lora_temp/`, `experimental_sgl_trtllm` backend |
+| MoE LoRA on the FP4/trtllm-gen fused path | verified (zero==base bitwise; random-adapter dynamic load) | `trtllm_lora_temp/`, `experimental_sgl_trtllm` backend |
 
 ## 1101 layout
 
@@ -102,6 +102,38 @@ Non-obvious things that broke (each cost a 30-min reload to find):
    non-LoRA path) and feed `Gemm2::Runner(MxE4m3, MxE2m1, BF16)` — the
    `Bmm_MxE4m3_MxE2m1*` cubins exist. The overlay now branches on input
    dtype; the pad/unpad intermediate bridge lives in the dispatch.
+
+14. **Zero-LoRA == base requires pass-through unification.** The old
+    lora_dispatch early-returned no-adapter requests to the stock fused
+    kernel (`_fused_experts_flashinfer_mxfp4_sm100_trtllm_gen`) — the fused
+    kernel's fp32 GEMM1 epilogue never materializes the gate_up output while
+    the decomposed Gemm2::Runner writes bf16, so every layer rounded
+    differently and greedy decoding always diverged (structurally impossible
+    to pass). The dispatch now routes no-adapter requests through the SAME
+    decomposed pipeline with a zero delta (VE calls gated on
+    `has_active_lora`; pass-through `zero_()`'s the delta buffer): a
+    zero-weight adapter's VE delta (exactly 0.0) and a pass-through zero are
+    bit-identical into x + 0.0 -> x, so zero==base is now BITWISE. Zero
+    measurable perf cost (149 vs 147 tok/s single-request decode).
+15. **The E4m3 activation quant must run through the fused kernel**
+    (`fused_activation_mxfp8_quant.cuh`). The unfused chain materialized the
+    activated row as bf16 before invokeMxFP8Quantization — one extra RN
+    rounding whose perturbation shifts each 32-block amax and flips UE8M0
+    exponents at the PosInf rounding boundaries. The fused kernel replicates
+    `gatedSiluScalars` element-for-element but quantizes straight from fp32
+    registers with the exact `cvt_warp_fp16_to_mxfp8` recipe (fp32 amax,
+    `__nv_cvt_float_to_e8m0` PosInf, +/-448 saturate, RN E4m3, swizzled SF
+    via `get_sf_out_offset_128x4/8x4`). Beware:
+    `__nv_cvt_float_to_fp8` returns a raw storage byte — construct via
+    `__nv_cvt_float2_to_fp8x2` like the stock kernel or it won't compile.
+16. **UE8M0 activation scales need the dedicated gather+swizzle kernel.**
+    `moe::dev::permute`'s only scale path (useDeepSeekFp8) indexes a FP32
+    128-block LINEAR layout (idx = token + numTokens*(hidden/128)); feeding
+    it the UE8M0 32-block tensor reads OOB and scatters garbage into the SF
+    buffer — the gate_up GEMM then scales by noise (output was tokenizer
+    garbage). Use `sgl_gather_swizzle_ue8m0_sf` (R128c4/R8c4 — same formulas
+    as dev_kernel getSfOffset / get_sf_out_offset_*) and permute the E4m3
+    data with useDeepSeekFp8=false.
 
 ## Verification recipes
 

@@ -19,6 +19,7 @@
 #include "flashinfer/trtllm/fused_moe/RoutingKernel.h"
 #include "flashinfer/trtllm/fused_moe/runner.h"
 #include "fused_activation_quant.cuh"
+#include "fused_activation_mxfp8_quant.cuh" // fused act+MXFP8-quant (E4m3 path precision fix)
 #include "fused_permute_quant.cuh" // fused permute+nvfp4-quant (gate_up de-pad), used by bench_fused_permute_quant
 #include "nv_internal/tensorrt_llm/kernels/quantization.h"
 #include "nv_internal/tensorrt_llm/thop/utils.h"
@@ -3358,7 +3359,45 @@ public:
     static int const actOptMode =
         envFlag("SGLANG_OPT_FUSED_MOE_ACTIVATION_VEC") ? 1 : 0;
 
-    if (!is_e4m3_input && fuseActQuant && inter / 16 <= 512) {
+    if (is_e4m3_input) {
+      // PRECISION (zero-LoRA == base): fused gated-SwiGLU (+ LoRA delta) +
+      // MXFP8 quant in ONE kernel. The old unfused chain materialized the
+      // activated row as bf16 (activation -> activated_bf16 ->
+      // invokeMxFP8Quantization) — one extra RN rounding the fused kernel's
+      // GEMM1 epilogue never performs; the bf16 perturbation shifts each
+      // 32-block amax and flips UE8M0 exponents at the PosInf rounding
+      // boundaries — the dominant residual noise vs base. The fused kernel
+      // keeps the act values in fp32 registers and quantizes directly with
+      // the exact cvt_warp_fp16_to_mxfp8 recipe (fp32 amax, UE8M0 PosInf,
+      // +/-448 saturate, RN E4m3, swizzled SF). Padding rows skip the quant
+      // outputs (never read into a valid output).
+      TVM_FFI_ICHECK(inter % 32 == 0 && inter / 32 <= 128)
+          << "fused act+mxfp8 quant requires inter%32==0 and inter/32<=128, "
+             "got inter="
+          << inter;
+      flashinfer::sgl_fused_act_mxfp8_quant::launchFusedActMxfp8Quant(
+          static_cast<int>(num_tokens * top_k), static_cast<int>(inter),
+          static_cast<int>(gate_up_n),
+          reinterpret_cast<__nv_bfloat16 const *>(gate_up_bf16.data_ptr()),
+          reinterpret_cast<__nv_bfloat16 const *>(
+              gate_up_lora_delta_.data_ptr()),
+          reinterpret_cast<__nv_bfloat16 *>(activation_lora_input_.data_ptr()),
+          static_cast<int32_t const *>(
+              expanded_idx_to_permuted_idx.data_ptr()),
+          gemm1_alpha_.has_value()
+              ? static_cast<float const *>(gemm1_alpha_.value().data_ptr())
+              : nullptr,
+          gemm1_beta_.has_value()
+              ? static_cast<float const *>(gemm1_beta_.value().data_ptr())
+              : nullptr,
+          gemm1_clamp_limit_.has_value()
+              ? static_cast<float const *>(
+                    gemm1_clamp_limit_.value().data_ptr())
+              : nullptr,
+          reinterpret_cast<uint8_t *>(act_fp8.data_ptr()),
+          reinterpret_cast<uint8_t *>(act_fp8_sf.data_ptr()), sfLayout,
+          stream);
+    } else if (fuseActQuant && inter / 16 <= 512) {
       // Fused: gate_up (interleaved) + lora_delta -> act_fp4/sf/per_token +
       // activation_lora_input, without materializing activated_bf16. >512 SF
       // vecs/row falls to the unfused chain below.
@@ -3376,16 +3415,6 @@ public:
     } else {
       Tensor activated_bf16 =
           alloc_tensor({max_num_padded_tokens, inter}, dl_bfloat16, device);
-      if (is_e4m3_input) {
-        // invokeMxFP8Quantization has no expanded->permuted row map (it
-        // quantizes the whole [m, n] buffer), and the activation kernel
-        // leaves padding rows UNINITIALIZED — zero the buffer FIRST so the
-        // quantizer's 32-block amax sees 0 (not NaN from garbage memory) on
-        // padding rows. Activation overwrites the valid rows right after.
-        cudaMemsetAsync(
-            activated_bf16.data_ptr(), 0,
-            static_cast<size_t>(max_num_padded_tokens) * inter * 2, stream);
-      }
       {
         moe::dev::activation::Data actData;
         actData.mDtypeElt = btg::Dtype::Bfloat16;
@@ -3400,10 +3429,8 @@ public:
             gate_up_lora_delta_.data_ptr());
         actData.activationLoraInputOutPtr = static_cast<cutlass::bfloat16_t *>(
             activation_lora_input_.data_ptr());
-        // Gated-SwiGLU scalar controls (OAI/GPT-OSS triple). MUST match what
-        // the non-LoRA fused path applies — V4.1 passes gemm1_clamp_limit
-        // (swiglu clamp) with alpha/beta=None; dropping them silently changed
-        // the activation and broke zero-LoRA == base parity.
+        // Gated-SwiGLU scalar controls (OAI/GPT-OSS triple) — must match what
+        // the non-LoRA fused path applies.
         actData.gatedActAlphaPtr =
             gemm1_alpha_.has_value()
                 ? static_cast<float const *>(gemm1_alpha_.value().data_ptr())
@@ -3427,35 +3454,18 @@ public:
         actData.actOptMode = actOptMode;
         moe::dev::activation::run(actData, stream);
       }
-      if (is_e4m3_input) {
-        // quant#2 (MXFP8): E4m3 + UE8M0 32-vec swizzled SF via the stock
-        // trtllm-gen kernel (quantization.cu invokeMxFP8Quantization). The
-        // output is the exact A-side format Gemm2::Runner(MxE4m3, MxE2m1)
-        // expects — same as the non-LoRA fused path's internal quantize.
-        int numSms = 0;
-        cudaDeviceGetAttribute(&numSms, cudaDevAttrMultiProcessorCount,
-                               dev_id);
-        tensorrt_llm::kernels::invokeMxFP8Quantization<__nv_bfloat16>(
-            /*b=*/1, static_cast<int>(max_num_padded_tokens),
-            static_cast<int>(inter), static_cast<int>(inter),
-            reinterpret_cast<__nv_bfloat16 const *>(activated_bf16.data_ptr()),
-            reinterpret_cast<int64_t *>(act_fp8.data_ptr()),
-            reinterpret_cast<int32_t *>(act_fp8_sf.data_ptr()), sfLayout,
-            numSms, /*enable_pdl=*/false, stream);
-      } else {
-        // quant#2 (NvFP4): m = num_tokens*top_k + the expanded->permuted map
-        // so only valid (non-padding) permuted rows are quantized (padding
-        // rows of activated_bf16 are left uninitialized).
-        tensorrt_llm::kernels::invokeNvfp4QuantAndPerTokenScale<__nv_bfloat16>(
-            num_tokens * top_k, inter,
-            reinterpret_cast<__nv_bfloat16 const *>(activated_bf16.data_ptr()),
-            globalScaleInv,
-            static_cast<int *>(expanded_idx_to_permuted_idx.data_ptr()),
-            reinterpret_cast<uint8_t *>(act_fp4.data_ptr()),
-            reinterpret_cast<uint8_t *>(act_fp4_sf.data_ptr()),
-            reinterpret_cast<float *>(act_per_token_sf.data_ptr()), sfLayout,
-            stream);
-      }
+      // quant#2 (NvFP4): m = num_tokens*top_k + the expanded->permuted map
+      // so only valid (non-padding) permuted rows are quantized (padding
+      // rows of activated_bf16 are left uninitialized).
+      tensorrt_llm::kernels::invokeNvfp4QuantAndPerTokenScale<__nv_bfloat16>(
+          num_tokens * top_k, inter,
+          reinterpret_cast<__nv_bfloat16 const *>(activated_bf16.data_ptr()),
+          globalScaleInv,
+          static_cast<int *>(expanded_idx_to_permuted_idx.data_ptr()),
+          reinterpret_cast<uint8_t *>(act_fp4.data_ptr()),
+          reinterpret_cast<uint8_t *>(act_fp4_sf.data_ptr()),
+          reinterpret_cast<float *>(act_per_token_sf.data_ptr()), sfLayout,
+          stream);
     }
 
     // ---- 8) down GEMM: Gemm2::Runner(E2m1,E2m1,bf16, K=inter, N=hidden) ----
