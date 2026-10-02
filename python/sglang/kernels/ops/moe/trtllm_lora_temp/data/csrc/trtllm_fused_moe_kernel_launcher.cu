@@ -2184,6 +2184,72 @@ public:
   }
 };
 
+// ===========================================================================
+// UE8M0 32-block scale gather + swizzle (E4m3/MXFP8 LoRA path). The dispatch
+// pre-quantizes the activations with the SAME per_token_group_quant(32, UE8M0)
+// the non-LoRA fused kernel consumes — passing those exact bytes through is
+// what makes zero-LoRA == base numerical parity hold. The generic
+// moe::dev::permute cannot gather this scale: its only scale path
+// (useDeepSeekFp8) indexes a FP32 128-block LINEAR layout
+// (idx = token + numTokens * (hidden/128)); feeding it the UE8M0 tensor reads
+// out-of-bounds and scatters noise into the SF buffer — the gate_up GEMM then
+// scales activations by garbage. This kernel gathers the scale rows by the
+// expanded->permuted index map and writes them in the swizzled SF layout the
+// MxE4m3 x MxE2m1 Gemm2::Runner reads: R128c4 (SWIZZLED_128x4) for
+// tile >= 128, R8c4 (SWIZZLED_8x4) below — byte-for-byte the layouts
+// dev_kernel.cu's getSfOffset defines and invokeMxFP8Quantization emits (the
+// layout the down GEMM already consumes). Padding rows of out_sf stay
+// UNwritten (any byte is a valid UE8M0 exponent; padding rows never reach a
+// valid output — same precedent as the bf16 permute).
+// ===========================================================================
+__global__ void sgl_gather_swizzle_ue8m0_sf_kernel(
+    uint8_t const *__restrict__ in_sf, uint8_t *__restrict__ out_sf,
+    int32_t const *__restrict__ expanded_idx_to_permuted_idx, int num_tokens,
+    int top_k, int num_blks, bool tile_ge_128) {
+  for (int tokenIdx = blockIdx.y; tokenIdx < num_tokens;
+       tokenIdx += gridDim.y) {
+    for (int blkIdx = threadIdx.x + blockDim.x * blockIdx.x; blkIdx < num_blks;
+         blkIdx += blockDim.x * gridDim.x) {
+      uint8_t const sf = in_sf[tokenIdx * num_blks + blkIdx];
+      for (int k = 0; k < top_k; ++k) {
+        int const permutedIdx =
+            expanded_idx_to_permuted_idx[tokenIdx * top_k + k];
+        if (permutedIdx < 0) {
+          continue;
+        }
+        int64_t offset;
+        if (tile_ge_128) {
+          // R128c4 — mirrors dev_kernel.cu dev::getSfOffset.
+          int64_t const sfBlkIdx =
+              (int64_t)(permutedIdx / 128) * (num_blks / 4) + blkIdx / 4;
+          int64_t const sfRowIdx =
+              (int64_t)(permutedIdx % 32) * 4 + (permutedIdx % 128) / 32;
+          offset = sfBlkIdx * 512 + sfRowIdx * 4 + blkIdx % 4;
+        } else {
+          // R8c4.
+          int64_t const sfBlkIdx =
+              (int64_t)(permutedIdx / 8) * (num_blks / 4) + blkIdx / 4;
+          offset = sfBlkIdx * 32 + (permutedIdx % 8) * 4 + blkIdx % 4;
+        }
+        out_sf[offset] = sf;
+      }
+    }
+  }
+}
+
+static void sgl_gather_swizzle_ue8m0_sf(uint8_t const *in_sf, uint8_t *out_sf,
+                                        int32_t const *idx_map, int num_tokens,
+                                        int top_k, int num_blks,
+                                        bool tile_ge_128,
+                                        cudaStream_t stream) {
+  dim3 const grid((num_blks + 127) / 128,
+                  std::min<int>(8192, std::max<int>(1, num_tokens)));
+  sgl_gather_swizzle_ue8m0_sf_kernel<<<grid, 128, 0, stream>>>(
+      in_sf, out_sf, idx_map, num_tokens, top_k, num_blks, tile_ge_128);
+  auto err = cudaGetLastError();
+  FLASHINFER_CHECK(err == cudaSuccess, cudaGetErrorString(err));
+}
+
 Array<Tensor> trtllm_bf16_moe(
     Optional<TensorView> const &routing_logits,
     Optional<TensorView> const &routing_bias, TensorView const &expert_indices,
@@ -2915,6 +2981,9 @@ public:
       Optional<TensorView> const &output1_scales_scalar,
       Optional<TensorView> const &output1_scales_gate_scalar,
       Optional<TensorView> const &output2_scales_scalar,
+      Optional<TensorView> const &gemm1_alpha,
+      Optional<TensorView> const &gemm1_beta,
+      Optional<TensorView> const &gemm1_clamp_limit,
       TensorView const &gate_up_lora_delta,
       TensorView const &activation_lora_input, TensorView const &output,
       int64_t lora_ready_event, int64_t gemm2_done_event)
@@ -2928,6 +2997,8 @@ public:
         output1_scales_scalar_(output1_scales_scalar),
         output1_scales_gate_scalar_(output1_scales_gate_scalar),
         output2_scales_scalar_(output2_scales_scalar),
+        gemm1_alpha_(gemm1_alpha), gemm1_beta_(gemm1_beta),
+        gemm1_clamp_limit_(gemm1_clamp_limit),
         gate_up_lora_delta_(gate_up_lora_delta),
         activation_lora_input_(activation_lora_input), output_(output),
         lora_ready_event_(lora_ready_event),
@@ -3046,29 +3117,27 @@ public:
     Tensor permuted_e4m3;
     Tensor permuted_e4m3_sf;
     if (is_e4m3_input) {
-      // ---- E4m3 (MXFP8) path: dispatch pre-quantized; just permute
-      // (gather) the E4m3 bytes and block scales. No NvFP4 quant needed —
-      // the MxE4m3 GEMM consumes E4m3 + 32-vec scale directly (matching
-      // cubins exist as Bmm_MxE4m3_MxE2m1*).
+      // ---- E4m3 (MXFP8) path: dispatch pre-quantized; permute (gather) the
+      // E4m3 bytes, then gather + swizzle the LINEAR UE8M0 scale into the
+      // R128c4/R8c4 SF layout the MxE4m3 x MxE2m1 Gemm2::Runner reads. The
+      // generic permute's scale path is FP32-128-block-Linear only
+      // (useDeepSeekFp8) — unusable for UE8M0 (OOB reads + garbage scatter,
+      // which made every LoRA request diverge from base), hence the dedicated
+      // sgl_gather_swizzle_ue8m0_sf below.
       int64_t const sf_size_e4m3 = tensorrt_llm::computeSwizzledLayoutSFSize(
           max_num_padded_tokens, hidden_size / 32);
       permuted_e4m3 = alloc_tensor({max_num_padded_tokens, hidden_size},
                                    dl_float8_e4m3fn, device);
-      permuted_e4m3_sf =
-          alloc_tensor({sf_size_e4m3}, dl_float8_e4m3fn, device);
+      permuted_e4m3_sf = alloc_tensor({sf_size_e4m3}, dl_uint8, device);
       {
         moe::dev::permute::Data permData;
         permData.mDtypeElt = btg::Dtype::E4m3;
         permData.mUsePdl = false;
-        permData.mUseDeepSeekFp8 = true;
+        permData.mUseDeepSeekFp8 = false;
         permData.inPtr = hidden_bf16_ptr;
         permData.outPtr = permuted_e4m3.data_ptr();
-        permData.inDqSfsPtr = static_cast<float*>(
-            hidden_states_scale_.has_value()
-                ? hidden_states_scale_.value().data_ptr()
-                : nullptr);
-        permData.outDqSfsPtr =
-            static_cast<float*>(permuted_e4m3_sf.data_ptr());
+        permData.inDqSfsPtr = nullptr;
+        permData.outDqSfsPtr = nullptr;
         permData.expandedIdxToPermutedIdx =
             static_cast<int *>(expanded_idx_to_permuted_idx.data_ptr());
         permData.hiddenDim = hidden_size;
@@ -3077,6 +3146,14 @@ public:
         permData.totalNumPaddedTokens =
             static_cast<int *>(total_num_padded_tokens.data_ptr());
         moe::dev::permute::run(permData, stream);
+        sgl_gather_swizzle_ue8m0_sf(
+            static_cast<uint8_t const *>(
+                hidden_states_scale_.value().data_ptr()),
+            static_cast<uint8_t *>(permuted_e4m3_sf.data_ptr()),
+            static_cast<int32_t const *>(
+                expanded_idx_to_permuted_idx.data_ptr()),
+            static_cast<int>(num_tokens), static_cast<int>(top_k),
+            static_cast<int>(hidden_size / 32), tile >= 128, stream);
       }
     } else {
     int64_t const hidden_sf_size = tensorrt_llm::computeSwizzledLayoutSFSize(
@@ -3323,6 +3400,23 @@ public:
             gate_up_lora_delta_.data_ptr());
         actData.activationLoraInputOutPtr = static_cast<cutlass::bfloat16_t *>(
             activation_lora_input_.data_ptr());
+        // Gated-SwiGLU scalar controls (OAI/GPT-OSS triple). MUST match what
+        // the non-LoRA fused path applies — V4.1 passes gemm1_clamp_limit
+        // (swiglu clamp) with alpha/beta=None; dropping them silently changed
+        // the activation and broke zero-LoRA == base parity.
+        actData.gatedActAlphaPtr =
+            gemm1_alpha_.has_value()
+                ? static_cast<float const *>(gemm1_alpha_.value().data_ptr())
+                : nullptr;
+        actData.gatedActBetaPtr =
+            gemm1_beta_.has_value()
+                ? static_cast<float const *>(gemm1_beta_.value().data_ptr())
+                : nullptr;
+        actData.gatedActClampLimitPtr =
+            gemm1_clamp_limit_.has_value()
+                ? static_cast<float const *>(
+                      gemm1_clamp_limit_.value().data_ptr())
+                : nullptr;
         actData.innerDim = gate_up_n;
         actData.numTokens = num_tokens;
         actData.topK = top_k;
@@ -3467,6 +3561,9 @@ private:
   Optional<TensorView> output1_scales_scalar_;
   Optional<TensorView> output1_scales_gate_scalar_;
   Optional<TensorView> output2_scales_scalar_;
+  Optional<TensorView> gemm1_alpha_;
+  Optional<TensorView> gemm1_beta_;
+  Optional<TensorView> gemm1_clamp_limit_;
   TensorView gate_up_lora_delta_;
   TensorView activation_lora_input_;
   TensorView output_;
@@ -3501,9 +3598,6 @@ Array<Tensor> sgl_trtllm_fp4_block_scale_moe_lora(
          "(SwiGLU) activation only.";
   (void)routing_logits;
   (void)gemm1_bias;
-  (void)gemm1_alpha;
-  (void)gemm1_beta;
-  (void)gemm1_clamp_limit;
   (void)gemm2_bias;
   (void)per_token_scales;
   (void)n_group;
@@ -3548,7 +3642,8 @@ Array<Tensor> sgl_trtllm_fp4_block_scale_moe_lora(
       expert_indices, expert_weights, routing_bias, hidden_states,
       hidden_states_scale, gemm1_weights, gemm1_weights_scale, gemm2_weights,
       gemm2_weights_scale, output1_scales_scalar, output1_scales_gate_scalar,
-      output2_scales_scalar, gate_up_lora_delta, activation_lora_input, output,
+      output2_scales_scalar, gemm1_alpha, gemm1_beta, gemm1_clamp_limit,
+      gate_up_lora_delta, activation_lora_input, output,
       lora_ready_event, gemm2_done_event);
   return launcher.run(num_experts, top_k, intermediate_size,
                       local_expert_offset, local_num_experts,
