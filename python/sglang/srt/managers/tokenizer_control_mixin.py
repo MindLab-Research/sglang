@@ -681,8 +681,15 @@ class TokenizerControlMixin:
                         "Retry the unload before loading it again."
                     )
 
-                # Generate new uniquely identifiable LoRARef object.
+                # PD disaggregation: each node's tokenizer manager parses
+                # /load_lora_adapter independently; a uuid4 default would
+                # mint a DIFFERENT id per node for the same adapter, and the
+                # request's P-side id then fails the D-side lookup (falls back
+                # to base). Use the deterministic uuid5 id so both sides
+                # agree (same rationale as --lora-paths, see
+                # LoRARef.deterministic_id).
                 new_adapter = LoRARef(
+                    lora_id=LoRARef.deterministic_id(obj.lora_name, obj.lora_path),
                     lora_name=obj.lora_name,
                     lora_path=obj.lora_path,
                     pinned=obj.pinned,
@@ -770,7 +777,10 @@ class TokenizerControlMixin:
                         "Retry the unload before loading it again."
                     )
 
+                # PD disaggregation: deterministic id, same rationale as the
+                # path-based load above (both sides must agree on the id).
                 new_adapter = LoRARef(
+                    lora_id=LoRARef.deterministic_id(obj.lora_name, "__tensor__"),
                     lora_name=obj.lora_name,
                     lora_path="__tensor__",
                     pinned=obj.pinned,
