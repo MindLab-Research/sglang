@@ -78,6 +78,16 @@ def _cgroup_memory_headroom(proc_root: Path = Path("/proc")) -> int | None:
                 # Do not silently ignore an unreadable usage file for a known
                 # limit: falling back to host RAM could overrun the container.
                 usage = int((directory / usage_name).read_text())
+                # cgroup usage includes reclaimable page cache; charge only the
+                # non-reclaimable share (usage - total_inactive_file) against
+                # the limit, mirroring MemAvailable's treatment of file cache.
+                try:
+                    for line in (directory / "memory.stat").read_text().splitlines():
+                        if line.startswith("total_inactive_file "):
+                            usage = max(0, usage - int(line.split()[1]))
+                            break
+                except FileNotFoundError:
+                    pass
                 remaining = max(0, limit - usage)
                 headroom = remaining if headroom is None else min(headroom, remaining)
             if directory == mount:
