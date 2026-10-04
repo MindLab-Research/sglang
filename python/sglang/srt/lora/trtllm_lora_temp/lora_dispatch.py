@@ -84,6 +84,36 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora(
     assert TopKOutputChecker.format_is_standard(topk_output)
     assert runner_config.top_k is not None
 
+    # REAL FIX — routed scaling on the decomposed (packed-topk) kernel path.
+    # The vendored trtllm_fused_moe_runner.cu sets routingData.mRouteScale only
+    # in the DeepSeekV3 (logits) routing branches; the TopK-only branch used
+    # by every packed-topk call with pre-materialized ids never assigns it, so
+    # routed_scaling_factor is silently ignored on this path. A/B on the
+    # GLM-5.3 fp8 build of the same kernel family measured the decomposed
+    # output at exactly 1/routed_scaling_factor of stock (0.400x for factor
+    # 2.5); for DeepSeek-V4.1-Flash (factor 1.5) every MoE layer would
+    # contribute 0.667x of stock, compounding per layer/chunk over long
+    # prefills. Applying the factor on the materialized weights here is
+    # mathematically identical (sum((s*w_i)*y_i) == s*sum(w_i*y_i)) and covers
+    # the pass-through, the decode-graph capture and the adapter/VE path (the
+    # hooks consume the same weights, so base expert outputs and LoRA deltas
+    # stay scaled consistently).
+    if (
+        runner_config.routed_scaling_factor is not None
+        and runner_config.routed_scaling_factor != 1.0
+    ):
+        topk_output = topk_output._replace(
+            topk_weights=(
+                topk_output.topk_weights
+                * runner_config.routed_scaling_factor
+            )
+        )
+        # The pass-through call below receives `dispatch_output`, so the
+        # scaled routing must be written back into it as well (NamedTuples
+        # are immutable; a local rebind alone would leave the pass-through
+        # consuming the unscaled weights).
+        dispatch_output = dispatch_output._replace(topk_output=topk_output)
+
     if not get_is_capture_mode() and not lora_info.has_active_lora:
         return fused_experts_fp8_sgl(
             dispatch_output,
@@ -339,6 +369,36 @@ def fused_experts_none_to_experimental_sgl_trtllm_bf16_lora(
     assert TopKOutputChecker.format_is_standard(topk_output)
     assert runner_config.top_k is not None
 
+    # REAL FIX — routed scaling on the decomposed (packed-topk) kernel path.
+    # The vendored trtllm_fused_moe_runner.cu sets routingData.mRouteScale only
+    # in the DeepSeekV3 (logits) routing branches; the TopK-only branch used
+    # by every packed-topk call with pre-materialized ids never assigns it, so
+    # routed_scaling_factor is silently ignored on this path. A/B on the
+    # GLM-5.3 fp8 build of the same kernel family measured the decomposed
+    # output at exactly 1/routed_scaling_factor of stock (0.400x for factor
+    # 2.5); for DeepSeek-V4.1-Flash (factor 1.5) every MoE layer would
+    # contribute 0.667x of stock, compounding per layer/chunk over long
+    # prefills. Applying the factor on the materialized weights here is
+    # mathematically identical (sum((s*w_i)*y_i) == s*sum(w_i*y_i)) and covers
+    # the pass-through, the decode-graph capture and the adapter/VE path (the
+    # hooks consume the same weights, so base expert outputs and LoRA deltas
+    # stay scaled consistently).
+    if (
+        runner_config.routed_scaling_factor is not None
+        and runner_config.routed_scaling_factor != 1.0
+    ):
+        topk_output = topk_output._replace(
+            topk_weights=(
+                topk_output.topk_weights
+                * runner_config.routed_scaling_factor
+            )
+        )
+        # The pass-through call below receives `dispatch_output`, so the
+        # scaled routing must be written back into it as well (NamedTuples
+        # are immutable; a local rebind alone would leave the pass-through
+        # consuming the unscaled weights).
+        dispatch_output = dispatch_output._replace(topk_output=topk_output)
+
     # No-LoRA non-capture decode -> fast bf16 path, valid only for 4-D block-shuffled
     # weights ([E, M//128, K//128, 128]); flat [E, 2F, D] stays on the decomposed kernel.
     if (
@@ -503,6 +563,36 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp4_lora(
     topk_output = dispatch_output.topk_output
     assert TopKOutputChecker.format_is_standard(topk_output)
     assert runner_config.top_k is not None
+
+    # REAL FIX — routed scaling on the decomposed (packed-topk) kernel path.
+    # The vendored trtllm_fused_moe_runner.cu sets routingData.mRouteScale only
+    # in the DeepSeekV3 (logits) routing branches; the TopK-only branch used
+    # by every packed-topk call with pre-materialized ids never assigns it, so
+    # routed_scaling_factor is silently ignored on this path. A/B on the
+    # GLM-5.3 fp8 build of the same kernel family measured the decomposed
+    # output at exactly 1/routed_scaling_factor of stock (0.400x for factor
+    # 2.5); for DeepSeek-V4.1-Flash (factor 1.5) every MoE layer would
+    # contribute 0.667x of stock, compounding per layer/chunk over long
+    # prefills. Applying the factor on the materialized weights here is
+    # mathematically identical (sum((s*w_i)*y_i) == s*sum(w_i*y_i)) and covers
+    # the pass-through, the decode-graph capture and the adapter/VE path (the
+    # hooks consume the same weights, so base expert outputs and LoRA deltas
+    # stay scaled consistently).
+    if (
+        runner_config.routed_scaling_factor is not None
+        and runner_config.routed_scaling_factor != 1.0
+    ):
+        topk_output = topk_output._replace(
+            topk_weights=(
+                topk_output.topk_weights
+                * runner_config.routed_scaling_factor
+            )
+        )
+        # The pass-through call below receives `dispatch_output`, so the
+        # scaled routing must be written back into it as well (NamedTuples
+        # are immutable; a local rebind alone would leave the pass-through
+        # consuming the unscaled weights).
+        dispatch_output = dispatch_output._replace(topk_output=topk_output)
 
     # No active LoRA in a non-capture decode -> plain (fast) FP4 path.
     if not get_is_capture_mode() and not lora_info.has_active_lora:
@@ -687,6 +777,36 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora(
         "logits-based (bypassed) routing does not expose them."
     )
     assert runner_config.top_k is not None
+
+    # REAL FIX — routed scaling on the decomposed (packed-topk) kernel path.
+    # The vendored trtllm_fused_moe_runner.cu sets routingData.mRouteScale only
+    # in the DeepSeekV3 (logits) routing branches; the TopK-only branch used
+    # by every packed-topk call with pre-materialized ids never assigns it, so
+    # routed_scaling_factor is silently ignored on this path. A/B on the
+    # GLM-5.3 fp8 build of the same kernel family measured the decomposed
+    # output at exactly 1/routed_scaling_factor of stock (0.400x for factor
+    # 2.5); for DeepSeek-V4.1-Flash (factor 1.5) every MoE layer would
+    # contribute 0.667x of stock, compounding per layer/chunk over long
+    # prefills. Applying the factor on the materialized weights here is
+    # mathematically identical (sum((s*w_i)*y_i) == s*sum(w_i*y_i)) and covers
+    # the pass-through, the decode-graph capture and the adapter/VE path (the
+    # hooks consume the same weights, so base expert outputs and LoRA deltas
+    # stay scaled consistently).
+    if (
+        runner_config.routed_scaling_factor is not None
+        and runner_config.routed_scaling_factor != 1.0
+    ):
+        topk_output = topk_output._replace(
+            topk_weights=(
+                topk_output.topk_weights
+                * runner_config.routed_scaling_factor
+            )
+        )
+        # The pass-through call below receives `dispatch_output`, so the
+        # scaled routing must be written back into it as well (NamedTuples
+        # are immutable; a local rebind alone would leave the pass-through
+        # consuming the unscaled weights).
+        dispatch_output = dispatch_output._replace(topk_output=topk_output)
 
     # PASS-THROUGH PRECISION (zero-LoRA == base): no-adapter requests take the
     # SAME decomposed pipeline with zero deltas. The previous early-return to

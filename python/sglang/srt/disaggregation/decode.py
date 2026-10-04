@@ -2717,16 +2717,21 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     and hicache_restore_status == HiCacheRestoreResult.PENDING
                 ):
                     continue
-                if len(decode_req.req.fill_ids) < len(decode_req.req.origin_input_ids):
+                if (
+                    decode_req.req.kv is None
+                    or decode_req.req.kv.kv_committed_len is None
+                    or decode_req.req.kv.kv_committed_len
+                    < len(decode_req.req.origin_input_ids)
+                ):
                     # Defense-in-depth against the chunked-transfer race: the
                     # receiver poll can report Success between KV chunks of a
                     # long multi-chunk prompt (observed at 55296/105023 tokens
                     # on a 105K prompt in the GLM PD deployment), which starts
                     # decode on a partial context and corrupts all output.
-                    # Never hand the request to the decode scheduler until
-                    # every prompt token's KV has actually landed; fill_ids
-                    # grows as slices arrive, so staying in the queue is safe
-                    # and liveness is preserved.
+                    # kv_committed_len is the decode-side native counter of
+                    # landed KV (set by the transfer allocation path before
+                    # this queue is polled); stay in the queue until every
+                    # prompt token's KV has actually landed.
                     continue
                 self._commit_transfer_to_req(decode_req)
                 indices_to_remove.add(i)
