@@ -15,6 +15,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 )
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
+    _mm_timing_async,
 )
 from sglang.srt.utils import GLM_MEDIA_CONFIG_KEYS
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
@@ -535,6 +536,7 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
         )
         return mrope_positions.squeeze(1), mrope_position_delta
 
+    @_mm_timing_async("glm_total")
     async def process_mm_data_async(
         self,
         image_data: List[Union[str, bytes]],

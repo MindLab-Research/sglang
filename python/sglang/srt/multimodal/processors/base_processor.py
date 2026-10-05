@@ -2,10 +2,13 @@ import asyncio
 import concurrent
 import concurrent.futures
 import dataclasses
+import functools
+import hashlib
 import multiprocessing as mp
 import os
 import re
 import threading
+import time
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import (
@@ -63,8 +66,67 @@ from sglang.srt.utils import (
 )
 
 _is_cpu = is_cpu()
+
+# Minimum free device memory for the fast image processor to run on the
+# serving GPU (cuda:base_gpu_id). Below this the tokenizer process's image
+# preprocessing falls back to CPU: the scheduler's KV pool can leave the
+# serving GPU essentially full, and torchvision pad/resize allocations then
+# fail per-request (OOM → HTTP 500 → clients see stream idle timeouts).
+_MIN_FAST_IMAGE_PREPROC_HEADROOM_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
 _is_npu = is_npu()
 _is_xpu = is_xpu()
+
+# Phase timing probes for the multimodal preprocessing pipeline. Off by
+# default; enable with SGLANG_MM_TIMING=1 to print per-request phase
+# breakdowns ([MM-T] lines) into the server log.
+_MM_TIMING = os.environ.get("SGLANG_MM_TIMING", "0") == "1"
+
+
+def _mm_timing_async(tag: str):
+    """Env-gated wall-clock probe for async multimodal pipeline stages."""
+
+    def deco(fn):
+        @functools.wraps(fn)
+        async def wrapper(*args, **kwargs):
+            if not _MM_TIMING:
+                return await fn(*args, **kwargs)
+            t0 = time.perf_counter()
+            try:
+                return await fn(*args, **kwargs)
+            finally:
+                print(f"[MM-T] {tag}={time.perf_counter() - t0:.2f}s", flush=True)
+
+        return wrapper
+
+    return deco
+
+
+def _content_scoped_item_hash(content_hash: str, processor_fingerprint) -> int:
+    """64-bit mm-item identity: media content hash scoped by the processor
+    fingerprint (every stable setting that can change the preprocessing
+    result). Replaces hashing the full feature tensors downstream."""
+    fingerprint = processor_fingerprint or ""
+    digest = hashlib.sha256(f"{content_hash}:{fingerprint}".encode()).hexdigest()[:16]
+    return int(digest, 16)
+
+
+def _mm_timing_sync(tag: str):
+    """Env-gated wall-clock probe for sync multimodal pipeline stages."""
+
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            if not _MM_TIMING:
+                return fn(*args, **kwargs)
+            t0 = time.perf_counter()
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                print(f"[MM-T] {tag}={time.perf_counter() - t0:.2f}s", flush=True)
+
+        return wrapper
+
+    return deco
 
 
 @dataclasses.dataclass
@@ -777,9 +839,24 @@ class BaseMultimodalProcessor(ABC):
             platform = platforms.current_platform
             if not platform.is_cuda_alike():
                 return None
+            device = f"{platform.device_type}:{server_args.base_gpu_id}"
+            try:
+                free_b, _total_b = torch.cuda.mem_get_info(device)
+                if free_b < _MIN_FAST_IMAGE_PREPROC_HEADROOM_BYTES:
+                    # The serving GPU is (nearly) full — e.g. the scheduler's
+                    # KV pool leaves no headroom for the tokenizer process's
+                    # image preprocessing (observed: a 38 MiB torchvision pad
+                    # failing on a GPU with 27 MiB free → per-request OOM →
+                    # HTTP 500 → clients see stream idle timeouts). Fall back
+                    # to CPU preprocessing instead of failing every image
+                    # request; revisit only when the deployment leaves the
+                    # serving GPU real headroom.
+                    return "cpu"
+            except Exception:
+                pass
             # Per-worker placement travels as a constructor argument, and
             # this record is that argument.
-            return f"{platform.device_type}:{server_args.base_gpu_id}"
+            return device
         if processor.__class__.__name__ == "MiniMaxVLProcessor":
             # MiniMax's image/video processors create 10-dim tensors during
             # patch extraction, exceeding the Ascend 8-dim limit; patch them
@@ -832,6 +909,7 @@ class BaseMultimodalProcessor(ABC):
         with torch.cuda.use_mem_pool(pool, device=device):
             yield
 
+    @_mm_timing_sync("proc_data")
     def process_mm_data(
         self,
         input_text,
@@ -955,6 +1033,61 @@ class BaseMultimodalProcessor(ABC):
 
         return estimated_frames_list
 
+    @staticmethod
+    def _sglang_media_hash(data) -> Optional[str]:
+        """Cheap content-identity hash for content-complete media references.
+
+        Handles the fork's ``ImageData`` wrapper (the chat endpoint wraps
+        every image_url part in ``ImageData(url, detail, max_dynamic_patch,
+        preprocess_kwargs, content_hash)``; ``load_image`` unwraps ``.url``
+        internally). The identity covers the media bytes AND every wrapper
+        option that can change the preprocessing result, so identical bytes
+        with different options never collide in a content-keyed preprocess
+        cache. Only base64 data URLs and raw bytes are content-complete;
+        remote URLs and file paths bypass because their content can change.
+        """
+        h = hashlib.md5()
+        url = getattr(data, "url", None)
+        if url is not None:
+            # ImageData-style wrapper: fold per-media preprocessing options
+            # into the identity (mirrors load_image's unwrap of ``.url``).
+            for opt_name in (
+                "detail",
+                "max_dynamic_patch",
+                "preprocess_kwargs",
+                "content_hash",
+            ):
+                opt = getattr(data, opt_name, None)
+                if opt is not None:
+                    h.update(f"{opt_name}={opt!r};".encode())
+            data = url
+        if isinstance(data, str):
+            if data.startswith("data:"):
+                h.update(data.encode("utf-8", "ignore"))
+                return h.hexdigest()
+            return None
+        if isinstance(data, (bytes, bytearray)):
+            h.update(bytes(data))
+            return h.hexdigest()
+        return None
+
+    @classmethod
+    def _sglang_attach_media_hash(cls, media, data) -> None:
+        """Tag loaded media with its content hash for downstream preprocess caches.
+
+        Agent conversations re-send identical images on every turn (they sit
+        in the chat history); image preprocessors key on this tag to skip
+        reprocessing identical media. Best-effort: containers that reject
+        custom attributes stay unhashed and bypass those caches.
+        """
+        h = cls._sglang_media_hash(data)
+        if h is None:
+            return
+        try:
+            media._sglang_media_hash = h
+        except Exception:
+            pass
+
     @classmethod
     def _load_single_item(
         cls,
@@ -977,15 +1110,21 @@ class BaseMultimodalProcessor(ABC):
             if modality == Modality.IMAGE:
                 img, _ = load_image(data, cls.gpu_image_decode)
                 if isinstance(img, torch.Tensor):
+                    cls._sglang_attach_media_hash(img, data)
                     return img  # JPEG already decoded on GPU by nvJPEG
                 # PIL decodes lazily; do it here in the io worker so the decode
                 # doesn't run later on the event-loop thread.
                 if discard_alpha_channel:
                     if cls.smart_rgb_conversion:
-                        return smart_to_rgb(img)
+                        img = smart_to_rgb(img)
+                        cls._sglang_attach_media_hash(img, data)
+                        return img
                     if img.mode != "RGB":
-                        return img.convert("RGB")
+                        img = img.convert("RGB")
+                        cls._sglang_attach_media_hash(img, data)
+                        return img
                 img.load()
+                cls._sglang_attach_media_hash(img, data)
                 return img
             elif modality == Modality.VIDEO:
                 return load_video(data, frame_count_limit)
@@ -1223,6 +1362,7 @@ class BaseMultimodalProcessor(ABC):
 
         return is_precomputed, images, videos, audios
 
+    @_mm_timing_async("load")
     async def load_mm_data(
         self,
         prompt: str,
@@ -1953,6 +2093,7 @@ class BaseMultimodalProcessor(ABC):
 
         return all_collected_items, input_ids, ret
 
+    @_mm_timing_sync("finalize")
     def _finalize_mm_items(
         self,
         mm_items: List[MultimodalDataItem],
@@ -1964,6 +2105,8 @@ class BaseMultimodalProcessor(ABC):
             images=images,
         )
 
+        self._apply_content_hash_identities(mm_items, images)
+
         for item in mm_items:
             if item.format in (
                 MultimodalInputFormat.PROCESSOR_OUTPUT,
@@ -1973,6 +2116,60 @@ class BaseMultimodalProcessor(ABC):
 
         self._precompute_hashes_before_cpu_transfer(mm_items)
         return self._prepare_mm_items_for_transport(mm_items)
+
+    def _apply_content_hash_identities(
+        self,
+        mm_items: List[MultimodalDataItem],
+        images: Optional[List[Any]],
+    ) -> None:
+        """Pre-compute mm item identities from tokenizer-side content hashes.
+
+        Every TP-rank scheduler calls ``item.set_pad_value()`` per request;
+        with no identity attached that sha256-hashes the full feature
+        tensors (~1.4GB for a 32-image agent request) on every rank, every
+        request. The media content hash (md5 of the payload, attached by
+        ``_load_single_item``) scoped by the processor fingerprint gives the
+        same "same bytes + same preprocessing => same identity" guarantee
+        with none of the hashing, and ``set_hash()`` derives the pad value so
+        the downstream ``set_pad_value()`` short-circuits. Falls back to the
+        internal ``hash_feature()`` recompute on any ordering or fingerprint
+        surprise, and leaves already-identified items untouched.
+        """
+        if not images:
+            return
+        image_items = [it for it in mm_items if it.modality == Modality.IMAGE]
+        if not image_items or len(image_items) != len(images):
+            return
+        content_hashes = [getattr(im, "_sglang_media_hash", None) for im in images]
+        if not any(content_hashes):
+            return
+        if self.processor_fingerprint is None:
+            if getattr(self, "_fingerprint_computed", False):
+                return
+            self._fingerprint_computed = True
+            try:
+                self.processor_fingerprint = build_processor_fingerprint(
+                    self, self.hf_config
+                )
+            except Exception:
+                logger.warning(
+                    "processor fingerprint unavailable for %s; mm items fall "
+                    "back to hash_feature()",
+                    type(self).__name__,
+                )
+                return
+        for item, content_hash in zip(image_items, content_hashes):
+            if (
+                content_hash is None
+                or item.hash is not None
+                or item.pad_value is not None
+            ):
+                continue
+            item.set_hash(
+                _content_scoped_item_hash(
+                    content_hash, self.processor_fingerprint
+                )
+            )
 
     def _postprocess_mm_items_before_transport(
         self,
@@ -2023,6 +2220,7 @@ class BaseMultimodalProcessor(ABC):
             raise
         return mm_items
 
+    @_mm_timing_async("combine")
     async def process_and_combine_mm_data_async(
         self,
         base_output: BaseMultiModalProcessorOutput,
