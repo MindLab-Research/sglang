@@ -44,3 +44,28 @@
 ## 5. 结论
 
 （待复测数据定稿）
+
+## 6. 终局验证（2026-10-06 12:30，GLM 生产恢复 + 全判别通过）
+
+| 验证项 | 结果 |
+|---|---|
+| GLM P/D/LB 全绿 + adapter 双端 pinned | ✅ |
+| lora 请求 3 连 | HTTP:200, 0.35s（此前 hang 根因 = P 端缺 adapter 的 KV-transfer 失败链，P 重启+双端加载后彻底解决） |
+| GLM base sanity | 5.7ms / 174tps（与终态一致） |
+| GLM zero 判别 | ZERO_FIRST_DIFF: 430（浮点序基线，一致） |
+
+## 7. 终局性能矩阵（DPSK vs GLM 5.3 Flash）
+
+| 场景 | DSV4.1-Flash（TP4 单机） | GLM-5.3-Flash（PD 4+4） |
+|---|---|---|
+| 无 MoL 基线 | 3.4ms / 291.2 tps | 5.8ms / 173.5 tps |
+| MoL 开启·base 请求 | 修复前 5.0ms(+47%) → **修复后 4.0ms(+18%)** | 修复前 8.1ms(-28.8%) → **修复后 5.7-5.8ms(0.0%)** |
+| MoL 开启·lora 请求 | 4.8-5.1ms / 194-207 tps（分解路径） | 8.3-8.7ms / 119-125 tps（分解路径） |
+
+## 8. 原因分析（为什么两者都曾有"零开销"假声明，为什么 GLM 达 0% 而 DSV4.1 还差 18%）
+
+1. **历史声明的共同模式**：两个模型的"零开销"报告都产自无 rand-挂载判别的时代——真实数字是 base 请求被强制走分解管线的 +28.8%（GLM）/ +47%（DSV4.1）。历史 DPSK "149 vs 147" 无可复现配置记录，与本次 A 组基线 291 tps 差近 2 倍，与 +47% 差两个数量级——证伪。
+2. **GLM 达 0% 的机制**：dual-TopK（base 批 BYPASSED→stock kernel）+ FusedMoEWithLoRA 分流 + capture-lora guards——GLM 的 decode graph capture 走 Python forward，分流全部生效。
+3. **DSV4.1 卡在 +18% 的架构根源**：decode graph capture 经 piecewise 编译快照（固化 LoRA-wrap 前的模块引用）绕过全部 Python 分流（五轮修复实证：op_experts/run_moe_core debug 零命中 + trace 分解 kernel 仍录在 nolora graph）+ 每步 lora_manager Python。0.6ms ≈ 18% 在 3.4ms 快基线上放大。下一步方向：piecewise 编译层注入分流 / decode graph 切非 piecewise backend / LoRA wrap 提前到编译快照前。
+
+*报告完（终稿）*
