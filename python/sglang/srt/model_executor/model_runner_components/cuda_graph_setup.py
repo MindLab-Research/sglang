@@ -722,6 +722,12 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
         f"bs={capture_bs}, avail mem={before_mem:.2f} GB"
     )
 
+    # GLM->DSV4 MoL perf port: with LoRA enabled the decomposed MoE-LoRA path
+    # only serves LoRA-active batches; every no-LoRA decode must replay the
+    # single-fused-kernel "nolora" graph instead of the decomposed one (the
+    # decomposed topology cost base requests +47% TPOT pre-split). Capture
+    # both variants so batches route by lora_ids at replay.
+    record_nolora = model_runner.lora_manager is not None
     if current_platform.is_out_of_tree():
         GraphRunnerCls = current_platform.get_graph_runner_cls()
         runner = GraphRunnerCls(model_runner)
@@ -734,7 +740,9 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
                 "xpu": XPUGraphRunner,
             },
         )
-        runner = graph_runners[model_runner.device](model_runner)
+        runner = graph_runners[model_runner.device](
+            model_runner, record_nolora_graph=record_nolora
+        )
 
     after_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
     memory_usage_gb = before_mem - after_mem
