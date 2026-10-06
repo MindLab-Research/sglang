@@ -24,6 +24,13 @@ MIN_CHUNK_SIZE = 16
 
 
 class ChunkedSgmvLoRABackend(BaseLoRABackend):
+    # GLM->DSV4 MoL perf port: all-base batches skip the full per-step
+    # prepare_lora_batch (pinned-memory tensor allocs + permutation +
+    # segment computation) and reset batch_info instead — the layers'
+    # lora_active guards then route to the stock path. LoRA-bearing batches
+    # still take the full prepare.
+    skip_inactive_lora_batches = True
+
     """
     Chunked LoRA backend using segmented matrix-vector multiplication.
 

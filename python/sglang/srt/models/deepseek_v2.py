@@ -575,6 +575,37 @@ _FUSED_FINALIZE_ALL_REDUCE_MAX_TOKENS = 384
 
 
 class DeepseekV2MoE(nn.Module):
+    def _dual_topk(self):
+        """Return the correct TopK instance for this batch (dual-TopK).
+
+        No-LoRA batches use the BYPASSED-format instance (stock kernel fast
+        path); LoRA-active batches use the STANDARD-format instance (the
+        decomposed pipeline needs materialized ids for VE routing).
+        While capturing the "lora" graph variant the dummy lora_ids are all
+        None (no adapter loaded yet), but the graph must record the
+        decomposed path — force the STANDARD TopK so the lora dispatch
+        receives materialized topk ids.
+        """
+        if self.topk_nolora is None:
+            return self.topk
+        _batch_info = getattr(
+            getattr(self.experts, "lora_backend", None),
+            "batch_info",
+            None,
+        )
+        if _batch_info is not None and getattr(_batch_info, "has_active_lora", False):
+            return self.topk
+        try:
+            from sglang.srt.model_executor.runner_utils.capture_mode import (
+                is_capturing_lora_variant,
+            )
+
+            if is_capturing_lora_variant():
+                return self.topk
+        except Exception:
+            pass
+        return self.topk_nolora
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -753,6 +784,23 @@ class DeepseekV2MoE(nn.Module):
                     ),
                 )
             self.topk = TopK(**topk_kwargs)
+
+            # GLM->DSV4 MoL perf port: dual-TopK. No-LoRA batches replay the
+            # stock fused kernel (BYPASSED routing, same route as a no-MoL
+            # deployment) instead of the materialized-topk decomposed path;
+            # LoRA-active batches keep the STANDARD instance above (the VE
+            # delta routing needs materialized ids). Created AFTER the DSV4
+            # override so the fp4/sqrtsoftplus flags are inherited.
+            # Explicit BYPASSED, not None: None falls through to auto-detection
+            # in TopK.forward_cuda which forces STANDARD when LoRA is enabled,
+            # defeating the dual-TopK entirely.
+            _lora_forces_std = _lora_forces_standard_topk()
+            if _lora_forces_std:
+                topk_kwargs_nolora = dict(topk_kwargs)
+                topk_kwargs_nolora["output_format"] = TopKOutputFormat.BYPASSED
+                self.topk_nolora = TopK(**topk_kwargs_nolora)
+            else:
+                self.topk_nolora = None
 
         self.shared_experts_is_int8 = False
         self.shared_experts_is_fp8 = False
@@ -1055,7 +1103,7 @@ class DeepseekV2MoE(nn.Module):
                     num_token_non_padded=num_token_non_padded,
                 )
             else:
-                topk_output = self.topk(
+                topk_output = self._dual_topk()(
                     hidden_states,
                     router_logits,
                     num_token_non_padded=num_token_non_padded,
@@ -1092,7 +1140,7 @@ class DeepseekV2MoE(nn.Module):
             has_shared_output
             and not self._shared_expert_tp1
             and topk_output.format == TopKOutputFormat.BYPASSED
-            and self.experts.supports_deferred_finalize
+            and getattr(self.experts, 'supports_deferred_finalize', False)
             and (
                 self._deferred_finalize_max_tokens <= 0
                 or hidden_states.shape[0] <= self._deferred_finalize_max_tokens
@@ -1311,7 +1359,7 @@ class DeepseekV2MoE(nn.Module):
                     num_token_non_padded=num_token_non_padded,
                 )
             else:
-                topk_output = self.topk(
+                topk_output = self._dual_topk()(
                     hidden_states,
                     router_logits,
                     num_token_non_padded=num_token_non_padded,
@@ -1421,7 +1469,7 @@ class DeepseekV2MoE(nn.Module):
     ) -> torch.Tensor:
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
+        topk_output = self._dual_topk()(hidden_states, router_logits)
         fused_experts_out = self.experts(
             hidden_states=hidden_states, topk_output=topk_output
         )
@@ -1508,7 +1556,7 @@ class DeepseekV2MoE(nn.Module):
                 if getattr(self, "is_hash", False)
                 else {}
             )
-            topk_output = self.topk(
+            topk_output = self._dual_topk()(
                 hidden_states,
                 router_logits,
                 num_token_non_padded=forward_batch.moe_num_token_non_padded(),
@@ -1902,7 +1950,7 @@ class DeepseekV2MoE(nn.Module):
             with get_global_expert_distribution_recorder().with_current_layer(
                 self.layer_id
             ):
-                state.topk_output = self.topk(
+                state.topk_output = self._dual_topk()(
                     hidden_states=hidden_states,
                     router_logits=router_logits,
                     num_token_non_padded=state.forward_batch.moe_num_token_non_padded(),
@@ -3011,7 +3059,7 @@ class DeepseekV2Model(nn.Module):
             # A TP1 shared expert is added after the all-reduce and cannot move it.
             can_defer_finalize=lambda layer: (
                 isinstance(layer.mlp, DeepseekV2MoE)
-                and layer.mlp.experts.supports_deferred_finalize
+                and getattr(layer.mlp.experts, 'supports_deferred_finalize', False)
                 and layer.mlp.num_fused_shared_experts == 0
                 and not layer.mlp._shared_expert_tp1
             ),

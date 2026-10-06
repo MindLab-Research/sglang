@@ -153,7 +153,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora(
         quant_info.w13_weight.shape[1],
     )
     gate_up_delta = (
-        hidden_states.new_empty(gate_up_delta_shape)
+        hidden_states.new_zeros(gate_up_delta_shape)
         if use_virtual_lora_store
         else hidden_states.new_zeros(gate_up_delta_shape)
     )
@@ -280,7 +280,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora(
         hidden_states.shape[1],
     )
     down_delta = (
-        hidden_states.new_empty(down_delta_shape)
+        hidden_states.new_zeros(down_delta_shape)
         if use_virtual_lora_store
         else hidden_states.new_zeros(down_delta_shape)
     )
@@ -628,7 +628,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp4_lora(
     # lora_a (rank 2r) and [gate_B; up_B] lora_b (rank r), via the rank-specialized direct expand
     # (use_direct_expand_add, rank <= 64). EP args scope the delta to this rank's experts, matching
     # the EP-aware trtllm MoE base.
-    gate_up_delta = hidden_states.new_empty(gate_up_delta_shape)
+    gate_up_delta = hidden_states.new_zeros(gate_up_delta_shape)
     merged_experts_fused_moe_lora_add(
         output=gate_up_delta,
         hidden_states=hidden_states,
@@ -772,6 +772,19 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora(
 
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
+    # GLM->DSV4 MoL perf port: the dual TopK produces BYPASSED-format
+    # routing for no-LoRA batches. When BYPASSED arrives here, route to the
+    # stock fused MoE entry (the same one a no-MoL deployment uses, which
+    # natively consumes the bypassed format and keeps the base batch on the
+    # fast fused route). LoRA-active batches always arrive STANDARD.
+    if TopKOutputChecker.format_is_bypassed(topk_output):
+        from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+            fused_experts_none_to_flashinfer_trtllm,
+        )
+
+        return fused_experts_none_to_flashinfer_trtllm(
+            dispatch_output, quant_info, runner_config
+        )
     assert TopKOutputChecker.format_is_standard(topk_output), (
         "experimental_sgl_trtllm MXFP4 LoRA needs materialized topk_ids; the "
         "logits-based (bypassed) routing does not expose them."
@@ -847,7 +860,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora(
         lora_info.gate_up_lora_b_weights.shape[2] // 2
     )  # unpadded, from the shared gate_up B buffer (N = 2 * inter_ve)
 
-    gate_up_delta_ve = hidden_states.new_empty(
+    gate_up_delta_ve = hidden_states.new_zeros(
         (hidden_states.shape[0], runner_config.top_k, 2 * _inter_ve)
     )
     if has_active_lora:

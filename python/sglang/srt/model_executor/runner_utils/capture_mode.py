@@ -68,6 +68,42 @@ def _set_capture_lora_variant(variant: Optional[str]) -> None:
     _capture_lora_variant = variant
 
 
+def is_capturing_lora_variant() -> bool:
+    """True while capturing the "lora" graph variant.
+
+    At capture time dummy lora_ids are all None and no adapter is loaded
+    yet, so has_active_lora is False — but the graph must record the
+    decomposed LoRA path so runtime LoRA-bearing batches replay it.
+    Consumers: the dual-TopK selector (_dual_topk), the lora_active guards
+    (layers.py) and the prepare skip shortcut (lora_manager.py).
+    """
+    return _capture_lora_variant == "lora"
+
+
+# Global mirror of the current forward mode. StandardDispatchOutput is a
+# NamedTuple without a forward-batch handle, so consumers that only hold a
+# dispatch_output (e.g. the O1 two-stream MoE gate in moe_overlap.py) cannot
+# read ForwardMode directly. ForwardBatch.init_new sets this on every batch
+# construction; decode-graph capture runs under DECODE mode too.
+_current_forward_mode = None
+
+
+def set_current_forward_mode(mode) -> None:
+    global _current_forward_mode
+    _current_forward_mode = mode
+
+
+def get_current_forward_mode():
+    return _current_forward_mode
+
+
+def current_forward_is_decode() -> bool:
+    """Safe decode check: None (unknown) counts as False so callers fall
+    back to their serial path."""
+    m = _current_forward_mode
+    return m is not None and m.is_decode()
+
+
 def get_capture_attention_variant() -> Optional[str]:
     return _capture_attention_variant
 

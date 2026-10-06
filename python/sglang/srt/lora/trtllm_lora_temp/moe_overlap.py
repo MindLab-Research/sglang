@@ -107,7 +107,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora_two_stream(
         runner_config.top_k,
         quant_info.w13_weight.shape[1],
     )
-    gate_up_delta = hidden_states.new_empty(gate_up_delta_shape)
+    gate_up_delta = hidden_states.new_zeros(gate_up_delta_shape)
 
     def _run_gate_up_lora():
         merged_experts_fused_moe_lora_add(
@@ -155,7 +155,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora_two_stream(
         local_expert_offset=quant_info.local_expert_offset,
         local_num_experts=quant_info.local_num_experts,
     )
-    gate_up_lora_intermediate = hidden_states.new_empty(
+    gate_up_lora_intermediate = hidden_states.new_zeros(
         (
             hidden_states.shape[0],
             topk_ids.shape[1],
@@ -309,7 +309,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora_two_stream(
         # same buffers, identical numerics; the shrink just starts earlier.
         # The shrink intermediate is allocated HERE (main = consumer stream of the expand),
         # per the SGLANG_OPT_LORA_OVERLAP_MAIN_ALLOC lesson on side-stream allocations.
-        down_intermediate = hidden_states.new_empty(
+        down_intermediate = hidden_states.new_zeros(
             (
                 hidden_states.shape[0],
                 topk_ids.shape[1],
@@ -398,7 +398,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp4_lora_two_stream(
     inter = quant_info.intermediate_size_per_partition
     side_stream = get_lora_side_stream()
 
-    gate_up_delta = hidden_states.new_empty(
+    gate_up_delta = hidden_states.new_zeros(
         (hidden_states.shape[0], runner_config.top_k, quant_info.w13_weight.shape[1])
     )
 
@@ -440,7 +440,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp4_lora_two_stream(
         local_expert_offset=quant_info.local_expert_offset,
         local_num_experts=quant_info.local_num_experts,
     )
-    gate_up_lora_intermediate = hidden_states.new_empty(
+    gate_up_lora_intermediate = hidden_states.new_zeros(
         (
             hidden_states.shape[0],
             topk_ids.shape[1],
@@ -557,7 +557,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp4_lora_two_stream(
         # MAIN stream after the op (strictly post-finalize) -- serial-path kernels/numerics.
         # Intermediate allocated on main (= consumer stream of the expand), per the
         # SGLANG_OPT_LORA_OVERLAP_MAIN_ALLOC lesson.
-        down_intermediate = hidden_states.new_empty(
+        down_intermediate = hidden_states.new_zeros(
             (
                 hidden_states.shape[0],
                 topk_ids.shape[1],
@@ -642,7 +642,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_bf16_lora_two_stream(
     inter = runner_config.intermediate_size_per_partition
     side_stream = get_lora_side_stream()
 
-    gate_up_delta = hidden_states.new_empty(
+    gate_up_delta = hidden_states.new_zeros(
         (hidden_states.shape[0], runner_config.top_k, 2 * inter)
     )
 
@@ -694,7 +694,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_bf16_lora_two_stream(
         local_expert_offset=quant_info.local_expert_offset,
         local_num_experts=runner_config.num_local_experts,
     )
-    gate_up_lora_intermediate = hidden_states.new_empty(
+    gate_up_lora_intermediate = hidden_states.new_zeros(
         (
             hidden_states.shape[0],
             topk_ids.shape[1],

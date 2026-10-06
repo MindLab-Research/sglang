@@ -67,14 +67,26 @@ class BaseLayerWithLoRA(nn.Module):
         forwards (see LoRAManager.prepare_lora_batch), so idle forwards take
         the base path."""
         batch_info = self.lora_backend.get_batch_info()
-        return (
-            self.set_lora
-            and batch_info is not None
-            and (
-                not self.lora_backend.skip_inactive_lora_batches
-                or batch_info.has_active_lora
+        if not self.set_lora or batch_info is None:
+            return False
+        if not self.lora_backend.skip_inactive_lora_batches:
+            return True
+        if batch_info.has_active_lora:
+            return True
+        # While capturing the "lora" graph variant the dummy lora_ids are
+        # all None and no adapter is loaded yet (has_active_lora False), but
+        # the graph must record the LoRA kernels so runtime LoRA-bearing
+        # batches replay the adapted path.
+        try:
+            from sglang.srt.model_executor.runner_utils.capture_mode import (
+                is_capturing_lora_variant,
             )
-        )
+
+            if is_capturing_lora_variant():
+                return True
+        except Exception:
+            pass
+        return False
 
     def set_lora_info(self, *args):
         pass
@@ -1193,8 +1205,30 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         2. After down projection, before final reduction
         """
         # DP-attention idle forward: no batch_info, run the base MoE path.
-        if self.lora_backend.get_batch_info(LoRABatchLayout.TP_GLOBAL) is None:
+        batch_info = self.lora_backend.get_batch_info(LoRABatchLayout.TP_GLOBAL)
+        if batch_info is None:
             return self.base_layer.forward(hidden_states, topk_output, **kwargs)
+
+        # GLM->DSV4 MoL perf port: batches with no active LoRA run the stock
+        # fused MoE path end-to-end — including during "nolora" cuda-graph
+        # capture. The dual TopK produces BYPASSED-format routing for these
+        # batches, so base_layer.forward() (stock kernel route) is safe here;
+        # this eliminates the decomposed-pipeline cost for base requests.
+        # Exception: capturing the "lora" graph variant — dummy lora_ids are
+        # all None and no adapter is loaded yet (has_active_lora False), but
+        # the graph must record the decomposed LoRA path for runtime replay.
+        if not getattr(batch_info, "has_active_lora", False):
+            _capturing_lora = False
+            try:
+                from sglang.srt.model_executor.runner_utils.capture_mode import (
+                    is_capturing_lora_variant,
+                )
+
+                _capturing_lora = is_capturing_lora_variant()
+            except Exception:
+                pass
+            if not _capturing_lora:
+                return self.base_layer.forward(hidden_states, topk_output, **kwargs)
 
         # Build LoRA info for this batch
         lora_info = self._get_lora_info()

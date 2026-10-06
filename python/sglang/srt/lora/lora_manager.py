@@ -302,9 +302,13 @@ class LoRAManager:
         assert lora_ref.lora_name is not None and lora_ref.lora_path is not None, (
             "LoRARef must have both lora_name and lora_path set for loading."
         )
-        assert lora_ref.lora_id not in self.loras, (
-            f"LoRA adapter with ID {lora_ref.lora_id} is already loaded. This should have been verified before request is sent to the backend."
-        )
+        if lora_ref.lora_id in self.loras:
+            # GLM->DSV4 MoL port: idempotent load. Re-loading an already-
+            # loaded pinned adapter is a no-op success. The HTTP layer cannot
+            # atomically check-and-load across engines, and a hard assert
+            # here killed the entire server on a benign duplicate load
+            # (observed 3x on the GLM PD deployment).
+            return self.create_lora_update_result(success=True)
 
         try:
             # load configs
@@ -667,8 +671,22 @@ class LoRAManager:
         if self.lora_backend.skip_inactive_lora_batches and not any(
             uid is not None for uid in forward_batch.lora_ids
         ):
-            self.reset_lora_batch()
-            return
+            # Exception: capturing the "lora" graph variant needs the full
+            # prepare — dummy lora_ids are all None and no adapter is
+            # loaded yet, but the graph must record the decomposed LoRA
+            # path with a prepared batch_info (not reset to None).
+            _capturing_lora = False
+            try:
+                from sglang.srt.model_executor.runner_utils.capture_mode import (
+                    is_capturing_lora_variant,
+                )
+
+                _capturing_lora = is_capturing_lora_variant()
+            except Exception:
+                pass
+            if not _capturing_lora:
+                self.reset_lora_batch()
+                return
 
         # set up batch info shared by all lora modules
         use_cuda_graph = self._use_cuda_graph_batch(forward_batch)

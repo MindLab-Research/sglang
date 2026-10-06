@@ -1047,6 +1047,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         ret.init_mlp_sync_metadata(batch, device)
 
+        # GLM->DSV4 MoL port: mirror the forward mode for consumers that only
+        # hold a dispatch_output (NamedTuple without a forward-batch handle),
+        # e.g. the O1 two-stream MoE gate. Every batch construction updates it.
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            set_current_forward_mode,
+        )
+
+        set_current_forward_mode(ret.forward_mode)
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
             if model_runner.lora_manager is not None:

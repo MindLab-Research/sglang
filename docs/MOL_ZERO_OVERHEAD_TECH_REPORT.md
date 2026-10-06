@@ -154,6 +154,8 @@ LoRA 增量本身的成本：VE 分组 Triton kernel 相对主 GEMM FLOPs ≈ 1.
 
 **结论**：GLM-5.3 的开销并非骨架设计错误，而是**第一版（experimental）形态未经本文 §3 的执行深度**，叠加 fp8 存在更强快路径的"跌落"结构。三项可回移：delta 内嵌去物化、finalize 融合 down delta、graph 整段核验；根治跌落则需为 fp8 融合 op 本身开 delta 注入（对应本文在分解路径开洞的思路，工程上需 vendor 该 op 源码）。
 
+> ⚠️ **2026-10-05 量化补记（GLM-5.3-flash PD 实测）**：本文写作时"GLM 线 MoL 开销显著"仅为定性判断。当日于 GLM-5.3-flash（`sglang-private` pr17，fp8，1101 4P+4D）以流式 TPOT 精测补齐量化数据：**MoL 常驻对 base 请求 decode TPOT -28.8%**（8.1ms vs 无 MoL 5.8ms，D 端 decode graph 捕获分解拓扑所致——即本表"capture 不能分叉→全体跌落"的实测值）。修复推进：双 variant graph（band-aid，base 走单 kernel 拓扑）恢复至 -20%（140.8 vs 173.5 tps）；**正路工程（本节结论所指的"三项可回移"+ tactic 调优）进行中**，目标为分解==stock 单拓扑。另：`sglang-private` 树的 `GLM53_FLASH_MOL_TECH_REPORT.md` 曾载单机 TP8 +0.04%"零开销"结论，经查系**适配器未挂载时的假数据**（请求字段误用，详见该报告 10-05 勘误），已作废——勿再引用。
+
 ---
 
 ## 6. 归属声明（git 实证）
