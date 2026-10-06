@@ -1196,6 +1196,34 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             lora_use_virtual_experts=self.lora_use_virtual_experts,
         )
 
+    def run_moe_core(self, dispatch_output, **kwargs):
+        """GLM->DSV4 MoL perf port: split no-LoRA batches to the stock core.
+
+        The piecewise decode graph calls op_experts -> run_moe_core directly,
+        bypassing forward() — so the forward-level split never applies on the
+        capture/replay path (traces showed the decomposed GEMM1/GEMM2 and
+        attention-LoRA shrink kernels recorded into the nolora graph). Apply
+        the same split here: no active LoRA (and not capturing the "lora"
+        variant) -> delegate to the wrapped FusedMoE, whose quant method
+        routes BYPASSED topk to the stock single-kernel path.
+        """
+        batch_info = self.lora_backend.get_batch_info(LoRABatchLayout.TP_GLOBAL)
+        if batch_info is None:
+            return self.base_layer.run_moe_core(dispatch_output, **kwargs)
+        if not getattr(batch_info, "has_active_lora", False):
+            _capturing_lora = False
+            try:
+                from sglang.srt.model_executor.runner_utils.capture_mode import (
+                    is_capturing_lora_variant,
+                )
+
+                _capturing_lora = is_capturing_lora_variant()
+            except Exception:
+                pass
+            if not _capturing_lora:
+                return self.base_layer.run_moe_core(dispatch_output, **kwargs)
+        return super().run_moe_core(dispatch_output, **kwargs)
+
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput, **kwargs):
         """
         Forward pass with integrated LoRA computation.
