@@ -827,6 +827,15 @@ class LoRAManager:
         self.lora_backend.batch_info.has_active_lora = any(
             lora_ranks[wi] > 0 for wi in weight_indices
         )
+        _active_moe = False
+        for _wi, _uid in zip(weight_indices, forward_batch.lora_ids):
+            if _wi is None or lora_ranks[_wi] <= 0 or _uid is None:
+                continue
+            _lora = self.loras.get(_uid)
+            if _lora is not None and getattr(_lora, "has_moe_weights", False):
+                _active_moe = True
+                break
+        self.lora_backend.batch_info.has_moe_lora = _active_moe
         if self.enable_dp_attention:
             self.lora_backend.prepare_global_lora_batch(forward_batch)
             if forward_batch.forward_mode.is_idle():
@@ -876,6 +885,15 @@ class LoRAManager:
         self.lora_backend.batch_info.has_active_lora = any(
             lora_ranks[index] > 0 for index in weight_indices
         )
+        _active_moe = False
+        for _wi, _lid in zip(weight_indices, lora_ids):
+            if _wi is None or lora_ranks[_wi] <= 0 or _lid is None:
+                continue
+            _lora = self.loras.get(_lid)
+            if _lora is not None and getattr(_lora, "has_moe_weights", False):
+                _active_moe = True
+                break
+        self.lora_backend.batch_info.has_moe_lora = _active_moe
 
     def update_lora_info(self):
         """

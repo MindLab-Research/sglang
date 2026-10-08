@@ -87,6 +87,11 @@ class LoRAAdapter(nn.Module):
             ]
         )
 
+        # MoL perf: whether this adapter carries routed-expert (MoE) LoRA
+        # weights. Attention-only adapters let the MoE keep the stock fused
+        # fast path instead of the decomposed LoRA pipeline.
+        self.has_moe_weights: bool = False
+
         self.embedding_layers: Dict[str, torch.Tensor] = {}
         self.pinned_embedding_layers: Dict[str, torch.Tensor] = {}
         self.added_tokens_embeddings: Dict[str, torch.Tensor] = {}
@@ -175,6 +180,8 @@ class LoRAAdapter(nn.Module):
 
         layer_id = get_layer_id(name)
         if layer_id is not None:
+            if _ROUTED_EXPERT_PATTERN.search(name):
+                self.has_moe_weights = True
             self.layers[layer_id].weights[name] = loaded_weight.cpu()
         elif "embed_tokens" in name or "lm_head" in name:
             # Check if this module is declared in target_modules before loading.

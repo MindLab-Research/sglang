@@ -1245,17 +1245,21 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         # Exception: capturing the "lora" graph variant — dummy lora_ids are
         # all None and no adapter is loaded yet (has_active_lora False), but
         # the graph must record the decomposed LoRA path for runtime replay.
-        if not getattr(batch_info, "has_active_lora", False):
-            _capturing_lora = False
+        _active_moe_lora = bool(
+            getattr(batch_info, "has_active_lora", False)
+            and getattr(batch_info, "has_moe_lora", False)
+        )
+        if not _active_moe_lora:
+            _capturing_moe_lora = False
             try:
                 from sglang.srt.model_executor.runner_utils.capture_mode import (
-                    is_capturing_lora_variant,
+                    is_capturing_moe_lora_variant,
                 )
 
-                _capturing_lora = is_capturing_lora_variant()
+                _capturing_moe_lora = is_capturing_moe_lora_variant()
             except Exception:
                 pass
-            if not _capturing_lora:
+            if not _capturing_moe_lora:
                 return self.base_layer.forward(hidden_states, topk_output, **kwargs)
 
         # Build LoRA info for this batch

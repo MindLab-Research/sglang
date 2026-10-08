@@ -77,6 +77,16 @@ def is_capturing_lora_variant() -> bool:
     Consumers: the dual-TopK selector (_dual_topk), the lora_active guards
     (layers.py) and the prepare skip shortcut (lora_manager.py).
     """
+    return _capture_lora_variant in ("lora", "lora_nomoe")
+
+
+def is_capturing_moe_lora_variant() -> bool:
+    """True only while capturing the full MoE-LoRA ("lora") graph variant.
+
+    The third variant, "lora_nomoe", captures the attention LoRA kernels while
+    keeping the stock fused MoE path — for adapters that carry no routed-expert
+    weights. Only "lora" must record the decomposed MoE topology.
+    """
     return _capture_lora_variant == "lora"
 
 

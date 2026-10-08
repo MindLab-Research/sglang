@@ -606,14 +606,18 @@ class DeepseekV2MoE(nn.Module):
             "batch_info",
             None,
         )
-        if _batch_info is not None and getattr(_batch_info, "has_active_lora", False):
+        if (
+            _batch_info is not None
+            and getattr(_batch_info, "has_active_lora", False)
+            and getattr(_batch_info, "has_moe_lora", False)
+        ):
             return self.topk
         try:
             from sglang.srt.model_executor.runner_utils.capture_mode import (
-                is_capturing_lora_variant,
+                is_capturing_moe_lora_variant,
             )
 
-            if is_capturing_lora_variant():
+            if is_capturing_moe_lora_variant():
                 return self.topk
         except Exception:
             pass

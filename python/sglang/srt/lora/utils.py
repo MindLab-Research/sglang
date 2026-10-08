@@ -88,6 +88,11 @@ class LoRABatchInfo:
     # Computed from Python lists in prepare_lora_batch to avoid GPU sync.
     has_active_lora: bool = False
 
+    # CPU-side flag: True when at least one active adapter in the batch
+    # actually carries routed-expert (MoE) LoRA weights. Attention-only
+    # adapters keep the stock fused MoE path.
+    has_moe_lora: bool = False
+
     # Per-request segment indptrs, shape (bs + 1,). Required by MoE virtual
     # experts which map tokens to requests regardless of the dense-LoRA
     # backend's internal segmentation.  For the triton backend these are
