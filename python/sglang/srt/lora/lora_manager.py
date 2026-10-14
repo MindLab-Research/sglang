@@ -701,6 +701,14 @@ class LoRAManager:
         # Load active loras into lora memory pool
         cur_uids = new_loras | running_loras
 
+        # Skip the pool re-preparation when the adapter set is unchanged:
+        # uid→buffer mapping is adapter-static; re-running prepare_lora_batch
+        # on every decode step only re-does the same slot assignments.
+        _key = frozenset(cur_uids)
+        if getattr(self, "_fetch_cache_key", None) == _key:
+            return
+        self._fetch_cache_key = _key
+
         assert len(cur_uids) <= self.max_loras_per_batch
         new_uids = {
             uid for uid in cur_uids if uid not in self.memory_pool.uid_to_buffer_id
