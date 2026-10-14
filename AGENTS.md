@@ -1,7 +1,55 @@
 # sglang-mol-v41 — DeepSeek-V4.1-Flash + MoL port
 
-Base: upstream `main` 81f27fb3a7 (+ fork increments ported in). Branch
-`release/dsv41-flash-mol` on `MindLab-Research/sglang`.
+**仓库铁律：我们用自己的【私有仓库】`MindLab-Research/sglang-private`，不是 fork。**
+**分支命名铁律：所有模型的「稳定/发布分支」一律以 `release/` 开头。**
+例：`release/glm53flash-*`（GLM-5.3-Flash）、`release/dsv41flash-*`（DeepSeek-V4.1-Flash）。
+`feat/`、`fix/` 只用于临时开发分支；不要用 `main` / 模型名裸分支承载发布。
+
+老仓库 `MindLab-Research/sglang` 已废弃，**不要往那边推**。基线 = 上游 `main` 81f27fb3a7，
+本地增量**直接提交到私有仓库**（remote `origin` = `https://github.com/MindLab-Research/sglang-private.git`）。
+
+**本文件所在树 = `/home/smith/src/sglang-mol-v41`（DeepSeek-V4.1-Flash + MoL 线），当前分支 `release/dsv41-flash-mol`。**
+**1101 盒子的 `/root/dsv41_upstream/sglang` 就是本树 `python/sglang/` rsync 出去的（本地 `python/sglang/srt` → 盒子 `sglang/srt`、本地 `python/sglang/kernels` → 盒子 `sglang/kernels`）。DSV4.1 的一切优化只认【本树 + 1101 盒子】，不要去翻别的树。**
+
+两条模型线的本地树，别搞混（2026-10-13 用户下令写死）：
+
+| 本地树 | 分支 | 模型线 |
+| --- | --- | --- |
+| `/home/smith/src/sglang-mol-v41`（**本文件所在**） | `release/dsv41-flash-mol` | **DeepSeek-V4.1-Flash + MoL**（跑在 1101 盒子） |
+| `/home/smith/src/sglang-private`（pr17 worktree） | `pr17` | GLM-5.3-Flash / MoL / LoRA 线 |
+
+> ⚠️ pr17 树里那份**未跟踪**的 `kernels/ops/moe/trtllm_lora_temp/{fused_moe_lora_all,m1_gate}.py`
+> 是 DSV4.1 融合核攻坚的本地镜像（10-12 攻坚的热修改主要在 1101 盒子上，尚未回灌）。
+> 见到它**不要**误判「DSV4.1 工作在 pr17」；收口时把盒子热修改回灌到**本树**提交。
+
+**PD/KV 传输铁律（2026-10-10 用户下令写死）——**
+**单台机器内的卡间 KV 传输必须走 NCCL。`--disaggregation-transfer-backend` 一律用 `nixl`（该版本的 nixl 后端即 NCCL/UCX 路径），严禁 `mooncake`。**
+- mooncake 走 RDMA/IB：本机没指定 IB 设备时日志为 `No IB devices specified for Mooncake backend, falling back to auto discovery` ⇒ P2P handshake 建不起来。
+- 症状：请求卡在 `KVPoll.Bootstrapping`，直到 **300s 超时** ⇒ `KVTransferError(bootstrap_room=...): Request ... timed out after 300.0s in KVPoll.Bootstrapping`；请求被 abort/重试（实测表现就是"一笔 500k 请求卡 5 分钟多才成功"）。这是 P0，不是网络问题。
+- 附：prefill 与 decode 在**同一台机器**时，禁止共用同一个 `--disaggregation-bootstrap-port`。
+
+> ⚠️ **实测例外（2026-10-10 22:13，血的教训）**：**DSV4.1 + DSpark 的 PD 无法用 `nixl`** —— SGLang 自身硬校验直接拒绝启动：
+> ```
+> ValueError: DeepSeek-V4.1 DSpark PD requires static verify, Mooncake, DP=1 and CP=1.
+> ```
+> （`srt/arg_groups/deepseek_v4_hook.py::validate_deepseek_v41_features`）
+> ⇒ 该组合下**只能** `Mooncake`；要真正走 NCCL，需另想办法（例如不带 DSpark 跑 nixl，或改用 `--disaggregation-ib-device` 把 mooncake 的 RDMA 路径配通）。
+> **教训**：改传输后端前**先跑一次 `--help`/启动 dry-run 验证该 backend 被模型接受**，不要直接重启——否则会把服务打挂（本次 30100/30200 双挂约 22 分钟）。
+
+## 投机解码：模型**自带 MTP / dspark**，永不依赖外部 draft 权重
+
+我们线上用的所有模型都**自带 MTP（nextn）预测层**或 **dspark** 头；投机解码的
+draft 能力由**基座权重内建提供**，**绝不依赖外部 draft / EAGLE 权重**。
+
+- 配置直接可见：如 `glm53_flash` 的 `text_config.num_nextn_predict_layers = 1`
+  （并含 `index_share_for_mtp_iteration = True`）。
+- 仓库内建实现：`srt/models/deepseek_v4_nextn.py`、`deepseek_nextn.py`、
+  `deepseek_v4_dspark.py`、`dspark.py`、`glm4_moe_nextn.py`、`exaone_moe_mtp.py` 等。
+
+**硬规矩（红线）**：**不要再提「需要外部 draft 权重」「去找一份 EAGLE draft」**——
+这类建议一律无效、已被明确否掉。要开投机解码，只走**基座自带的 MTP/dspark 路径**
+（`--speculative-algorithm` 选内建算法如 `NEXTN` / `DSPARK`），先查模型 `config.json`
+与仓库内建实现，**不要在外部找权重**。
 
 ## What lives here
 
@@ -14,8 +62,11 @@ Base: upstream `main` 81f27fb3a7 (+ fork increments ported in). Branch
 
 ## 1101 layout
 
-- code `/root/dsv41_upstream/sglang`, launcher `launch.sh`, weights `/mnt/workspace/DeepSeek-V4.1-Flash`
+- code `/root/dsv41_upstream/sglang` = **本树 `python/sglang/` 的 rsync 目标**（`srt/`、`kernels/` 同构；盒子是扁平包根，`PYTHONPATH=/root/dsv41_upstream`）
+- **rsync 前先对账：盒子上有攻坚热修改（如 10-12 的 `kernels/ops/moe/trtllm_lora_temp/fused_moe_lora_all.py`、`m1_gate.py`、`lora_tuning_config.py` 的 `[sdiag]` 行），盲目 local→box 会把它们抹掉。用 `rsync -rcn -i`（checksum dry-run）先列差异，盒子新文件先拉回本地再动。**
 - **after every rsync: `find /root/dsv41_upstream -name '__pycache__' -type d -exec rm -r {} +`** (stale .pyc masks updates)
+- **重启测试前必须轮换 smg API key**（2026-10-13 用户下令）：`/root/dsv41_upstream/smg_api_key.txt` 换新 key，旧 key 追加记录到 `/root/smg_api_keys_history.txt`——外部还有人拿老 key 打流量（实测 decode GPU 90%+ 是外部流量），不换 key 测量数据被污染。bench 客户端用同一个新 key。
+- launcher: `exp_l20.sh`（标准 LoRA）/ `exp_l20_dg.sh`（deep_gemm 变体，当前启动会失败，见下文）；weights `/mnt/workspace/DeepSeek-V4.1-Flash`
 - HiCache on V4.1 needs an explicit `--hicache-ratio` (auto-sizing does not support `DeepSeekV4TokenToKVPool`)
 - MoE LoRA needs `SGLANG_EXPERIMENTAL_LORA_OPTI=1` + `gate_up_proj down_proj` in `--lora-target-modules` + `--lora-use-virtual-experts`
 
@@ -83,11 +134,25 @@ Non-obvious things that broke (each cost a 30-min reload to find):
    fails the buffer check ([16, 640] vs [16, 576]; the last rank even
    truncates silently to [16, 384]). FusedMoE now keeps the raw
    `intermediate_size`; FusedMoEWithLoRA recomputes from it.
-11. **The flashinfer JIT cache is presence-based, not content-based.** After
-   editing the overlay .cu source, the JIT loads the stale .so unless it is
-   removed/renamed — it does not hash the source to detect changes. Always
-   rename the .so in `~/.cache/sglang/.cache/flashinfer/*/cached_ops/
-   sgl_fused_moe_trtllm_sm100/` after rsync'ing overlay source changes.
+11. **The overlay is JIT-compiled; cache freshness is ninja/mtime-based, not
+   content-hash-based.** Verified on flashinfer 0.6.18: `JitSpecNvcc.build_and_load()`
+   → `try_load()` returns None for the (non-AOT) JIT path → `build()` →
+   `write_ninja()` + `run_ninja()`; no `flashinfer_jit_cache` package / no
+   `flashinfer/data/aot` dir ⇒ `is_aot` is False, so there is **no AOT wheel** —
+   the `.so` is always built from source at first import. The ninja recipe uses
+   `deps = gcc` + depfiles, and `.ninja_deps` DOES track headers: `ninja -t deps`
+   lists `.../fused_activation_mxfp8_quant.cuh` as a VALID dep of
+   `csrc_trtllm_fused_moe_kernel_launcher.cuda.o` (~1498 deps). So editing a
+   `.cuh`/`.cu` with a NEWER mtime recompiles just that object and relinks
+   (~50s for the launcher object; the ~471s cold-build figure is a full
+   rebuild). Two mtime failure modes remain: (a) an rsync that preserves an
+   OLDER source mtime leaves the stale `.so`; (b) a NEWLY added `#include` is
+   not yet in `.ninja_deps`. Safe route after any overlay source change: delete
+   the module's `.o`/`.so` (or rename the `.so`) in the **LIVE** cache dir
+   `$FLASHINFER_WORKSPACE_BASE/.cache/flashinfer/<ver>/<arch>/cached_ops/
+   sgl_fused_moe_trtllm_sm100/` (1101 box:
+   `/mnt/workspace/ferrite-env-backup/bbuf-flashinfer/.cache/...`) — **not**
+   `~/.cache/sglang/.cache/flashinfer` (that holds a stale tree's build).
 12. **The trtllm-gen cubin package must be downloaded.** The 1101 box's
    flashinfer pip package has the checksums.txt manifest but NOT the actual
    .cubin files (only downloaded on demand). The decomposed FP4 MoE-LoRA
@@ -135,6 +200,32 @@ Non-obvious things that broke (each cost a 30-min reload to find):
     as dev_kernel getSfOffset / get_sf_out_offset_*) and permute the E4m3
     data with useDeepSeekFp8=false.
 
+## LoRA 作用域：`--lora-target-layers`（两种形态都支持）
+
+线上有两种适配器形态，**同一个引擎都要支持**：
+
+- **全量**：适配器覆盖全部 40 层（Tinker `all-linear`，722 张量，层 0–39）。
+- **后 20 层**：适配器只覆盖 20–39（`dsv41_moe_rnd` / `dsv41_moe_zero`，120 张量）。
+
+**后 20 层形态下，0–19 层必须零开销。** 用 `--lora-target-layers 20-39` 开启（不填 = 全量，行为不变）：
+
+1. `srt/arg_groups/fields/lora.py`：新增 `lora_target_layers: Optional[str]`。语法 `20-39` / `20,21,39` / `all`；层号与 HF 模块名一致，即适配器 safetensors 的 key 索引。
+2. `srt/lora/lora_manager.py`：
+   - `_parse_lora_target_layers()` 解析 → `self.lora_layer_ids`，并在启动日志打印 `LoRA layer filter ACTIVE: ...`；
+   - **`init_lora_modules` 是唯一的包装入口**，在此做层过滤：层不在范围 ⇒ `continue`，该层保持原生 `FusedMoE`/线性层；
+   - **加载期守卫**（`validate_new_adapter`）：适配器权重落在范围外 ⇒ **响亮 `raise ValueError`**，不静默降级。
+3. 启动器：`/root/exp_l20.sh`（后 20 层模式）；`/root/exp_thinking.sh`（全量）。
+
+**为什么是「零开销」（机制，不是估计）**：LoRA 走分解链的**唯一前提**是该层被包成 `FusedMoEWithLoRA`。层不在范围内 ⇒ 根本不包装 ⇒ 永远是原生模块 ⇒ 走 stock 融合核：**不分配 LoRA buffer、不做 VE delta、不进分解 GEMM**。不是「算出 0 再加进去」，是结构上不进入这条路径。
+
+**它修掉的浪费**：`has_active_lora` 是 **batch 级**的（`lora_manager.py` 的 `any(lora_ranks[wi] > 0)`）。旧实现把**全部 40 层**都包成 LoRA 模块，于是只要 batch 里有一个请求挂适配器，**没有权重的层也照跑整条分解链**（delta 恒 0）。后 20 层适配器在旧实现下白付 20 层 —— 这正是 `--lora-target-layers` 消除的东西。
+
+**⚠️ 实测坑（PD 分离）**：适配器必须在 **P(30100) 与 D(30200) 两侧都加载**（`/root/load_adapters.sh` 本来就是两侧循环）。只加载一侧 ⇒ 经 smg 的请求会**全部挂到客户端超时**（实测两次：256/256 bad、wall=720s），而服务端日志里**看不到明显报错**，极易误判成"改动把 LoRA 打挂了"。判据：`grep "loading completes" pd_decode.log` 应有记录。
+
+**⚠️ 对比口径铁律（2026-10-14 用户下令）**：任何 LoRA 模块/层隔离实验（`--lora-target-modules` 变体、gate_up-only / down-only 等）必须保持 `--lora-target-layers 20-39` 与历史基线一致——**别拿全量层挂载的新数字跟后 20 层历史数据比**（口径错位 2ms 级，结论全废）。隔离实验只准改 `--lora-target-modules`，`--lora-target-layers` 一律不动。
+
+**⚠️ `SGLANG_LORA_TWO_STREAM` 是死变量**：全树只有 6 处注释提到它，**没有任何 `os.environ.get` / `EnvBool` 读取点**。双流真正的开关是 `SGLANG_EXPERIMENTAL_LORA_OPTI`（`lora/layers.py` 里 `install_two_stream_overrides`）。启动脚本里写 `SGLANG_LORA_TWO_STREAM=0` 关不掉任何东西。
+
 ## Verification recipes
 
 - `test/registered/scripts/test_kv_shared_lora.py` (+ `make_kv_shared_adapters.py`)
@@ -142,3 +233,140 @@ Non-obvious things that broke (each cost a 30-min reload to find):
 - MoE LoRA: `make_zero_moe_lora.py` + `test_moe_lora_v41.py` — **a zero-weight
   adapter must reproduce the base output exactly**; that is the cheap numerical
   parity check for the decomposed path (activation + quant + deltas).
+
+## LoRA 性能攻坚：开销三分、两把死刀、一把活刀（2026-10-12 实测）
+
+### 开销三分（conc=64 decode，客户端聚合口径）
+base **5.253 ms/tok** vs LoRA **7.632 ms/tok**（差 2.379ms）。按 kernel 做差（base 980.0ms → rnd 1249.4ms，两侧 attention calls 同为 1720 ⇒ 可比）：
+
+| 桶 | 占比 | 归属 |
+| --- | --- | --- |
+| `t128x8x512_s3` GEMM 家族 | **63%** | MoE GEMM（LoRA 207.94/178.85 µs/call vs 基座 `t128x16x256_s6` 130.94/76.00） |
+| `_chunked_lora_{shrink,expand}` | **21%** | **注意力 LoRA**（`kernels/ops/gemm/chunked_sgmv_{shrink,expand}.py`，`ChunkedSgmvLoRABackend`） |
+| 其余（VE delta 等） | 15% | MoE VE + 杂项 |
+
+⇒ 单砍 63% 只到 ~6.12ms；**要 <6.0ms 必须同时动那 21%**。
+
+### 死刀 ①：runner options 不可调
+`trtllm_lora_temp/data/csrc/trtllm_fused_moe_runner.cu:377-435` + launcher 实参：`useShuffledMatrix=true`、`weightLayout=MatrixLayout::MajorK`、`usePerChannelScaling=false` **全硬编码**；`usePerTokenScaling = !is_e4m3_input`；`epilogueTileM/routeAct/transposeMmaOutput` 硬编码。
+**`fusedAct` 被 delta 的数学位置强制 false**（源码原话：`// FP4 LoRA forces unfused activation so the gate_up LoRA delta can be added pre-SwiGLU.`）。
+**物理根因**：`fusedAct=false` ⇒ GEMM 必须落 **bf16 gate_up（宽 2I，2B）**；基座融合路只落 **fp8 激活（宽 I，1B）** ⇒ **epilogue 写带宽 4×**。配置层旋钮已穷尽（tile 16/32/64/128、config 0..31、PDL、stage-cfg、消 pad 全否决）。
+
+### 死刀 ②：cuBLAS 在 V4.1 永不生效
+`SGLANG_OPT_LORA_CUBLAS{,_A,_B,_GATE_UP,_QKV,_KV_B}` 读取点全在 `kernels/ops/gemm/trtllm_lora_temp/{sgemm_lora_a,sgemm_lora_b,qkv_lora_b,gate_up_lora_b,kv_b_lora_absorbed}.py`；而 V4.1 的 `ChunkedSgmvLoRABackend.run_lora_{a,b}_sgemm` **只调** `chunked_sgmv_lora_{shrink,expand}_forward` ⇒ 那些 cuBLAS 分支**永不被调用**。同理 O7/O8/O9 双流 overrides 在 csgmv 上被 `hasattr(lora_backend,"_sgemm_info")` 挡掉、退回 stock forward。
+
+### ★ 活刀：CSGMV 调参表缺失 ⇒ 注意力 LoRA 全跑未调优默认
+`kernels/ops/gemm/lora_tuning_config.py` 加载路径：
+```python
+config_dir  = os.environ.get("SGLANG_LORA_CONFIG_DIR", <gem 目录>)
+configs_root= os.path.join(config_dir, "csgmv_configs")
+version_dir = f"triton_{triton.__version__.replace('.','_')}"
+path = os.path.join(configs_root, version_dir, f"lora_{kernel},K={K},R={R},S={S},device={dev}.json")
+```
+**现状**：`csgmv_configs/triton_3_5_1/` 里**只有 `device=NVIDIA_H200`、`R=64`、K∈{1024..6144}**；本机是 **`device=NVIDIA_L20D`、`triton 3.7.1`、R=16** ⇒ 三重不匹配，服务日志对**全部 4 个形状**都报 `no tuned config, using defaults`：
+
+| 形状 | 默认（未调优） | H200 获奖值（仅参考） |
+| --- | --- | --- |
+| shrink K=5120/576, R=16 | `BLOCK_N=16, BLOCK_K=256`，无 warps/stages | `BLOCK_N=64, BLOCK_K=64–128, warps 4–8, stages 3–4` |
+| expand K=5120/1152, R=16 | `BLOCK_N=64, BLOCK_K=16`，无 warps/stages | `BLOCK_N=64, BLOCK_K=32, warps 4–8, stages 1–3` |
+
+⚠️ **禁止盲抄 H200 表**：H200 是 R=64（shrink 的 `N=S·r`≥128），我们是 R=16（`N=S·r`=16/32/48）⇒ shrink 的 BLOCK_N 必须按我们的小 N 重调。
+调参器：`kernels/ops/gemm/tune_csgmv_l20d.py`（自写；仓库自带 `benchmark/kernels/lora_csgmv/tune_lora_csgmv.py` **本树不存在**）。它必须 monkeypatch **模块内绑定名** `chunked_sgmv_shrink.get_lora_shrink_config`（**不是** `lora_tuning_config.get_lora_shrink_config` —— 后者是 `from ... import` 的直接绑定，patch 源模块无效）。
+**chunk_size 语义**（`chunked_backend._determine_chunk_size_for_tokens`）：`num_tokens<64→16`、`≥64→32`、`≥256→128`，写入 `batch_info.max_len`（= 查表 key）。**conc=64 decode ⇒ key=32。**
+
+### ⚠️ JIT 缓存操作教训（本次踩两次）
+- 新起进程 import overlay 会触发 **flashinfer JIT 串行重建**（`nvcc --threads=1 -O3 -gencode=arch=compute_103a`，多 `.cu`，**实测 ~471s**）。缓存实目录由 `FLASHINFER_CACHE_DIR` 决定（本机曾见 `/mnt/workspace/ferrite-env-backup/bbuf-flashinfer/.cache/flashinfer/0.6.18/103a/cached_ops/sgl_fused_moe_trtllm_sm100/`），**不是** `~/.cache/sglang/.cache/flashinfer`。
+- **`timeout N ssh ...` 只杀 ssh 客户端，远端 nvcc 变孤儿继续跑** ⇒ 与后续进程**抢同一缓存目录**，两边都拖死（本次 STAGE-BENCH 300s、M1 闸门 900s 双双 exit 124 且无输出）。解法：`setsid nohup` 把构建与 SSH 解耦，**先跑一次长构建暖缓存**（`/root/warm_build.sh`，实测 471s、rc=0、无孤儿），之后各 testbed 秒级完成。孤儿必须**按精确 PID kill**（`pkill` 被 hook 拦）。
+
+### 融合核 `kernels/ops/moe/trtllm_lora_temp/fused_moe_lora_all.py`
+目标：`GEMM1 → +gate_up_delta → gated-SwiGLU(OAI α=1.702/β=1.0/limit=7.0) → MXFP8(E4M3+UE8M0)` 融成一颗，**只在寄存器留 fp32 acc、永不物化 bf16 gate_up**（正消那 4× 写带宽）。
+**已修两个硬 bug**（读码发现，非"简化"）：
+1. kernel 1 原先**从未量化、从未写 `act_sf`** ⇒ 现在走 `_e4m3_quant_tile`（per-32 UE8M0、PosInf 舍入、±448 饱和）并**同时写数据与 SF**；
+2. B 侧 MXFP4 原先**只取低 4 位**（K 维减半，数值必错）⇒ 现在 `_dequant_mxfp4_pair` 取 lo/hi 双 nibble，`join→permute→reshape` 交错成 `[2·BLOCK_K, BLOCK_N]`（**`BLOCK_K` 语义 = 打包字节数**）。
+
+**M1 闸门** `kernels/ops/moe/trtllm_lora_temp/m1_gate.py` 对拍 `M.bench_activation`。布局契约已从源码钉死（`trtllm_fused_moe_dev_kernel.cu::activationKernel`）：`inner_dim = 2*INTER`；gate_up 按 **permutedIdx**、列**交错** `(gate,up,…)`；delta 按 **expandedIdx**、行内 `[up(I) | gate(I)]`；**x1=gu[2j] ← +=delta UPPER half、x2=gu[2j+1] ← +=delta LOWER half**（搞反数值全错但不崩）；`activated` 输出是**直接激活值**（permuted 行、INTER 列），**不是** interleaved。
+
+#### ✅ 实测回填（2026-10-12）
+**M1 闸门已过**（T=64/256 两次）：
+```
+[M1-GATE] T=64   plain   max_abs=5.938e-02  max_rel=3.890e-03  ok=True
+[M1-GATE] T=256  plain   max_abs=6.231e-02  max_rel=3.891e-03  ok=True
+[M1-GATE] fused kernel imported OK: alpha=1.702 beta=1.0 limit=7.0 SF_BLOCK_A=128 SF_BLOCK_B=32
+```
+**⚠️ 关键坑（本次踩到，浪费一轮）**：`bench_activation` 的 C++ wrapper **从不设置** `gatedActAlphaPtr/BetaPtr/ClampLimitPtr`（`run()` 也只是原样透传，`dev_kernel:609-610`；结构体注释写着 `// may be null`）⇒ `gatedSiluScalars` 走**早退分支** `return silu(xGlu)*xLinear`。**所以 bench 跑的是「朴素 silu」路，不是 OAI gated 路**。拿生产公式（α=1.702/β=1.0/limit=7.0）去对拍必然 `ok=False`（实测 max_abs≈6.9）。`m1_gate.py` 现在**同时报 plain 与 gated 两个变体**：plain 对 benchmark ✅、gated 是生产契约（靠源码钉死，bench 无法覆盖）。
+
+**CSGMV 调参表已生成**（`csgmv_configs/triton_3_7_1/*NVIDIA_L20D.json`，6 张，JSON 校验通过）。conc=64 ⇒ `chunk_size=32`，实测最优 vs 原默认：
+
+| 形状 | 原默认 | 调参后（chunk=32） |
+| --- | --- | --- |
+| shrink K=5120 S=3 | `BLOCK_N=16, BLOCK_K=256` | `BLOCK_N=64, BLOCK_K=256, warps4, stages3` |
+| shrink K=5120 S=2 | `BLOCK_N=16, BLOCK_K=256` | `BLOCK_N=64, BLOCK_K=64, warps4, stages3` |
+| shrink K=576 S=1 | `BLOCK_N=16, BLOCK_K=256` | `BLOCK_N=32, BLOCK_K=64, warps8, stages3` |
+| shrink K=1152 S=1 | `BLOCK_N=16, BLOCK_K=256` | `BLOCK_N=32, BLOCK_K=64, warps4, stages3` |
+| expand K=5120 S=1 | `BLOCK_N=64, BLOCK_K=16` | `BLOCK_N=32, BLOCK_K=256, warps8, stages3` |
+| expand K=1152 S=1 | `BLOCK_N=64, BLOCK_K=16` | `BLOCK_N=64, BLOCK_K=64, warps8, stages3` |
+
+**⚠️ 校验时机坑**：`get_lora_configs` 是 `@functools.lru_cache`，`get_lora_shrink_config` 只在**首次真实 LoRA forward** 时打日志 ⇒ **服务刚就绪时 grep 日志什么都有没有**；必须等第一次带 LoRA 的请求之后再查 `Using LoRA … config from …` vs `no tuned config, using defaults`。
+
+**⚠️ 调参器坑（本次踩到）**：CSGMV 核在 `chunked_sgmv_shrink.py:71` **无条件** `tl.load(permutation + s_offset_logical)` ⇒ 合成 `LoRABatchInfo` 时 `permutation` **不能给 None**（Triton 编译期报错，且报错位置指向注释行，极难读）；给 `torch.arange(s, dtype=int32)` 即可。
+
+**⚠️ 文件名必须覆盖 `S`（num_slices）**：日志行 `LoRA shrink (K=5120, R=16)` **不带 S**，所以只按 (kernel,K,R) 写文件会**全部 miss**（实测：磁盘有文件、日志仍 56 条 `no tuned config`、0 条 `Using … config from`）。**必须写 K×S 全交叉**（本轮 18 张：K∈{576,1152,5120} × S∈{1,2,3} × {shrink,expand}）。误判风险高——**「有文件」不等于「被加载」**，唯一判据是日志出现 `Using LoRA <kernel> config from …`。
+
+**⚠️ `get_lora_configs` 是 `@functools.lru_cache` ⇒ 换表必须重启**（服务一旦跑过 LoRA forward 就把 `None` 缓存住了）。
+
+**⚠️ csgmv expand/shrink 的 `permutation` 在行映射上是「自抵消」的**（2026-10-14 实测，勿再踩）：
+`kernels/ops/gemm/chunked_sgmv_expand.py` 里 **x 和 output 都用 `s_offset_physical`** 索引
+（:107 读 x / :138 写 out；shrink 同款见 `chunked_sgmv_shrink.py:118`）⇒
+`out[perm[i]] = f(x[perm[i]])`，即等价于 **`out += scaling * (x @ W^T)`，没有任何行位移**。
+判定实验（随机 perm，`/root/a1/lora_quant/expand_opt/semantics_check.py`）：
+按"散布"理解 `out[perm[i]] += x[i]@W^T` 对拍 rel=2.8e-1（错），按"自抵消"理解 rel=1.7e-3（对）。
+`permutation` 的真实作用只是**定义哪些行属于哪个 segment**（选 adapter + chunk 切分），不是搬数据。
+⇒ 单 adapter（`--max-loras-per-batch 1`）时 M 可任意平铺、且**完全不需要 gather**；
+这也解释了为什么该 kernel 的 grid 用 segment 切（`grid=(N/BN, num_slices, num_segments)`、
+`BLOCK_M=chunk_size=32` 而每 segment 只有 8 个 expanded row ⇒ M 浪费 75%）。
+平铺改造实测（CUDA graph 计时，消 launch 开销）：M=512 仅 1.12×，M=8192 到 2.0–2.2×；
+而 decode 侧 expand 实测 ~27µs/shape 里 kernel 只有 ~5µs，**杠杆在 host launch / `torch.zeros` 分配，不在 kernel**。
+
+**⚠️ `/health` 返回 200 但 body 为空** ⇒ 就绪判据必须用 HTTP code：`curl -s -o /dev/null -m 5 -w "%{http_code}"`；用 `[ -n "$(curl -s …/health)" ]` 会**永远判不就绪**（本轮踩到，重启脚本空转 20 分钟）。
+
+**⚠️ `exp_l20.sh` 自带 stop 段**（日志 `[exp_m2] stop current stack` → `ports free after …`）⇒ 重启**不必**手工 kill 旧 P/D/smg；手工 kill 只是冗余。
+
+### 🔴 调参键的真凶是 `R = --max-lora-rank`，**不是适配器的真实 rank**（本次连错两轮）
+`get_lora_shrink_config` 的 `R` 来自 `MAX_RANK = weights.shape[1] // num_slices`，而**权重维被 padding 到 `--max-lora-rank`**（本环境 = 32）。所以：
+- 启动器写 `--max-lora-rank 32` ⇒ 查表键是 **`R=32`**，哪怕适配器 safetensors 里 `lora_A.weight` 的形状是 `[1, 16, 5120]`（真 rank 16）。
+- **日志行 `LoRA shrink (K=5120, R=16)` 是更早一轮 `--max-lora-rank 16` 的旧输出** ⇒ 拿它当依据就会写出整批 `R=16` 文件、**全部 miss**（现象：磁盘有文件、日志全是 `no tuned config`、0 条 `Using … config from`）。
+
+**⇒ 判据只有一条：日志出现 `Using LoRA <kernel> config from …<file>.json`。** 出不来就是键错了。
+
+**⇒ 诊断手段（本次靠它一击定案）**：给 `lora_tuning_config.get_lora_configs` 开头插一行
+```python
+logger.info("[sdiag] get_lora_configs kernel=%s K=%s R=%s S=%s -> %s", kernel, K, R, S, json_file_name)
+```
+**重启后第一次 LoRA forward 就会把真实 (kernel,K,R,S) 打出来**（本轮实测键：`shrink {2048,5120,5120S2,576}` + `expand {1152S2,32320,5120}`）。**别再从形状反推。**
+
+### 🔴 CSGMV 块大小调参在 conc=64 **端到端收益为零**（实测结案，勿再走）
+`R=32` 表**确认生效**（7/7 `Using LoRA config from`、`no tuned config` 归零）后的 A/B：
+
+| 指标 | 未调优 | 调参生效 | Δ |
+| --- | --- | --- | --- |
+| base p50 | 5.216 ms | 5.087 ms | 噪声（client_agg 反降 10624→10482） |
+| **rnd p50** | **7.632 ms** | **7.636 ms** | **+0.004 ms ⇒ 无改善** |
+
+**⇒ 结论：decode 时 `chunk=32`、各段极短 ⇒ 这些 kernel 是 launch/延迟受限，不是 tile 效率受限**，故 `BLOCK_N/BLOCK_K/num_warps/num_stages` 怎么调都不影响端到端。**该桶实测关闭**（不是推测关闭）。
+
+### 🔬 kernel 微基准协议（2026-10-14 三 lane 实测教训）
+给 LoRA/csgmv 类小 kernel 计时，**「flush+sync 再 event」的 raw 协议会把 ~20–30µs 启动延迟算进数字**（空 kernel grid=1 实测 19.65µs），decode T=64 的真实 kernel 时间只有个位数 µs ⇒ raw 协议下「变体加速 2×」常常只是「少了一层 launch」。**判据必须用 CUDA Graph 内计时**（capture 后回放消掉 host launch），或 `graph[flush+kernel] − graph[flush]` 的 cold 口径。另：**权重不是 per-expert 读一次**——shrink 权重按 m-block 重复读（T=64 时 32×），算 issued 流量别按 per-expert；decode T=64 下 MoE shrink 两形状 graph 内合计仅 ~11µs（gate_up 6.59 + down 4.44），**先塞 graph/PDL 再谈 kernel 数学**。
+
+### ⛔ 红线（2026-10-12 用户下令）：**禁止把 LoRA 烘进权重**
+「把 LoRA 直接烘进权重、让 LoRA 请求走基座同一条快路径」——**绝对不行也不允许，必须动态**。
+- 即：**不得**物化 `W_eff = W + s·B·A` 去蹭基座的 fused 快路径；LoRA 的 delta 必须**每请求现算**。
+- 推论：`fusedAct=false`（delta 必须加在 SwiGLU 之前）这个约束**不能靠改权重绕开** ⇒ 想在 base 那条 `t128x16x256_s6` 快路上跑 LoRA，**只能由我们自己的算子**把 `GEMM1 → +delta → gated-SwiGLU → MXFP8` 融成一颗（即 `fused_moe_lora_all.py`，delta 仍从适配器的 A/B 动态算出）。
+- 上述「权重物化」方案**已作废**：即便显存账可行也**不允许**。
+
+### 🟢 63% 桶的门槛实验（未定论，但已具备条件）
+- `MoeRunnerBackend.DEEP_GEMM = "deep_gemm"` 合法；`mxfp4.py:386-390` 原文：*"True W4A8: DeepGEMM fp8_fp4 grouped GEMM (SM100 MXF8F6F4 UMMA) … Weights stay MXFP4 … zero requantization"*。
+- `deep_gemm 0.2.0` 已装，导出 `m_grouped_fp8_fp4_gemm_nt_masked`（正是 A=MXFP8 × B=MXFP4）。
+- 树内有 `srt/layers/moe/moe_runner/deep_gemm.py::DeepGemmRunnerCore`，且 **GEMM 与「SwiGLU+量化」是分开两步**（`:771` GEMM1 → `:813 _varlen_deep_gemm_silu_mul_quant`）⇒ **LoRA delta 天然可插在 `:771` 之后、`:813` 之前**。
+- **但 LoRA 只在 `experimental_sgl_trtllm` 一个 backend 里实现**（`srt/lora/trtllm_lora_temp/lora_layer.py` 的 `init_/dispatch_experimental_sgl_trtllm_lora`；`srt/lora/` 全树对 `deep_gemm` 引用数 = 0）⇒ **`--moe-runner-backend deep_gemm` 会完全绕过 LoRA ⇒ 只能先测 base。**
+- 变体启动器 `/root/exp_l20_dg.sh`（只插 `--moe-runner-backend deep_gemm`，原 `exp_l20.sh` 不动）；base-only 基准脚本 `/tmp/bench_dg_base.sh`。
+- **判据**：base p50 显著优于 **5.087–5.216 ms** ⇒ 63% 可攻；持平/更差 ⇒ **两者都要落 bf16 gate_up（4× 写带宽结构不变）就是墙**。

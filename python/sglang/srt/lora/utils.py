@@ -254,6 +254,22 @@ def get_default_hidden_dim(
         # For lm_head: input is hidden_size, output is vocab_size
         # if contain extra tokens will be added; otherwise is 0.
         return config.hidden_size, config.vocab_size + lora_added_vocab_size
+    elif module_name == "self_attn.wq_a":
+        # DeepSeek-V4.x MLA: wq_a = ReplicatedLinear(hidden, q_lora_rank)
+        return config.hidden_size, config.q_lora_rank
+    elif module_name == "self_attn.wkv":
+        # wkv = ReplicatedLinear(hidden, head_dim)
+        return config.hidden_size, head_dim
+    elif module_name == "self_attn.wo_b":
+        # wo_b = RowParallelLinear(o_groups * o_lora_rank, hidden_size).
+        # The HF-config field is `o_groups` (the model reads it as n_groups).
+        # Return the FULL width; get_lora_A_shape divides by tp because
+        # "self_attn.wo_b" is listed in ROW_PARALLELISM_LINEAR_LORA_NAMES.
+        _og = getattr(config, "o_groups", None) or getattr(config, "n_groups", 1)
+        return (
+            _og * getattr(config, "o_lora_rank", config.hidden_size),
+            config.hidden_size,
+        )
     else:
         raise NotImplementedError("get_hidden_dim not implemented for " + module_name)
 
@@ -301,6 +317,12 @@ def get_normalized_target_modules(
         "wq_b": "indexer.wq_b",
         "wk": "indexer.wk",
         "weights_proj": "indexer.weights_proj",
+        # Tinker/checkpoint names kept as-is so substring matching in
+        # get_target_module_name() hits `...self_attn.wq_a...` etc.
+        "wq_a": "self_attn.wq_a",
+        "wkv": "self_attn.wkv",
+        "wo_b": "self_attn.wo_b",
+
     }
 
     result = set()
@@ -356,6 +378,7 @@ def get_target_module_name(full_module_name: str, target_modules: Set[str]) -> s
 
 EMBEDDING_NAMES = ["embed_tokens", "lm_head"]
 ROW_PARALLELISM_LINEAR_LORA_NAMES = [
+    "self_attn.wo_b",
     "o_proj",
     "out_proj",
     "down_proj",

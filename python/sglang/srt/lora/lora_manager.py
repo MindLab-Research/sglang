@@ -17,7 +17,7 @@
 
 import logging
 import re
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Dict, Iterable, List, Optional, Sequence, Set
 
 import torch
 
@@ -63,6 +63,42 @@ from sglang.srt.utils.hf_transformers_utils import AutoConfig
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_lora_target_layers(spec) -> Optional[Set[int]]:
+    """Parse --lora-target-layers ('20-39', '20,21,39', 'all'/None) into a layer-id set.
+
+    Returns None when the filter is disabled (full-model LoRA). Ids use the same
+    numbering as the HF module names, i.e. the adapter safetensors key indices.
+    """
+    if spec is None:
+        return None
+    spec_s = str(spec).strip()
+    if not spec_s or spec_s.lower() in ("all", "*"):
+        return None
+    out: Set[int] = set()
+    for raw in spec_s.split(","):
+        part = raw.strip()
+        if not part:
+            continue
+        if "-" in part:
+            lo_s, hi_s = part.split("-", 1)
+            lo, hi = int(lo_s), int(hi_s)
+            if lo < 0 or hi < lo:
+                raise ValueError(
+                    "Invalid --lora-target-layers range %r: expect LO-HI with 0 <= LO <= HI" % part
+                )
+            out.update(range(lo, hi + 1))
+        else:
+            v = int(part)
+            if v < 0:
+                raise ValueError(
+                    "Invalid --lora-target-layers entry %r: layer ids must be >= 0" % part
+                )
+            out.add(v)
+    if not out:
+        raise ValueError("--lora-target-layers resolved to an empty layer set")
+    return out
 
 
 class LoRAManager:
@@ -127,6 +163,16 @@ class LoRAManager:
             get_lora().experts_shared_outer_loras
         )
         self.lora_use_virtual_experts: bool = get_lora().lora_use_virtual_experts
+        self.lora_layer_ids: Optional[Set[int]] = _parse_lora_target_layers(
+            get_lora().lora_target_layers
+        )
+        if self.lora_layer_ids is not None:
+            logger.info(
+                "LoRA layer filter ACTIVE: LoRA is mounted on %d layer(s) %s only; "
+                "every other layer stays unwrapped on the stock path (zero LoRA overhead).",
+                len(self.lora_layer_ids),
+                sorted(self.lora_layer_ids),
+            )
         self.lora_strict_loading: bool = get_lora().lora_strict_loading
         self.speculative_algorithm: Optional[str] = get_spec().speculative_algorithm
 
@@ -418,6 +464,28 @@ class LoRAManager:
                 f"Failed to load {lora_ref.lora_name} because LoRA serving currently doesn't support DoRA adapters"
             )
 
+        # --lora-target-layers: an adapter whose weights land on unwrapped layers would
+        # be silently under-applied in zero-overhead mode. Reject it loudly instead.
+        if self.lora_layer_ids is not None:
+            _guard_layers = self._adapter_weight_layers(lora_config)
+            if _guard_layers is None:
+                logger.warning(
+                    "--lora-target-layers is set but adapter %s weight layers could not "
+                    "be inspected; skipping the range check.",
+                    lora_ref.lora_name,
+                )
+            else:
+                _outside = sorted(_guard_layers - self.lora_layer_ids)
+                if _outside:
+                    raise ValueError(
+                        f"Failed to load {lora_ref.lora_name}: adapter carries weights for "
+                        f"layer(s) {_outside}, which are outside the configured "
+                        f"--lora-target-layers range {sorted(self.lora_layer_ids)}. "
+                        f"Those layers are deliberately left unwrapped (zero-overhead "
+                        f"mode), so this adapter would be silently under-applied. "
+                        f"Widen --lora-target-layers, or drop it for full-model LoRA."
+                    )
+
         # kv_shared promises the adapter never writes persistent KV, so its
         # requests can share the base model's radix namespace.
         #
@@ -664,6 +732,23 @@ class LoRAManager:
         self.lora_backend.reset_batch_state()
 
     def prepare_lora_batch(self, forward_batch: ForwardBatch):
+        import os as _osd
+
+        if _osd.environ.get("SGLANG_DEBUG_LORA"):
+            _cap = None
+            try:
+                from sglang.srt.model_executor.runner_utils.capture_mode import (
+                    get_capture_lora_variant,
+                )
+
+                _cap = get_capture_lora_variant()
+            except Exception:
+                pass
+            print(
+                f"[DBG-PREP] lora_ids={list(forward_batch.lora_ids)[:3]} cap={_cap} "
+                f"bi={type(self.lora_backend.batch_info).__name__ if self.lora_backend.batch_info is not None else None}",
+                flush=True,
+            )
         # Some internal-only backends (currently UNO) use explicit token-row
         # routing for their adapted forwards and want all-base batches to run
         # through the plain model path.  Clear any routing retained by the
@@ -1064,7 +1149,7 @@ class LoRAManager:
                 _use_dsa_indexer_fusion,
             )
 
-            if _use_dsa_indexer_fusion:
+            if _use_dsa_indexer_fusion():
                 raise ValueError(
                     f"LoRA targets the DSA indexer ({sorted(indexer_targets)}), which is "
                     "incompatible with DSA indexer Q/K fusion. Set "
@@ -1211,6 +1296,7 @@ class LoRAManager:
             experts_shared_outer_loras=self.experts_shared_outer_loras,
             strict_loading=self.lora_strict_loading,
             enable_lora_overlap_loading=self.enable_lora_overlap_loading,
+            layer_filter=self.lora_layer_ids,
         )
 
         # Initializing memory pool with base model
@@ -1218,7 +1304,13 @@ class LoRAManager:
 
     def set_lora_module(self, module_name, module):
         """Wrap any module (standard or MoE) with LoRA support."""
-        lora_module = get_lora_layer(module, self.lora_backend)
+        try:
+            lora_module = get_lora_layer(module, self.lora_backend)
+        except Exception as _e:
+            raise Exception(
+                f"[diag] No LoRA layer supported: module_name={module_name!r} "
+                f"type={type(module)} err={_e}"
+            ) from _e
         replace_submodule(self.base_model, module_name, lora_module)
         return lora_module
 
@@ -1268,6 +1360,14 @@ class LoRAManager:
         from sglang.srt.models.inkling_common.dense_mlp import InklingBatchDenseMLP
 
         for module_name, module in self.base_model.named_modules():
+            # --lora-target-layers: leave out-of-range layers fully unwrapped so they
+            # never enter the LoRA (decomposed) MoE path and cost exactly what the
+            # non-LoRA model costs. Modules with no resolvable layer id (embed_tokens,
+            # lm_head) are never filtered here.
+            if self.lora_layer_ids is not None:
+                _lid = get_layer_id(module_name)
+                if _lid is not None and _lid not in self.lora_layer_ids:
+                    continue
             # Handle embed_tokens and lm_head before the should_apply_lora gate,
             # since VL models' should_apply_lora patterns only match language
             # model layers and would incorrectly skip these.

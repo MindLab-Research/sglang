@@ -149,6 +149,7 @@ class LoRAMemoryPool:
         experts_shared_outer_loras: bool = False,
         strict_loading: bool = False,
         enable_lora_overlap_loading: bool = False,
+        layer_filter=None,
     ):
         self.base_hf_config: AutoConfig = base_hf_config
         self.num_layer: int = base_hf_config.num_hidden_layers
@@ -162,6 +163,9 @@ class LoRAMemoryPool:
         self.experts_shared_outer_loras: bool = experts_shared_outer_loras
         self.strict_loading: bool = strict_loading
         self.enable_lora_overlap_loading: bool = enable_lora_overlap_loading
+        # --lora-target-layers: only these layer ids get LoRA buffers. Layers
+        # outside the set stay unwrapped, so their buffers are dead weight.
+        self.layer_filter = set(layer_filter) if layer_filter else None
         self.pin_memory_available: bool = is_pin_memory_available()
 
         # Under EP with a Triton/DeepGEMM runner, `StandardDispatcher` remaps
@@ -464,14 +468,14 @@ class LoRAMemoryPool:
             if self.experts_shared_outer_loras and module_name in (
                 "gate_up_proj_moe",
                 "gate_up_proj_shared_moe",
-                # DeepSeek-V4.1: down A shared too. The adapters ship A as 3-D
+                # NOTE: down A is PER-EXPERT for Tinker-exported adapters
+                # (the kernel requests experts_shared_outer_loras_a=False
+                # on the down call), so it is intentionally NOT listed here. The adapters ship A as 3-D
                 # [1, r, inter] (shared), and a per-expert down-A buffer would
                 # expand the shrink routing to n_routed(384) * max_loras
                 # virtual buckets (>=1024 -> _align_block_size_large, whose
                 # JIT kernel faults) while the loader only fills expert 0 of
                 # the per-expert dict anyway.
-                "down_proj_moe",
-                "down_proj_shared_moe",
             ):
                 expert_dim = 1
             return (
@@ -584,8 +588,6 @@ class LoRAMemoryPool:
                 # (~450MB/layer/rank) and the expand routing to
                 # 384*max_loras virtual buckets >= 1024, whose
                 # _align_block_size_large JIT kernel faults.
-                "gate_up_proj_moe",
-                "gate_up_proj_shared_moe",
             ):
                 expert_dim = 1
             return (self.max_loras_per_batch, expert_dim, output_dim, max_lora_dim)
@@ -768,6 +770,36 @@ class LoRAMemoryPool:
             self.get_lora_B_shape,
         )
 
+
+        # --lora-target-layers: drop the per-layer LoRA buffers of layers that
+        # were deliberately left unwrapped. Those layers never load adapter
+        # weights (enforced at load time) and have no LoRA module holding a
+        # reference, so replacing the tensors is safe. The placeholder keeps
+        # dim 0 (= max_loras_per_batch) so _clear_buffer_slot_for_base()'s
+        # tensor[buffer_id].zero_() still works, while any real use fails loudly
+        # on a shape mismatch.
+        if self.layer_filter is not None:
+            freed = 0
+            for buf_dict in (self.A_buffer, self.B_buffer):
+                for seq in buf_dict.values():
+                    for idx in range(len(seq)):
+                        if idx in self.layer_filter:
+                            continue
+                        t = seq[idx]
+                        if t is None or t.numel() == 0:
+                            continue
+                        freed += t.numel() * t.element_size()
+                        seq[idx] = torch.zeros(
+                            (self.max_loras_per_batch, 0),
+                            dtype=self.dtype,
+                            device=t.device,
+                        )
+            logger.info(
+                "LoRA layer filter: freed %.2f MiB of per-layer LoRA buffers "
+                "(layers outside %s keep no buffer).",
+                freed / 1024 / 1024,
+                sorted(self.layer_filter),
+            )
     def _get_maybe_cached_weight_for_transfer(
         self,
         pinned_weight_store: Dict[str, torch.Tensor],
@@ -1205,8 +1237,6 @@ class LoRAMemoryPool:
                         # the adapters ship it 3-D [1, r, inter]; load it
                         # through the shared slot instead of the per-expert
                         # dict path.
-                        "down_proj_moe",
-                        "down_proj_shared_moe",
                     ):
                         if weights is None or (
                             isinstance(weights, dict) and not weights
@@ -1216,7 +1246,7 @@ class LoRAMemoryPool:
                             if weights.shape[0] != 1:
                                 raise ValueError(
                                     f"experts_shared_outer_loras is enabled but "
-                                    f"gate_up_proj_moe lora_A has expert_dim="
+                                    f"{name!r} lora_A has expert_dim="
                                     f"{weights.shape[0]} (expected 1)."
                                 )
                             assert isinstance(weights_cache_key, str)
@@ -1354,8 +1384,6 @@ class LoRAMemoryPool:
                         # get_lora_B_shape): the adapters ship it 3-D [1, N, r],
                         # so load it through the shared slot instead of the
                         # per-expert dict path.
-                        "gate_up_proj_moe",
-                        "gate_up_proj_shared_moe",
                     ):
                         if weights is None or (
                             isinstance(weights, dict) and not weights
@@ -1366,7 +1394,7 @@ class LoRAMemoryPool:
                             if weights.shape[0] != 1:
                                 raise ValueError(
                                     f"experts_shared_outer_loras is enabled but "
-                                    f"down_proj_moe lora_B has expert_dim="
+                                    f"{name!r} lora_B has expert_dim="
                                     f"{weights.shape[0]} (expected 1)."
                                 )
                             buffer_view = target_buffer[buffer_id, 0, :, :lora_rank]

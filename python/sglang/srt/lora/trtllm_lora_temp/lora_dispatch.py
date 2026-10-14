@@ -831,6 +831,11 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora(
     # (exactly 0.0) and a pass-through's zero delta are bit-identical into the
     # activation's x + 0.0 -> x.
     has_active_lora = lora_info.has_active_lora
+    # F1 ablation (numerically lossless): SKIP_DELTA=1 degrades to the pass-through zero-delta
+    # path -- identical numerics to a zero-weight adapter, but the LoRA delta kernels are skipped.
+    import os as _abl_os
+    if _abl_os.environ.get("SGLANG_MOE_LORA_SKIP_DELTA") == "1":
+        has_active_lora = False
     topk_ids = topk_output.topk_ids
     topk_weights = topk_output.topk_weights
     use_virtual_lora_store = bool(
@@ -987,13 +992,24 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora(
     # the first 576 columns (the padded tail has no LoRA weights). The slice
     # must be contiguous for the VE kernel's stride assumptions.
     if has_active_lora:
+        # P-B (2026-10-13): SGLANG_LORA_DOWN_NOCONTIG=1 skips the full D2D
+        # contiguous copy by handing the VE chain a row-strided view
+        # ([T*topk, 640] stride, reading the first 576 columns). The VE
+        # kernels must tolerate the row stride — gated off by default;
+        # enable only after the G1 zero==pass-through bit-exact gate passes.
+        import os as _os_pb
+
+        _down_nocontig = _os_pb.environ.get("SGLANG_LORA_DOWN_NOCONTIG") == "1"
+        if _inter > _inter_ve and not _down_nocontig:
+            _down_hs = activation_lora_input[..., :_inter_ve].contiguous().view(
+                -1, _inter_ve)
+        elif _inter > _inter_ve:
+            _down_hs = activation_lora_input.view(-1, _inter)[:, :_inter_ve]
+        else:
+            _down_hs = activation_lora_input.view(-1, _inter)
         merged_experts_fused_moe_lora_add(
             output=output,
-            hidden_states=(
-                activation_lora_input[..., :_inter_ve]
-                if _inter > _inter_ve
-                else activation_lora_input
-            ).contiguous().view(-1, min(_inter, _inter_ve)),
+            hidden_states=_down_hs,
             lora_a=lora_info.down_lora_a_weights,
             lora_b=lora_info.down_lora_b_weights,
             topk_ids=topk_ids,

@@ -489,7 +489,7 @@ def trtllm_fp4_block_scale_routed_moe_lora(
         enable_pdl,
         act_type,
         output,
-        [-1, -1],  # config_index (autotuner)
+        _lora_tactic_hotswap_v3(),  # config_index (env/file sweep)
         norm_topk_prob,
         None,  # routing_replay_out
         gate_up_lora_delta,
@@ -522,3 +522,52 @@ def trtllm_fp4_block_scale_moe_lora_finalize(
         routed_scaling_factor,
     )
     return output
+
+# --- sweep-only: LoRA MoE tactic from env, read ONCE at import -------------------------------
+# SGLANG_LORA_MOE_TACTIC="<tile_N>,<config>"  (e.g. "64,3");  default/[] => [-1, -1] (unchanged).
+def _parse_lora_moe_tactic():
+    raw = _os.environ.get("SGLANG_LORA_MOE_TACTIC", "").strip()
+    if raw:
+        try:
+            parts = [int(x) for x in raw.split(",")]
+            if len(parts) == 2:
+                return parts
+        except Exception:
+            pass
+    return [-1, -1]
+
+
+import os as _os
+
+_LORA_MOE_TACTIC_FROM_ENV = _parse_lora_moe_tactic()
+
+# --- sweep-only: LoRA MoE tactic = env default + 1s-cached file override ----------------------
+# /tmp/lora_tactic.txt 内容形如 "64,3" (tile_N,config); 缺失/非法 => 回落 env => 回落 [-1,-1].
+def _lora_tactic_hotswap_v3():
+    now = _sweep_v3_time.time()
+    if now - _SWEEP_V3_CACHE["t"] > 1.0:
+        raw = None
+        try:
+            with open("/tmp/lora_tactic.txt") as _f:
+                raw = _f.read().strip()
+        except Exception:
+            raw = None
+        if not raw:
+            raw = _sweep_v3_os.environ.get("SGLANG_LORA_MOE_TACTIC", "")
+        val = [-1, -1]
+        if raw:
+            try:
+                parts = [int(x) for x in raw.split(",")]
+                if len(parts) == 2:
+                    val = parts
+            except Exception:
+                val = [-1, -1]
+        _SWEEP_V3_CACHE["v"] = val
+        _SWEEP_V3_CACHE["t"] = now
+    return list(_SWEEP_V3_CACHE["v"])
+
+
+import os as _sweep_v3_os
+import time as _sweep_v3_time
+
+_SWEEP_V3_CACHE = {"t": 0.0, "v": [-1, -1]}

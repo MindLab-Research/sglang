@@ -3396,7 +3396,7 @@ public:
               : nullptr,
           reinterpret_cast<uint8_t *>(act_fp8.data_ptr()),
           reinterpret_cast<uint8_t *>(act_fp8_sf.data_ptr()), sfLayout,
-          stream);
+          stream, enable_pdl);
     } else if (fuseActQuant && inter / 16 <= 512) {
       // Fused: gate_up (interleaved) + lora_delta -> act_fp4/sf/per_token +
       // activation_lora_input, without materializing activated_bf16. >512 SF

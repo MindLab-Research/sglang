@@ -43,6 +43,16 @@ class Lora(msgspec.Struct):
         Optional[int],
         "The maximum rank of LoRA adapters. If not specified, it will be automatically inferred from the adapters provided in --lora-paths.",
     ] = None
+
+    lora_target_layers: A[
+        Optional[str],
+        "Restrict LoRA to a subset of decoder layers, e.g. '20-39' or '20,21,39'. "
+        "Layer ids use the same numbering as the HF module names "
+        "(\"model.layers.<i>\"), i.e. exactly the indices in the adapter safetensors keys. "
+        "Layers outside the range are NOT wrapped for LoRA, allocate no LoRA buffers "
+        "and always run the stock non-LoRA path, so they pay ZERO LoRA overhead. "
+        "Unset = all layers (full-model LoRA).",
+    ] = None
     lora_target_modules: A[
         Optional[Union[set[str], List[str]]],
         Arg(

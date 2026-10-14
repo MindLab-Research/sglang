@@ -72,6 +72,8 @@ def get_lora_configs(
     or None if no config file is found.
     """
     json_file_name = get_lora_config_file_name(kernel, K, R, S)
+    logger.info("[sdiag] get_lora_configs kernel=%s K=%s R=%s S=%s -> %s",
+                kernel, K, R, S, json_file_name)
 
     config_dir = os.environ.get(
         "SGLANG_LORA_CONFIG_DIR", os.path.dirname(os.path.realpath(__file__))

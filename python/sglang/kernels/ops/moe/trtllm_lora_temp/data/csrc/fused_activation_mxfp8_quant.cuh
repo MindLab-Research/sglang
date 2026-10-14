@@ -55,7 +55,7 @@ inline __device__ float fusedGatedSilu(float alpha, float beta, bool hasClamp,
   return act * (xLinear + beta);
 }
 
-template <uint32_t BLOCK_SIZE, bool SF_128x4>
+template <uint32_t BLOCK_SIZE, bool SF_128x4, bool USE_PDL = false>
 __global__ void fusedActMxfp8QuantKernel(
     int m,         // num expanded rows (num_tokens * top_k)
     int innerHalf, // inter; multiple of 32; innerHalf/32 <= BLOCK_SIZE
@@ -75,6 +75,10 @@ __global__ void fusedActMxfp8QuantKernel(
     uint8_t *__restrict__ scaleOutput) { // swizzled UE8M0 SF
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
   constexpr int SF_VEC = 32;
+  if (USE_PDL) {
+    // PDL consumer: wait for GEMM1 (gateUp producer) to finish before reading.
+    cudaGridDependencySynchronize();
+  }
   int const expandedIdx = blockIdx.x;
   if (expandedIdx >= m) {
     return;
@@ -224,6 +228,11 @@ __global__ void fusedActMxfp8QuantKernel(
       SF_128x4 ? tk::get_sf_out_offset_128x4(0, permutedIdx, blk, m, numBlks)
                : tk::get_sf_out_offset_8x4(0, permutedIdx, blk, m, numBlks);
   scaleOutput[sfOffset] = tmpSFVal.__x;
+
+  if (USE_PDL) {
+    // PDL producer: quant outputs are written — GEMM2 may start its preamble.
+    cudaTriggerProgrammaticLaunchCompletion();
+  }
 #else
   (void)m;
   (void)innerHalf;
@@ -247,9 +256,39 @@ inline void launchFusedActMxfp8Quant(
     int32_t const *expandedIdxToPermutedIdx, float const *alphaPtr,
     float const *betaPtr, float const *clampLimitPtr, uint8_t *weightOutput,
     uint8_t *scaleOutput, tensorrt_llm::QuantizationSFLayout sfLayout,
-    cudaStream_t stream) {
+    cudaStream_t stream, bool usePdl = false) {
   dim3 const grid(static_cast<uint32_t>(m));
-  dim3 const block(128);
+  // One thread handles one 32-element SF block (numBlks = innerHalf/32, e.g. 20
+  // for V4.1's 640 padded inter). A fixed 128-thread block idles 15.6% of its
+  // threads at 20 blocks; size the block to the actual need (multiple of 32,
+  // capped at 128 so inter<=4096 stays safe: 4096/32=128 blocks).
+  uint32_t const nblk = static_cast<uint32_t>((innerHalf + 31) / 32);
+  uint32_t const blockThreads = std::min<uint32_t>(128, ((nblk + 31) / 32) * 32);
+  dim3 const block(blockThreads);
+  if (usePdl) {
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[0].val.programmaticStreamSerializationAllowed = 1;
+    cudaLaunchConfig_t cfg{};
+    cfg.gridDim = grid;
+    cfg.blockDim = block;
+    cfg.dynamicSmemBytes = 0;
+    cfg.stream = stream;
+    cfg.attrs = attr;
+    cfg.numAttrs = 1;
+    if (sfLayout == tensorrt_llm::QuantizationSFLayout::SWIZZLED_128x4) {
+      cudaLaunchKernelEx(&cfg, fusedActMxfp8QuantKernel<128, true, true>,
+                         m, innerHalf, innerDim, gateUp, loraDelta, loraInputOut,
+                         expandedIdxToPermutedIdx, alphaPtr, betaPtr,
+                         clampLimitPtr, weightOutput, scaleOutput);
+    } else {
+      cudaLaunchKernelEx(&cfg, fusedActMxfp8QuantKernel<128, false, true>,
+                         m, innerHalf, innerDim, gateUp, loraDelta, loraInputOut,
+                         expandedIdxToPermutedIdx, alphaPtr, betaPtr,
+                         clampLimitPtr, weightOutput, scaleOutput);
+    }
+    return;
+  }
   if (sfLayout == tensorrt_llm::QuantizationSFLayout::SWIZZLED_128x4) {
     fusedActMxfp8QuantKernel<128, true><<<grid, block, 0, stream>>>(
         m, innerHalf, innerDim, gateUp, loraDelta, loraInputOut,

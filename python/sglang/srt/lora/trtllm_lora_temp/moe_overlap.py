@@ -17,6 +17,7 @@ from sglang.srt.lora.trtllm_lora_temp import (
     get_original_bf16_moe_lora_func,
     get_original_fp4_moe_lora_func,
     get_original_moe_lora_func,
+    get_original_mxfp4_moe_lora_func,
     is_two_stream_active,
 )
 
@@ -43,6 +44,11 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora_two_stream(
     use_virtual_lora_store = bool(
         lora_info.lora_use_virtual_experts and lora_info.max_lora_rank > 0
     )
+    import os as _o2, sys as _s2
+    if _o2.environ.get("SGLANG_TS_DIAG") == "1" and not getattr(_o2, "_ts_printed_hit", False) and use_virtual_lora_store:
+        _o2._ts_printed_hit = True
+        print("[TS-ACTIVE] fp4 two-stream ENTERED (tokens=%s max_rank=%s)" % (
+            hidden_states.shape[0], lora_info.max_lora_rank), flush=True, file=_s2.stderr)
     # Two-stream requires virtual-experts LoRA AND a decode-shaped batch.
     # Fall back to the original implementation for anything else (prefill,
     # non-virtual LoRA, non-LoRA capture, etc.).
@@ -355,6 +361,11 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp4_lora_two_stream(
         lora_info.lora_use_virtual_experts and lora_info.max_lora_rank > 0
     )
     if not (use_virtual_lora_store and is_two_stream_active(hidden_states)):
+        import os as _o, sys as _s
+        if _o.environ.get("SGLANG_TS_DIAG") == "1" and not getattr(_o, "_ts_printed_fallback", False):
+            _o._ts_printed_fallback = True
+            print("[TS-ACTIVE] fp4 two-stream FALLBACK (virtual=%s active=%s tokens=%s)" % (
+                use_virtual_lora_store, is_two_stream_active(hidden_states), hidden_states.shape[0]), flush=True, file=_s.stderr)
         return get_original_fp4_moe_lora_func()(
             dispatch_output, quant_info, runner_config, lora_info
         )
@@ -789,4 +800,360 @@ def fused_experts_none_to_experimental_sgl_trtllm_bf16_lora_two_stream(
         local_expert_offset=quant_info.local_expert_offset,
         local_num_experts=runner_config.num_local_experts,
     )
+    return StandardCombineInput(hidden_states=output)
+
+
+# M2-v2 rebase (step3): known-good single-stream mxfp4 body + incremental side-stream delta.
+_MB_ENTERED = [False]  # M2-v2 tracer state
+import os as _o
+
+
+def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora_two_stream(
+    dispatch_output,
+    quant_info,
+    runner_config,
+    lora_info,
+):
+    """DeepSeek-V4.1 MXFP4 (SM100 trtllm-gen) MoE-LoRA dispatch.
+
+    Sibling of ``fused_experts_none_to_experimental_sgl_trtllm_fp4_lora`` for the
+    sglang MXFP4 checkpoint format and its gated SwiGLU with the OAI / GPT-OSS
+    activation controls (alpha=1.702, beta=1.0, clamp_limit=7.0 — the same
+    parameters the non-LoRA ``_fused_experts_flashinfer_mxfp4_sm100_trtllm_gen``
+    path passes to the trtllm-gen kernel).
+
+    Decomposed (unfused-activation) pipeline: routing -> gather -> gate_up grouped
+    GEMM (raw 2*inter) -> activation that adds ``gate_up_lora_delta`` pre-SwiGLU
+    and captures ``activation_lora_input`` -> MXFP8 quant -> down grouped GEMM ->
+    finalize, then the virtual-experts down-LoRA is merged into the output.
+
+    Weight/scale layout (see ``mxfp4.py``): ``w13_weight``/``w2_weight`` are packed
+    e2m1, ``w13_weight_scale`` is e4m3x2, ``w2_weight_scale`` is ue8m0, and both
+    biases are fp32 per-expert. The kernel consumes them as-is.
+    """
+    # M2-v2: replay of lora_dispatch.py module-level imports
+    from typing import TYPE_CHECKING
+    import torch
+    from sglang.kernels.ops.quantization.fp8_kernel import per_token_group_quant_fp8
+    from sglang.srt.distributed.device_communicators.pynccl_allocator import use_symmetric_memory
+    from sglang.srt.layers.dp_attention import is_allocation_symmetric
+    from sglang.srt.runtime_context import get_parallel
+    from sglang.srt.utils.common import next_power_of_2
+    from sglang.kernels.ops.moe.trtllm_lora_temp import (
+        trtllm_fp4_block_scale_routed_moe_lora,
+    )
+    from sglang.kernels.ops.moe.trtllm_lora_temp.topk_pack import fused_pack_topk
+    from sglang.kernels.ops.moe.trtllm_lora_temp.virtual_experts import (
+        merged_experts_fused_moe_lora_add,
+    )
+    from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+        _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen,
+        get_activation_type,
+    )
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+    from sglang.srt.layers.moe.topk import TopKOutputChecker
+    from sglang.srt.layers.moe.utils import RoutingMethodType
+    from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
+    if _o.environ.get("SGLANG_TS_DIAG") == "1" and not _MB_ENTERED[0]:
+        _MB_ENTERED[0] = True
+        print("[TS-ACTIVE] rebased mxfp4 two-stream ENTERED tokens=%s rank=%s"
+              % (dispatch_output.hidden_states.shape[0], lora_info.max_lora_rank),
+              flush=True, file=_o.sys.stderr)
+
+    assert runner_config.is_gated, (
+        "experimental_sgl_trtllm MXFP4 LoRA requires a gated activation."
+    )
+
+    hidden_states = dispatch_output.hidden_states
+    topk_output = dispatch_output.topk_output
+    # GLM->DSV4 MoL perf port: the dual TopK produces BYPASSED-format
+    # routing for no-LoRA batches. When BYPASSED arrives here, route to the
+    # stock fused MoE entry (the same one a no-MoL deployment uses, which
+    # natively consumes the bypassed format and keeps the base batch on the
+    # fast fused route). LoRA-active batches always arrive STANDARD.
+    if TopKOutputChecker.format_is_bypassed(topk_output):
+        from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+            fused_experts_none_to_flashinfer_trtllm,
+        )
+
+        return fused_experts_none_to_flashinfer_trtllm(
+            dispatch_output, quant_info, runner_config
+        )
+    assert TopKOutputChecker.format_is_standard(topk_output), (
+        "experimental_sgl_trtllm MXFP4 LoRA needs materialized topk_ids; the "
+        "logits-based (bypassed) routing does not expose them."
+    )
+    assert runner_config.top_k is not None
+
+    # REAL FIX — routed scaling on the decomposed (packed-topk) kernel path.
+    # The vendored trtllm_fused_moe_runner.cu sets routingData.mRouteScale only
+    # in the DeepSeekV3 (logits) routing branches; the TopK-only branch used
+    # by every packed-topk call with pre-materialized ids never assigns it, so
+    # routed_scaling_factor is silently ignored on this path. A/B on the
+    # GLM-5.3 fp8 build of the same kernel family measured the decomposed
+    # output at exactly 1/routed_scaling_factor of stock (0.400x for factor
+    # 2.5); for DeepSeek-V4.1-Flash (factor 1.5) every MoE layer would
+    # contribute 0.667x of stock, compounding per layer/chunk over long
+    # prefills. Applying the factor on the materialized weights here is
+    # mathematically identical (sum((s*w_i)*y_i) == s*sum(w_i*y_i)) and covers
+    # the pass-through, the decode-graph capture and the adapter/VE path (the
+    # hooks consume the same weights, so base expert outputs and LoRA deltas
+    # stay scaled consistently).
+    if (
+        runner_config.routed_scaling_factor is not None
+        and runner_config.routed_scaling_factor != 1.0
+    ):
+        topk_output = topk_output._replace(
+            topk_weights=(
+                topk_output.topk_weights
+                * runner_config.routed_scaling_factor
+            )
+        )
+        # The pass-through call below receives `dispatch_output`, so the
+        # scaled routing must be written back into it as well (NamedTuples
+        # are immutable; a local rebind alone would leave the pass-through
+        # consuming the unscaled weights).
+        dispatch_output = dispatch_output._replace(topk_output=topk_output)
+
+    # PASS-THROUGH PRECISION (zero-LoRA == base): no-adapter requests take the
+    # SAME decomposed pipeline with zero deltas. The previous early-return to
+    # the stock fused kernel made "zero adapter == base" structurally
+    # impossible — the fused kernel's fp32 GEMM1 epilogue never materializes
+    # the gate_up output, while the decomposed Gemm2::Runner writes bf16, so
+    # every layer rounded differently and the greedy stream diverged. With
+    # both sides on the decomposed path, a zero-weight adapter's VE delta
+    # (exactly 0.0) and a pass-through's zero delta are bit-identical into the
+    # activation's x + 0.0 -> x.
+    has_active_lora = lora_info.has_active_lora
+    topk_ids = topk_output.topk_ids
+    topk_weights = topk_output.topk_weights
+    use_virtual_lora_store = bool(
+        lora_info.lora_use_virtual_experts and lora_info.max_lora_rank > 0
+    )
+    assert not has_active_lora or use_virtual_lora_store, (
+        "MXFP4 trtllm LoRA with an active adapter requires virtual-experts."
+    )
+    token_lora_mapping = lora_info.token_lora_mapping
+    fused_lora_routing_cache: dict = {}
+
+    inter = quant_info.intermediate_size_per_partition
+
+    # --- Pad/unpad bridge: the VE world and the C++ op world use different
+    # intermediate widths on the trtllm-gen MXFP4 path. The flashinfer C++ op
+    # consumes the PADDED per-rank width (128-aligned, V4.1: 2304/4=576 -> 640)
+    # because its gemm1 output is laid out padded; the VE/LoRA buffers are
+    # sized by get_hidden_dim (UNPADDED 576). Derive the VE width from the
+    # actual B buffer (the two must always agree) and bridge explicitly:
+    #   gate_up: VE writes 2*576=1152 -> zero-pad to 2*640=1280 for the C++
+    #            activation kernel (the padded tail has no LoRA weights).
+    #   down:    the C++ activation kernel writes 640 (padded) columns of
+    #            activation_lora_input; down VE reads the first 576 (the A
+    #            buffer's input width).
+    _inter = quant_info.intermediate_size_per_partition  # padded (C++ op)
+    _inter_ve = (
+        lora_info.gate_up_lora_b_weights.shape[2] // 2
+    )  # unpadded, from the shared gate_up B buffer (N = 2 * inter_ve)
+
+    gate_up_delta_ve = hidden_states.new_zeros(
+        (hidden_states.shape[0], runner_config.top_k, 2 * _inter_ve)
+    )
+    gate_up_delta = (
+        hidden_states.new_zeros(
+            (hidden_states.shape[0], runner_config.top_k, 2 * _inter)
+        )
+        if _inter > _inter_ve
+        else gate_up_delta_ve
+    )
+    lora_event = torch.cuda.Event()
+    _mb_side = get_lora_side_stream()
+    _mb_side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(_mb_side):
+        if has_active_lora:
+            merged_experts_fused_moe_lora_add(
+                output=gate_up_delta_ve,
+                hidden_states=hidden_states,
+                lora_a=lora_info.gate_up_lora_a_weights,
+                lora_b=lora_info.gate_up_lora_b_weights,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+                token_lora_mapping=token_lora_mapping,
+                mul_routed_weight=False,
+                experts_shared_outer_loras_a=lora_info.experts_shared_outer_loras,
+                experts_shared_outer_loras_b=lora_info.experts_shared_outer_loras,
+                routing_cache=fused_lora_routing_cache,
+                fuse_add_to_output=False,
+                use_direct_expand_add=lora_info.max_lora_rank <= 64,
+                local_expert_offset=quant_info.local_expert_offset,
+                local_num_experts=quant_info.local_num_experts,
+            )
+        else:
+            gate_up_delta_ve.zero_()
+        if _inter > _inter_ve:
+            gate_up_delta[..., : 2 * _inter_ve].copy_(gate_up_delta_ve)
+        lora_event.record()
+    lora_ready_handle = lora_event.cuda_event
+    activation_lora_input = torch.empty(
+        (hidden_states.shape[0], runner_config.top_k, inter),
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
+    )
+
+    # Pre-quantize activations to MXFP8 (E4m3), the same prep the non-LoRA
+    # path uses (_fused_experts_flashinfer_mxfp4_sm100_trtllm_gen). The overlay
+    # kernel already supports E4m3 input with a 32-vec scale
+    # (kernel_launcher.cu:2796-2802: scale vec_size==32 -> mDtypeAct=MxE4m3,
+    # no internal FP4 quant), which selects the MxE4m3_MxE2m1 GEMM cubins that
+    # exist. Passing raw bf16 (scale=None) instead would trigger the internal
+    # E2m1 quant path -> E2m1×E2m1 tile-8 GEMM -> "No kernel found" (no such
+    # cubin in the package).
+    from sglang.srt.layers.quantization.mxfp4 import (
+        _prepare_flashinfer_mxfp8_activations,
+    )
+
+    x_padded, prepared_packed_topk, x_quant, x_scale = (
+        _prepare_flashinfer_mxfp8_activations(hidden_states, quant_info.hidden_size)
+    )
+
+    # The gate_up VE delta must match the same padded layout the C++ activation
+    # kernel consumes (2 * padded inter). VE writes the unpadded 2*inter_ve
+    # wide slice; F.pad zero-pads it to the padded width (the padded tail has
+    # no LoRA weights — correct by construction).
+
+    packed_topk_ids = (
+        prepared_packed_topk
+        if prepared_packed_topk is not None
+        else fused_pack_topk(topk_ids=topk_ids, topk_weights=topk_weights)
+    )
+
+    def _as_fp8(t: torch.Tensor) -> torch.Tensor:
+        return (
+            t.view(torch.float8_e4m3fn)
+            if t.dtype == torch.uint8
+            else t
+        )
+
+    with use_symmetric_memory(
+        get_parallel().tp_group, disabled=not is_allocation_symmetric()
+    ):
+        direct_down_output = torch.empty(
+            hidden_states.shape[0],
+            hidden_states.shape[1],
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+
+    if _o.environ.get("SGLANG_LORA_DEEPGEMM_V3") == "1":
+        # v3 path: bf16-bmm MoE-LoRA (DeepGEMM masked discarded; rel=3.6e-3 PASS).
+        # GEMM segment only — delta VE stages and down-VE merge stay identical.
+        from sglang.srt.layers.quantization.mxfp4 import dequant_mxfp4
+        global _DG_V3_WCACHE
+        try:
+            _DG_V3_WCACHE
+        except NameError:
+            _DG_V3_WCACHE = {}
+        _wkey = quant_info.w13_weight.data_ptr()
+        if _wkey not in _DG_V3_WCACHE:
+            _DG_V3_WCACHE[_wkey] = (
+                dequant_mxfp4(quant_info.w13_weight,
+                              quant_info.w13_weight_scale, torch.bfloat16),
+                dequant_mxfp4(quant_info.w2_weight,
+                              quant_info.w2_weight_scale, torch.bfloat16),
+            )
+        _w13_bf, _w2_bf = _DG_V3_WCACHE[_wkey]
+        from sglang.kernels.ops.moe.trtllm_lora_temp.deepgemm_path import (
+            v3_gemm_stage,
+        )
+        _g1a = (float(quant_info.gemm1_alpha)
+                if quant_info.gemm1_alpha is not None else 1.702)
+        _g1b = (float(quant_info.gemm1_beta)
+                if quant_info.gemm1_beta is not None else 1.0)
+        output, _ = v3_gemm_stage(
+            hidden_states, topk_ids, topk_weights, _w13_bf, _w2_bf,
+            gate_up_delta, None, quant_info.gemm1_clamp_limit,
+            activation_lora_input, quant_info.local_num_experts, M_MAX=64,
+            gemm1_alpha=_g1a, gemm1_beta=_g1b)
+    else:
+        output = trtllm_fp4_block_scale_routed_moe_lora(
+            topk_ids=packed_topk_ids,
+            routing_bias=None,
+            hidden_states=x_quant,
+            hidden_states_scale=x_scale,
+            gemm1_weights=quant_info.w13_weight,
+            gemm1_weights_scale=_as_fp8(quant_info.w13_weight_scale),
+            gemm2_weights=quant_info.w2_weight,
+            gemm2_weights_scale=_as_fp8(quant_info.w2_weight_scale),
+            output1_scales_scalar=None,
+            output1_scales_gate_scalar=None,
+            output2_scales_scalar=None,
+            gate_up_lora_delta=gate_up_delta,
+            activation_lora_input=activation_lora_input,
+            lora_ready_event=lora_ready_handle,
+            num_experts=quant_info.global_num_experts,
+            top_k=runner_config.top_k,
+            intermediate_size=inter,
+            local_expert_offset=quant_info.local_expert_offset,
+            local_num_experts=quant_info.local_num_experts,
+            routed_scaling_factor=(
+                runner_config.routed_scaling_factor
+                if runner_config.routed_scaling_factor is not None
+                else 1.0
+            ),
+            routing_method_type=RoutingMethodType.TopK.value,
+            do_finalize=True,
+            output=direct_down_output,
+            act_type=get_activation_type(
+                runner_config.activation, is_gated=runner_config.is_gated
+            ),
+            # OAI / GPT-OSS gated-activation controls + FC1/FC2 biases, matching the
+            # non-LoRA MXFP4 path (see _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen).
+            gemm1_bias=quant_info.w13_weight_bias,
+            gemm1_alpha=quant_info.gemm1_alpha,
+            gemm1_beta=quant_info.gemm1_beta,
+            gemm1_clamp_limit=quant_info.gemm1_clamp_limit,
+            gemm2_bias=quant_info.w2_weight_bias,
+        )
+
+    # Down VE: the C++ activation kernel wrote PADDED inter (640) columns of
+    # activation_lora_input; the down A buffer is UNPADDED (576) wide, so read
+    # the first 576 columns (the padded tail has no LoRA weights). The slice
+    # must be contiguous for the VE kernel's stride assumptions.
+    if has_active_lora:
+        merged_experts_fused_moe_lora_add(
+            output=output,
+            hidden_states=(
+                activation_lora_input[..., :_inter_ve]
+                if _inter > _inter_ve
+                else activation_lora_input
+            ).contiguous().view(-1, min(_inter, _inter_ve)),
+            lora_a=lora_info.down_lora_a_weights,
+            lora_b=lora_info.down_lora_b_weights,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            token_lora_mapping=token_lora_mapping,
+            mul_routed_weight=True,
+            experts_shared_outer_loras_a=lora_info.experts_shared_outer_loras,
+            experts_shared_outer_loras_b=lora_info.experts_shared_outer_loras,
+            routing_cache=fused_lora_routing_cache,
+            fuse_add_to_output=False,
+            fuse_sum_all_reduce=True,
+            use_direct_expand_add=lora_info.max_lora_rank <= 64,
+            local_expert_offset=quant_info.local_expert_offset,
+            local_num_experts=quant_info.local_num_experts,
+        )
+    # else: pass-through — the down VE delta is zero, nothing to merge.
+    if _o.environ.get("SGLANG_MLP_OUT_LORA") == "1":
+        # Synthetic MLP-output-side dense LoRA (perf probe for the output-side
+        # adapter topology; values are random, cost depends on shape only).
+        global _MLP_OUT_W
+        try:
+            _MLP_OUT_W
+        except NameError:
+            _g = torch.Generator(device="cuda").manual_seed(7)
+            _MLP_OUT_W = (
+                torch.randn(16, output.shape[-1], device=output.device,
+                            dtype=torch.bfloat16, generator=_g) * 0.02,
+                torch.randn(output.shape[-1], 16, device=output.device,
+                            dtype=torch.bfloat16, generator=_g) * 0.02)
+        _wa, _wb = _MLP_OUT_W
+        output = output + (output @ _wa.T) @ _wb
     return StandardCombineInput(hidden_states=output)

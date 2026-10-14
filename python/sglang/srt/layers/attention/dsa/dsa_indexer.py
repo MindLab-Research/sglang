@@ -35,6 +35,7 @@ def _use_dsa_indexer_fusion() -> bool:
     from sglang.srt.utils import is_cuda
 
     return is_cuda() and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
+
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.environ import envs

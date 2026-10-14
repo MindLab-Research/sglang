@@ -66,13 +66,6 @@ from sglang.srt.utils import (
 )
 
 _is_cpu = is_cpu()
-
-# Minimum free device memory for the fast image processor to run on the
-# serving GPU (cuda:base_gpu_id). Below this the tokenizer process's image
-# preprocessing falls back to CPU: the scheduler's KV pool can leave the
-# serving GPU essentially full, and torchvision pad/resize allocations then
-# fail per-request (OOM → HTTP 500 → clients see stream idle timeouts).
-_MIN_FAST_IMAGE_PREPROC_HEADROOM_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 
@@ -839,24 +832,9 @@ class BaseMultimodalProcessor(ABC):
             platform = platforms.current_platform
             if not platform.is_cuda_alike():
                 return None
-            device = f"{platform.device_type}:{server_args.base_gpu_id}"
-            try:
-                free_b, _total_b = torch.cuda.mem_get_info(device)
-                if free_b < _MIN_FAST_IMAGE_PREPROC_HEADROOM_BYTES:
-                    # The serving GPU is (nearly) full — e.g. the scheduler's
-                    # KV pool leaves no headroom for the tokenizer process's
-                    # image preprocessing (observed: a 38 MiB torchvision pad
-                    # failing on a GPU with 27 MiB free → per-request OOM →
-                    # HTTP 500 → clients see stream idle timeouts). Fall back
-                    # to CPU preprocessing instead of failing every image
-                    # request; revisit only when the deployment leaves the
-                    # serving GPU real headroom.
-                    return "cpu"
-            except Exception:
-                pass
             # Per-worker placement travels as a constructor argument, and
             # this record is that argument.
-            return device
+            return f"{platform.device_type}:{server_args.base_gpu_id}"
         if processor.__class__.__name__ == "MiniMaxVLProcessor":
             # MiniMax's image/video processors create 10-dim tensors during
             # patch extraction, exceeding the Ascend 8-dim limit; patch them

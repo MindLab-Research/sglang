@@ -4595,6 +4595,12 @@ SUPPORTED_LORA_TARGET_MODULES = [
     # Inkling attention projections (merged q/k/v/r and its row-parallel output).
     "qkvr",
     "wo_ud",
+
+    # Tinker all-linear DSV4.1 exports use the checkpoint names below.
+    "wq_a",
+    "wkv",
+    "wo_b",
+
 ]
 
 LORA_TARGET_ALL_MODULES = "all"

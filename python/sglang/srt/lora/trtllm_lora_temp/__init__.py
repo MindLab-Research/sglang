@@ -24,6 +24,7 @@ path even with the patch installed.
 
 from typing import Callable, Optional
 
+import os
 import torch
 
 from sglang.srt.environ import envs
@@ -95,6 +96,7 @@ _ORIGINAL_COLUMN_FORWARD: Optional[Callable] = None
 _ORIGINAL_REPLICATED_FORWARD: Optional[Callable] = None
 _ORIGINAL_MOE_LORA_FUNC: Optional[Callable] = None
 _ORIGINAL_FP4_MOE_LORA_FUNC: Optional[Callable] = None
+_ORIGINAL_MXFP4_MOE_LORA_FUNC: Optional[Callable] = None
 _ORIGINAL_BF16_MOE_LORA_FUNC: Optional[Callable] = None
 _INSTALLED: bool = False
 
@@ -127,6 +129,10 @@ def get_original_fp4_moe_lora_func() -> Callable:
     return _ORIGINAL_FP4_MOE_LORA_FUNC
 
 
+def get_original_mxfp4_moe_lora_func() -> Callable:
+    return _ORIGINAL_MXFP4_MOE_LORA_FUNC
+
+
 def get_original_bf16_moe_lora_func() -> Callable:
     return _ORIGINAL_BF16_MOE_LORA_FUNC
 
@@ -141,8 +147,8 @@ def install_two_stream_overrides() -> None:
       3. ``MergedColumnParallelLinearWithLoRA.forward`` (O9 — merged-column LoRA
          shrink overlap: dense gate_up + mamba in_proj_qkvz)
       4. ``lora_dispatch.fused_experts_none_to_experimental_sgl_trtllm_fp8_lora``
-         (O1 — MoE gate_up LoRA overlap), plus its fp4 (O1-fp4) and bf16
-         (O1-bf16) siblings
+         (O1 — MoE gate_up LoRA overlap), plus its fp4 (O1-fp4), mxfp4
+         (O1-mxfp4, DeepSeek-V4.1) and bf16 (O1-bf16) siblings
 
     The saved originals are exposed via :func:`get_original_qkv_forward`,
     :func:`get_original_row_forward`, :func:`get_original_moe_lora_func` so the
@@ -157,6 +163,7 @@ def install_two_stream_overrides() -> None:
         _ORIGINAL_REPLICATED_FORWARD, \
         _ORIGINAL_MOE_LORA_FUNC, \
         _ORIGINAL_FP4_MOE_LORA_FUNC, \
+        _ORIGINAL_MXFP4_MOE_LORA_FUNC, \
         _ORIGINAL_BF16_MOE_LORA_FUNC
 
     if _INSTALLED:
@@ -199,14 +206,19 @@ def install_two_stream_overrides() -> None:
         fused_experts_none_to_experimental_sgl_trtllm_bf16_lora_two_stream,
         fused_experts_none_to_experimental_sgl_trtllm_fp4_lora_two_stream,
         fused_experts_none_to_experimental_sgl_trtllm_fp8_lora_two_stream,
+        fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora_two_stream,
     )
 
-    # O1 (FP8 Qwen) + O1-fp4 (NVFP4 Kimi) + O1-bf16 (unquantized Qwen): MoE gate_up
-    # LoRA overlap. Each patched fn falls back to its saved single-stream original
-    # for non-decode batches.
+    # O1 (FP8 Qwen) + O1-fp4 (NVFP4 Kimi) + O1-mxfp4 (DeepSeek-V4.1 MXFP4) +
+    # O1-bf16 (unquantized Qwen): MoE gate_up LoRA overlap. Each patched fn falls
+    # back to its saved single-stream original for non-decode / non-active-LoRA
+    # batches.
     _ORIGINAL_MOE_LORA_FUNC = ft.fused_experts_none_to_experimental_sgl_trtllm_fp8_lora
     _ORIGINAL_FP4_MOE_LORA_FUNC = (
         ft.fused_experts_none_to_experimental_sgl_trtllm_fp4_lora
+    )
+    _ORIGINAL_MXFP4_MOE_LORA_FUNC = (
+        ft.fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora
     )
     _ORIGINAL_BF16_MOE_LORA_FUNC = (
         ft.fused_experts_none_to_experimental_sgl_trtllm_bf16_lora
@@ -216,6 +228,9 @@ def install_two_stream_overrides() -> None:
     )
     ft.fused_experts_none_to_experimental_sgl_trtllm_fp4_lora = (
         fused_experts_none_to_experimental_sgl_trtllm_fp4_lora_two_stream
+    )
+    ft.fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora = (
+        fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora_two_stream
     )
     ft.fused_experts_none_to_experimental_sgl_trtllm_bf16_lora = (
         fused_experts_none_to_experimental_sgl_trtllm_bf16_lora_two_stream
@@ -236,6 +251,77 @@ __all__ = [
     "get_original_replicated_forward",
     "get_original_moe_lora_func",
     "get_original_fp4_moe_lora_func",
+    "get_original_mxfp4_moe_lora_func",
     "get_original_bf16_moe_lora_func",
     "install_two_stream_overrides",
 ]
+
+def _sgl_stage_bench():
+    """Stage-level microbenchmark of the mxfp4 MoE-LoRA decomposition chain (decode shapes)."""
+    import time
+    import torch as _t
+
+    from sglang.kernels.ops.moe.trtllm_lora_temp.core import (
+        get_sgl_trtllm_moe_sm100_raw_module,
+    )
+
+    M = get_sgl_trtllm_moe_sm100_raw_module()
+    H, INTER, TOPK = 5120, 2304, 6
+
+    def _us(fn, iters=50, warmup=10):
+        for _ in range(warmup):
+            fn()
+        _t.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(iters):
+            fn()
+        _t.cuda.synchronize()
+        return (time.perf_counter() - t0) / iters * 1e6
+
+    def _mk(T):
+        nrows = T * TOPK
+        mp = ((nrows + 127) // 128) * 128
+        d = dict(
+            hidden=_t.randn(T, H, dtype=_t.bfloat16, device="cuda"),
+            idx=(_t.arange(nrows, dtype=_t.int32, device="cuda") % mp),
+            total_pad=_t.tensor([mp], dtype=_t.int32, device="cuda"),
+            permuted=_t.empty(mp, H, dtype=_t.bfloat16, device="cuda"),
+            gate_up=_t.randn(mp, 2 * INTER, dtype=_t.bfloat16, device="cuda"),
+            lora_delta=_t.randn(T, TOPK, 2 * INTER, dtype=_t.bfloat16, device="cuda"),
+            activated=_t.empty(mp, 2 * INTER, dtype=_t.bfloat16, device="cuda"),
+            lora_in=_t.empty(T, TOPK, INTER, dtype=_t.bfloat16, device="cuda"),
+            fp4_out=_t.empty(mp * INTER // 2, dtype=_t.uint8, device="cuda"),
+            sf_out=_t.empty(mp * INTER // 32 + 8192, dtype=_t.uint8, device="cuda"),
+            ptsf=_t.empty(mp, dtype=_t.float32, device="cuda"),
+        )
+        return d, T, mp
+
+    print("[STAGE-BENCH] ops:", [n for n in ("bench_permute", "bench_nvfp4_quant", "bench_activation",
+                                             "bench_fused_permute_quant", "bench_fused_act_quant")
+                                 if hasattr(M, n)], flush=True)
+    for T in (64, 256, 768):
+        d, T, mp = _mk(T)
+        for key, fn in (
+            ("permute", lambda: M.bench_permute(d["hidden"], d["idx"], d["total_pad"], d["permuted"], T, TOPK, H)),
+            ("activation", lambda: M.bench_activation(d["gate_up"], d["lora_delta"], d["idx"], d["total_pad"],
+                                                      d["activated"], d["lora_in"], INTER, T, TOPK, 0, 0)),
+            ("fused_act_quant", lambda: M.bench_fused_act_quant(d["gate_up"], d["lora_delta"], d["idx"],
+                                                                d["fp4_out"], d["sf_out"], d["ptsf"], d["lora_in"],
+                                                                INTER, 2 * INTER, T, TOPK, 128)),
+            ("nvfp4_quant", lambda: M.bench_nvfp4_quant(d["hidden"], None, d["fp4_out"], d["sf_out"], d["ptsf"], mp, H, 128)),
+            ("fused_permute_quant", lambda: M.bench_fused_permute_quant(d["hidden"], d["idx"], d["fp4_out"],
+                                                                        d["sf_out"], d["ptsf"], T, TOPK, H, mp, 128, 0)),
+        ):
+            try:
+                v = _us(fn)
+                print("[STAGE-BENCH] T=%-4d %-20s %8.2f us  (x20 layers = %7.1f us/step)"
+                      % (T, key, v, v * 20), flush=True)
+            except Exception as e:  # noqa
+                print("[STAGE-BENCH] T=%-4d %-20s FAILED: %s" % (T, key, str(e)[:140]), flush=True)
+
+
+if os.environ.get("SGLANG_STAGE_BENCH") == "1":
+    try:
+        _sgl_stage_bench()
+    except Exception as _e:  # noqa
+        print("[STAGE-BENCH] failed: %r" % (_e,), flush=True)

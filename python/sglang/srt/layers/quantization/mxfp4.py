@@ -653,6 +653,84 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # Packed fp4 (e2m1 x2 per byte) weights: DeepGEMM expects int8.
             layer.w13_weight.data = layer.w13_weight.data.view(torch.int8)
             layer.w2_weight.data = layer.w2_weight.data.view(torch.int8)
+
+            # DSV4.1 (GPT-OSS interleaved checkpoints): the deep_gemm runner's
+            # silu kernel splits gate/up at N/2 (concat halves), so deinterleave
+            # w13 exactly like the marlin branch does.
+            if (
+                self.moe_runner_config.gemm1_alpha is not None
+                and getattr(self.moe_runner_config, "gate_up_interleaved", True)
+            ):
+                from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+                    deinterleave_moe_mxfp4_w13_for_marlin,
+                )
+
+                deinterleave_moe_mxfp4_w13_for_marlin(layer)
+
+            # DeepGEMM masked-path alignment requirements (measured on B300,
+            # see docs/DSV41_LORA_SUB10_PLAN.md): the per-128 activation groups
+            # and the packed-UE8M0 A-scale (byte width % 4) require the down
+            # GEMM's K to be a multiple of 512 -> pad the per-rank intermediate
+            # 576 -> 640.  Zero weights x any scale == 0, so the extra columns
+            # are bit-exact no-ops in the fp32 accumulator.
+            inter = layer.w13_weight.shape[1] // 2
+            inter_pad = (inter + 127) // 128 * 128
+            if inter_pad != inter:
+                half = inter_pad - inter  # 64 for V4.1
+                e, n2, kb = layer.w13_weight.shape
+                zeros_col = torch.zeros(
+                    e, half, kb, dtype=layer.w13_weight.dtype, device=layer.w13_weight.device
+                )
+                # concat halves: [gate(inter) | up(inter)] -> [gate(inter+half) | up(inter+half)]
+                layer.w13_weight.data = torch.cat(
+                    [
+                        torch.cat([layer.w13_weight[:, :inter], zeros_col], dim=1),
+                        torch.cat([layer.w13_weight[:, inter:], zeros_col], dim=1),
+                    ],
+                    dim=1,
+                )
+                for scale_name in ("w13_weight_scale", "w13_weight_scale_inv"):
+                    scale = getattr(layer, scale_name, None)
+                    if scale is not None:
+                        szeros = torch.full(
+                            (e, half, scale.shape[-1]), 127,
+                            dtype=scale.dtype, device=scale.device,
+                        )
+                        setattr(
+                            layer,
+                            scale_name,
+                            torch.cat(
+                                [
+                                    torch.cat([scale[:, :inter], szeros], dim=1),
+                                    torch.cat([scale[:, inter:], szeros], dim=1),
+                                ],
+                                dim=1,
+                            ),
+                        )
+                        break
+                # down GEMM K: append zero fp4 bytes (64 elements = 32 bytes)
+                kzeros = torch.zeros(
+                    layer.w2_weight.shape[0],
+                    layer.w2_weight.shape[1],
+                    half // 2,
+                    dtype=layer.w2_weight.dtype,
+                    device=layer.w2_weight.device,
+                )
+                layer.w2_weight.data = torch.cat([layer.w2_weight.data, kzeros], dim=2)
+                for scale_name in ("w2_weight_scale", "w2_weight_scale_inv"):
+                    scale = getattr(layer, scale_name, None)
+                    if scale is not None:
+                        szeros = torch.full(
+                            (scale.shape[0], scale.shape[1], half // 32), 127,
+                            dtype=scale.dtype, device=scale.device,
+                        )
+                        setattr(
+                            layer,
+                            scale_name,
+                            torch.cat([scale.data, szeros], dim=2),
+                        )
+                        break
+
             # Checkpoint scales are uint8 e8m0 (biased exponents). DeepGEMM
             # SM100 needs them in packed-UE8M0 TMA-aligned MN-major layout.
             # Round-trip through fp32 is exact (values are powers of two).

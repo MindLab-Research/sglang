@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
@@ -181,7 +182,13 @@ def _masked_activation_unsupported_reason(
     e = runner_config.num_local_experts
     if d is None or e is None:
         return None
-    group_size = quant_info.block_shape[1] if quant_info.block_shape else 128
+    # fp8xfp4 experts: the activation is quantized per-128 (the recipe_a=(1,128)
+    # contract); block_shape[1] is the WEIGHT block ([1,32] for DSV4), not the
+    # activation gran — using it here wrongly rejects the masked layout.
+    if getattr(quant_info, "is_fp4_experts", False):
+        group_size = 128
+    else:
+        group_size = quant_info.block_shape[1] if quant_info.block_shape else 128
     if d // 8 < e:
         return f"D // 8 ({d // 8}) < num_local_experts ({e})"
     if group_size != 128:
@@ -297,6 +304,12 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
     # DSV4 mxfp4 layout flag; selects recipe_a=(1,128)/recipe_b=(1,32) downstream.
     is_fp4_experts: bool = False
     use_mxfp8: bool = False
+    # DSV4.1 OAI gated-SwiGLU controls, sourced from the layer's trtllm attrs
+    # (MoeRunnerConfig.gemm1_alpha is unset on this model). Non-None ⇒ the contig
+    # activation must use the OAI formula, not plain silu.
+    gemm1_alpha: Optional[float] = None
+    gemm1_beta: Optional[float] = None
+    gemm1_clamp_limit: Optional[float] = None
 
     def __post_init__(self):
         if self.use_mxfp8:
@@ -452,6 +465,16 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         ):
             hidden_states_scale = tma_align_input_scale(hidden_states_scale)
 
+        if os.environ.get("SGLANG_DEEPGEMM_V41_DIAG") == "1":
+            logger.warning(
+                "[dgdiag] contig G1 lhs=%s %s sf=%s %s | rhs=%s sf=%s %s | "
+                "recipes=%s m_indices=%s all_tokens=%s",
+                tuple(hidden_states.shape), hidden_states.dtype,
+                tuple(hidden_states_scale.shape), hidden_states_scale.dtype,
+                tuple(quant_info.w13_weight.shape),
+                tuple(quant_info.w13_scale.shape), quant_info.w13_scale.dtype,
+                (recipe_a, recipe_b), tuple(m_indices.shape), all_tokens,
+            )
         deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
             (hidden_states, hidden_states_scale),
             w13_weight_fp8,
@@ -467,7 +490,66 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
-        if self.config.activation == "situ":
+        if quant_info.is_fp4_experts and quant_info.gemm1_alpha is not None:
+            # DSV4.1 OAI gated-SwiGLU (xGlu=min(up,limit), xLin=clamp(gate,+-limit),
+            # y=xGlu*sigmoid(alpha*xGlu)*(xLin+beta)): the situ branch below
+            # computes a different activation (beta*tanh(beta) soft clamps,
+            # sigmoid on the other half) and would silently corrupt this model.
+            # Emit fp8 + per-128 fp32 scales — the fp8xfp4 GEMM casts float sf
+            # to ue8m0 internally (disable_ue8m0_cast=False).
+            rows = gateup_output.shape[0]
+            half_n = gateup_output.shape[1] // 2
+            kg = (half_n + scale_block_size - 1) // scale_block_size
+            down_input_fp8 = torch.empty(
+                (rows, half_n),
+                device=gateup_output.device,
+                dtype=torch.float8_e4m3fn,
+            )
+            down_input_scale = torch.empty(
+                (rows, kg),
+                device=gateup_output.device,
+                dtype=torch.float32,
+            )
+            _oai_mul_quant_contig_kernel[(rows,)](
+                gateup_output,
+                down_input_fp8,
+                down_input_scale,
+                half_n,
+                kg,
+                quant_info.gemm1_alpha,
+                (
+                    quant_info.gemm1_beta
+                    if quant_info.gemm1_beta is not None
+                    else 1.0
+                ),
+                (
+                    quant_info.gemm1_clamp_limit
+                    if quant_info.gemm1_clamp_limit is not None
+                    else 7.0
+                ),
+                GROUP=scale_block_size,
+                KG_POW2=triton.next_power_of_2(kg),
+                num_warps=8,
+            )
+            del gateup_output
+            # The fp8xfp4 GEMM's float-sf (internal cast) path crashes with
+            # CUDA_ERROR_LAUNCH_FAILURE even at aligned K (measured, launch 11).
+            # Convert to the packed int32 ue8m0 layout the masked-path fix uses:
+            # pad the per-128 byte width to a multiple of 4 with a neutral scale
+            # (1.0 -> e8m0 byte 127), then the round-up e8m0 pack (5 -> 2 int32
+            # == ceil_div(640, 512) — the g2_k640_packed-proven recipe).
+            kg_pad = (kg + 3) // 4 * 4
+            if kg_pad != kg:
+                down_input_scale = torch.nn.functional.pad(
+                    down_input_scale, (0, kg_pad - kg), value=1.0
+                )
+            # _cast_to_e8m0_with_rounding_up works on 3D [G, M, W] (its
+            # MN-major transpose needs dim 2); the masked path wraps with
+            # unsqueeze/squeeze the same way.
+            down_input_scale = _cast_to_e8m0_with_rounding_up(
+                down_input_scale.unsqueeze(0)
+            ).squeeze(0)
+        elif self.config.activation == "situ":
             situ_beta = self.config.gemm1_alpha
             situ_linear_beta = self.config.gemm1_clamp_limit
             assert situ_beta is not None and situ_linear_beta is not None
@@ -556,7 +638,48 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 sglang_per_token_group_quant_fp8,
             )
 
-            if not _is_musa:
+            if quant_info.gemm1_alpha is not None:
+                # DSV4.1 OAI gated-SwiGLU (xGlu=min(up,limit), xLin=clamp(gate),
+                # y=xGlu*sigmoid(alpha*xGlu)*(xLin+beta)): the legacy silu kernels
+                # below compute plain (clamped) silu*up and would silently corrupt
+                # this activation. Emit fp8 + per-128 fp32 scales — the fp8xfp4
+                # GEMM casts float sf to ue8m0 internally.
+                rows = gateup_output.shape[0]
+                half_n = gateup_output.shape[1] // 2
+                kg = (half_n + scale_block_size - 1) // scale_block_size
+                down_input_fp8 = torch.empty(
+                    (rows, half_n),
+                    device=gateup_output.device,
+                    dtype=torch.float8_e4m3fn,
+                )
+                down_input_scale = torch.empty(
+                    (rows, kg),
+                    device=gateup_output.device,
+                    dtype=torch.float32,
+                )
+                _oai_mul_quant_contig_kernel[(rows,)](
+                    gateup_output,
+                    down_input_fp8,
+                    down_input_scale,
+                    half_n,
+                    kg,
+                    quant_info.gemm1_alpha,
+                    (
+                        quant_info.gemm1_beta
+                        if quant_info.gemm1_beta is not None
+                        else 1.0
+                    ),
+                    (
+                        quant_info.gemm1_clamp_limit
+                        if quant_info.gemm1_clamp_limit is not None
+                        else 7.0
+                    ),
+                    GROUP=scale_block_size,
+                    KG_POW2=triton.next_power_of_2(kg),
+                    num_warps=8,
+                )
+                del gateup_output
+            elif not _is_musa:
                 down_input = torch.empty(
                     (all_tokens, N // 2),
                     device=gateup_output.device,
@@ -611,6 +734,16 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             hidden_size=down_input_fp8.shape[-1],
             activation_scale_width=down_input_scale.shape[-1],
         )
+        if os.environ.get("SGLANG_DEEPGEMM_V41_DIAG") == "1":
+            logger.warning(
+                "[dgdiag] contig G2 lhs=%s %s sf=%s %s | rhs=%s sf=%s %s | "
+                "recipes=%s",
+                tuple(down_input_fp8.shape), down_input_fp8.dtype,
+                tuple(down_input_scale.shape), down_input_scale.dtype,
+                tuple(quant_info.w2_weight.shape),
+                tuple(quant_info.w2_scale.shape), quant_info.w2_scale.dtype,
+                (recipe_a_down, recipe_b),
+            )
         deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
             (down_input_fp8, down_input_scale),
             w2_weight_fp8,
@@ -729,7 +862,14 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             )
 
         use_mxfp8 = quant_info.use_mxfp8
-        scale_block_size = quant_info.block_shape[1] if quant_info.block_shape else 128
+        # fp8xfp4: activation gran is per-128 (recipe_a=(1,128)); block_shape[1]
+        # is the weight block ([1,32] for DSV4).
+        if getattr(quant_info, "is_fp4_experts", False):
+            scale_block_size = 128
+        else:
+            scale_block_size = (
+                quant_info.block_shape[1] if quant_info.block_shape else 128
+            )
 
         recipe_a, recipe_b = quant_info.scale_recipes(
             activation_block_size=runner_input.activation_scale_block_size,
@@ -831,6 +971,25 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         n = w2_weight.shape[1]
 
         if (
+            getattr(quant_info, "is_fp4_experts", False)
+            and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+            and down_input_scale.dtype != torch.int32
+        ):
+            # fp4 experts: the down GEMM's K (= inter, e.g. 640 for V4.1) gives a
+            # per-128 scale byte width that is not divisible by 4; pad with a
+            # neutral scale (1.0 -> e8m0 byte 127) so the uint8->int32 pack is
+            # well-defined (5 bytes -> 2 int32 == ceil_div(640, 512)). deep_gemm's
+            # own get_mn_major_tma_aligned_packed_ue8m0_tensor produces a layout
+            # the masked kernel crashes on (CUDA 719) for this shape family —
+            # measured on B300, do NOT use it here (docs/DSV41_LORA_SUB10_PLAN.md).
+            nb = down_input_scale.shape[-1]
+            pad = (4 - nb % 4) % 4
+            if pad:
+                down_input_scale = torch.nn.functional.pad(
+                    down_input_scale, (0, pad), value=1.0
+                )
+            down_input_scale = _cast_to_e8m0_with_rounding_up(down_input_scale)
+        elif (
             use_mxfp8
             and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
             and down_input_scale.dtype != torch.int32
@@ -1022,7 +1181,13 @@ def pre_permute_standard_to_deep_gemm(
                 runner_config.num_local_experts,
                 hidden_states,
                 runner_config.top_k,
-                quant_info.block_shape,
+                # fp8xfp4: the activation quant gran is per-128 (recipe_a=(1,128)),
+                # not the weight block ([1,32] for DSV4).
+                (
+                    [1, 128]
+                    if getattr(quant_info, "is_fp4_experts", False)
+                    else quant_info.block_shape
+                ),
                 output_dtype=output_dtype,
                 use_mxfp8=quant_info.use_mxfp8,
                 expert_start=expert_start,
@@ -1104,7 +1269,15 @@ def pre_permute_standard_to_deep_gemm(
             sglang_per_token_group_quant_fp8,
         )
 
-        block_k = quant_info.block_shape[1] if quant_info.block_shape else 128
+        # fp8xfp4 (is_fp4_experts) W4A8 contract: activations are quantized
+        # per-128 regardless of the weight block ([1,32] for DSV4) —
+        # scale_recipes() returns recipe_a=(1,128) for fp4 experts, and a
+        # per-32 quant here produces a packed sf width the kernel rejects
+        # (layout.hpp:114, measured on B300 2026-10-13).
+        if getattr(quant_info, "is_fp4_experts", False):
+            block_k = 128
+        else:
+            block_k = quant_info.block_shape[1] if quant_info.block_shape else 128
         packed_input_source, packed_input_source_scale = (
             sglang_per_token_group_quant_fp8(
                 hidden_states,
@@ -1158,7 +1331,7 @@ def pre_permute_standard_to_deep_gemm(
         m_indices,
         src2dst,
         scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-        quant_block_size=(quant_info.block_shape[1] if quant_info.block_shape else 128),
+        quant_block_size=block_k,
         expert_alignment=block_e,
         expert_start=expert_start,
     )
@@ -1672,6 +1845,46 @@ def _situ_mul_quant_contig_kernel(
     tl.store(q_ptr + row * N + offs, q, mask=mask)
     srow = tl.arange(0, KG_POW2)
     tl.store(s_ptr + row * KG + srow, amax / 448.0, mask=srow < KG)
+
+
+@triton.jit
+def _oai_mul_quant_contig_kernel(
+    g_ptr,  # [rows, 2N] bf16, concat halves [xLinear | xGlu]
+    q_ptr,  # [rows, N] fp8 out
+    s_ptr,  # [rows, KG] fp32 scales out
+    N,
+    KG,
+    alpha,
+    beta,
+    clamp_limit,
+    GROUP: tl.constexpr,
+    KG_POW2: tl.constexpr,
+):
+    """OAI/GPT-OSS gated-SwiGLU (DSV4.1): xGlu=min(up,limit),
+    xLin=clamp(gate,+-limit), y = xGlu*sigmoid(alpha*xGlu)*(xLin+beta),
+    then per-128 fp8 quant with fp32 row-major scales — the fp8xfp4 kernel
+    casts float sf to ue8m0 internally (disable_ue8m0_cast=False)."""
+    row = tl.program_id(0).to(tl.int64)
+    rows2d = tl.arange(0, KG_POW2)[:, None]
+    cols = tl.arange(0, GROUP)[None, :]
+    offs = rows2d * GROUP + cols
+    mask = rows2d < KG
+    x_lin = tl.load(g_ptr + row * 2 * N + offs, mask=mask, other=0.0).to(tl.float32)
+    x_glu = tl.load(g_ptr + row * 2 * N + N + offs, mask=mask, other=0.0).to(tl.float32)
+    x_glu = tl.minimum(x_glu, clamp_limit)
+    x_lin = tl.maximum(tl.minimum(x_lin, clamp_limit), -clamp_limit)
+    y = x_glu * tl.sigmoid(alpha * x_glu) * (x_lin + beta)
+    amax = tl.clamp(tl.max(tl.abs(y), axis=1), min=1e-10, max=float("inf"))
+    # Quantize with the ROUND-UP pow2 scale — the epilogue packs the stored sf
+    # via _cast_to_e8m0_with_rounding_up, and the GEMM dequantizes with that
+    # rounded sf. Quantizing with the raw amax/448 while dequantizing with the
+    # rounded sf inflates every group by up to 2x (measured garbage, launch 14).
+    sf_exp = tl.ceil(tl.log2(amax / 448.0))
+    scale = tl.exp2(sf_exp)
+    q = (y / scale[:, None]).to(tl.float8e4nv)
+    tl.store(q_ptr + row * N + offs, q, mask=mask)
+    srow = tl.arange(0, KG_POW2)
+    tl.store(s_ptr + row * KG + srow, scale, mask=srow < KG)
 
 
 def _apply_swiglu_limit(

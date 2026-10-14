@@ -2056,6 +2056,75 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 and will_use_deepgemm:
                     from deep_gemm import transform_sf_into_required_layout
 
+                    # DSV4.1 + deepgemm: the contig fp8xfp4 kernel requires the
+                    # down GEMM's K (= inter) to be a multiple of 128
+                    # (runtime_utils.hpp:137 gmem_inner_dim%128). The V4.1
+                    # checkpoint stores per-expert w1/w3 and the loader CONCATs
+                    # them ([w1 | w3] halves — verified via the shard_id w1/w3
+                    # narrow() mapping), which is exactly the concat-halves
+                    # layout the contig silu kernels expect: NO deinterleave
+                    # here (deinterleaving a concat scrambles it — measured,
+                    # launch 13 garbage). Only pad the per-rank inter 576->640.
+                    # Zero weights x any scale == 0, so the padding is bit-exact.
+                    inter = layer.w13_weight.shape[1] // 2
+                    inter_pad = (inter + 127) // 128 * 128
+                    if inter_pad != inter:
+                        half = inter_pad - inter
+                        e, _, kb = layer.w13_weight.shape
+                        zeros_col = torch.zeros(
+                            e,
+                            half,
+                            kb,
+                            dtype=layer.w13_weight.dtype,
+                            device=layer.w13_weight.device,
+                        )
+                        layer.w13_weight.data = torch.cat(
+                            [
+                                torch.cat(
+                                    [layer.w13_weight[:, :inter], zeros_col], dim=1
+                                ),
+                                torch.cat(
+                                    [layer.w13_weight[:, inter:], zeros_col], dim=1
+                                ),
+                            ],
+                            dim=1,
+                        )
+                        scale = layer.w13_weight_scale_inv
+                        neutral = 127 if scale.dtype == torch.uint8 else 1.0
+                        szeros = torch.full(
+                            (e, half, scale.shape[-1]),
+                            neutral,
+                            dtype=scale.dtype,
+                            device=scale.device,
+                        )
+                        layer.w13_weight_scale_inv.data = torch.cat(
+                            [
+                                torch.cat([scale[:, :inter], szeros], dim=1),
+                                torch.cat([scale[:, inter:], szeros], dim=1),
+                            ],
+                            dim=1,
+                        )
+                        kzeros = torch.zeros(
+                            layer.w2_weight.shape[0],
+                            layer.w2_weight.shape[1],
+                            half // 2,
+                            dtype=layer.w2_weight.dtype,
+                            device=layer.w2_weight.device,
+                        )
+                        layer.w2_weight.data = torch.cat(
+                            [layer.w2_weight.data, kzeros], dim=2
+                        )
+                        scale2 = layer.w2_weight_scale_inv
+                        szeros2 = torch.full(
+                            (scale2.shape[0], scale2.shape[1], half // 32),
+                            neutral,
+                            dtype=scale2.dtype,
+                            device=scale2.device,
+                        )
+                        layer.w2_weight_scale_inv.data = torch.cat(
+                            [scale2.data, szeros2], dim=2
+                        )
+
                     for scale_param, weight_param in [
                         (layer.w13_weight_scale_inv, layer.w13_weight),
                         (layer.w2_weight_scale_inv, layer.w2_weight),
@@ -3070,6 +3139,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 block_shape=block_shape,
                 is_fp4_experts=self.is_fp4_expert,
                 use_mxfp8=self.use_mxfp8,
+                # V4.1's config declares NO gemm1_alpha/beta/clamp (its activation
+                # is plain clamped swiglu, swiglu_limit=10.0 — config.json). The
+                # mxfp4 prep's "or 1.702 / or 7.0" fallbacks exist for GPT-OSS;
+                # applying them here computed the WRONG activation (launch 15's
+                # semi-coherent output). Leave them unset so the contig runner
+                # takes its canonical swiglu_limit branch.
+                gemm1_alpha=getattr(layer.moe_runner_config, "gemm1_alpha", None),
+                gemm1_beta=getattr(layer.moe_runner_config, "gemm1_beta", None),
+                gemm1_clamp_limit=getattr(
+                    layer.moe_runner_config, "gemm1_clamp_limit", None
+                ),
             )
         elif (
             self.runner.runner_backend.is_flashinfer_trtllm()

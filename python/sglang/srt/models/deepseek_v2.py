@@ -121,6 +121,19 @@ def _lora_forces_standard_topk() -> bool:
     from sglang.srt.runtime_context import get_lora
 
     return bool(getattr(get_lora(), "enable_lora", False))
+
+
+def _moe_rejects_bypassed_topk() -> bool:
+    """Whether the active MoE backend refuses BYPASSED topk.
+
+    The flashinfer MXFP4 / TRT-LLM MoE apply() raises on BYPASSED (it needs
+    materialized topk ids / HashTopK-aware args), while TopK auto-detect and the
+    dual-TopK fast path both prefer BYPASSED. Every producer of BYPASSED must be
+    gated on this -- notably the dspark/nextn draft sub-model, whose CUDA-graph
+    capture otherwise dies on the apply() guard.
+    """
+    rb = get_moe_runner_backend()
+    return rb.is_flashinfer_trtllm() or rb.is_flashinfer_mxfp4()
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
@@ -760,6 +773,10 @@ class DeepseekV2MoE(nn.Module):
                             (quant_config is None)
                             and (not get_moe_runner_backend().is_flashinfer_trtllm())
                         )
+                        # The flashinfer MXFP4/TRT-LLM MoE apply() refuses BYPASSED
+                        # while TopK auto-detect (output_format=None) picks it for
+                        # fp4 experts -- force the materialized format there.
+                        or _moe_rejects_bypassed_topk()
                         or _lora_forces_standard_topk()
                     )
                     else None
@@ -795,7 +812,11 @@ class DeepseekV2MoE(nn.Module):
             # in TopK.forward_cuda which forces STANDARD when LoRA is enabled,
             # defeating the dual-TopK entirely.
             _lora_forces_std = _lora_forces_standard_topk()
-            if _lora_forces_std:
+            # The BYPASSED instance must not exist on a backend that refuses it:
+            # the draft (nextn) capture is not a "lora variant" capture, so
+            # _dual_topk() would hand it out and the MoE apply() would raise.
+            _bypassed_ok = not _moe_rejects_bypassed_topk()
+            if _lora_forces_std and _bypassed_ok:
                 topk_kwargs_nolora = dict(topk_kwargs)
                 topk_kwargs_nolora["output_format"] = TopKOutputFormat.BYPASSED
                 self.topk_nolora = TopK(**topk_kwargs_nolora)
@@ -1986,6 +2007,14 @@ class DeepseekV2MoE(nn.Module):
                 )
 
     def op_experts(self, state):
+        import os as _osd
+
+        if _osd.environ.get("SGLANG_DEBUG_LORA"):
+            print(
+                f"[DBG-OP-EXPERTS] experts_type={type(self.experts).__name__} "
+                f"has_rmc_split={hasattr(type(self.experts), '_glm_split_rmc_marker')}",
+                flush=True,
+            )
         state.combine_input = self.experts.run_moe_core(
             dispatch_output=state.dispatch_output,
         )
@@ -3538,10 +3567,16 @@ def dsv2_flashinfer_moe_dual_stream_graph(
     # Custom-op execution happens outside the caller's Python scope under
     # torch.compile. Carry graph-varying control state as scalar operands and
     # republish it for the nested MoE/linear consumers.
+    # This op forces a BYPASSED topk; that format is refused by the flashinfer
+    # MXFP4/TRT-LLM MoE apply() and forbidden whenever LoRA needs materialized
+    # ids, so gate it on both instead of forcing it unconditionally.
+    _bypass_allowed = not (
+        _lora_forces_standard_topk() or _moe_rejects_bypassed_topk()
+    )
     with get_forward().scoped(
         fuse_mlp_allreduce=fuse_mlp_allreduce,
         mlp_reduce_scatter=mlp_reduce_scatter,
-        flashinfer_trtllm_bypass=True,
+        flashinfer_trtllm_bypass=_bypass_allowed,
         lora_batch_layout=LoRABatchLayout.TP_GLOBAL,
         # The op's Tensor schema cannot carry a MoeFinalizeHandoff.
         defer_moe_finalize=False,
