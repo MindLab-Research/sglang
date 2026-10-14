@@ -24,13 +24,32 @@ MIN_CHUNK_SIZE = 16
 
 
 class ChunkedSgmvLoRABackend(BaseLoRABackend):
-    # GLM->DSV4 MoL perf port: all-base batches skip the full per-step
-    # prepare_lora_batch (pinned-memory tensor allocs + permutation +
+    # GLM-5.3-flash MoL perf: all-base batches skip the full per-step
+    # prepare_lora_batch (3 pinned-memory tensor allocs + permutation +
     # segment computation) and reset batch_info instead — the layers'
-    # lora_active guards then route to the stock path. LoRA-bearing batches
-    # still take the full prepare.
+    # lora_active guards then route to the stock path. Mirrors the UNO
+    # backend shortcut. LoRA-bearing batches still take the full prepare.
     skip_inactive_lora_batches = True
 
+    # GLM-5.3-flash MoL perf: LoRA-A (shrink) overlap. The LoRA layer's
+    # forward calls start_lora_a_overlap(x) BEFORE the base GEMM (see
+    # ColumnParallelLinearWithLoRA.forward), which fires the chunked
+    # shrink on a side stream; the base GEMM runs on the main stream in
+    # parallel; apply_lora then consumes the precomputed shrink output
+    # (waiting on the done event) instead of re-running it serially.
+    # KNOWN ISSUE (default OFF): on the D-side decode graph this produced
+    # a numeric corruption — the zero adapter's output diverged from base
+    # starting at the 2nd token (FIRST_DIFF_IDX 7 vs the 430 baseline),
+    # disappearing with A_OVERLAP=0. Root cause not yet isolated (suspect
+    # stale-cache/stream race in capture/replay). Enabled only for debugging
+    # with SGLANG_LORA_A_OVERLAP=1. See handover Phase 4b' notes.
+    import os as _os
+
+    supports_lora_a_overlap = _os.environ.get("SGLANG_LORA_A_OVERLAP", "0") == "1"
+
+    # Fused attn shrink: wq_a/wkv share the same input x — concat their A
+    # weights and fire ONE chunked shrink per layer instead of two.
+    _fused_attn_enabled = _os.environ.get("SGLANG_FUSED_ATTN_SHRINK", "0") == "1"
     """
     Chunked LoRA backend using segmented matrix-vector multiplication.
 
@@ -51,6 +70,114 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
     ):
         super().__init__(max_loras_per_batch, device)
         self.max_chunk_size = get_lora().max_lora_chunk_size
+        # LoRA-A overlap state (see supports_lora_a_overlap above). Event and
+        # stream are kept alive on this backend instance so cuda-graph
+        # captures referencing them are never torn down.
+        self._overlap_a_out = None
+        self._overlap_done_event = torch.cuda.Event()
+        self._overlap_side_stream = None
+        # Fused attn shrink pool: layer_key -> {"wq_a": A, "wkv": A} registered
+        # at set_lora_info time so the FIRST run_lora_a_sgemm of a layer can
+        # fire ONE concat shrink for both modules (they share input x).
+        self._attn_a_pool: dict = {}
+        # Per-forward fused cache: (data_ptr of x, fused_x2 [T, 2r], n_consumed)
+        self._fused_attn_cache = None
+
+    def register_attn_a(self, prefix: str, A: torch.Tensor) -> None:
+        """Register an attention LoRA-A buffer for fused shrink pairing.
+
+        Called from ColumnParallelLinearWithLoRA.set_lora_info; prefix is the
+        base layer's full module prefix (e.g. "...layers.20.self_attn.wq_a").
+        Pairing key strips the trailing module name.
+        """
+        import re as _re
+
+        m = _re.search(r"(layers\.\d+)\.", prefix)
+        layer_key = m.group(1) if m else prefix
+        tail = prefix.rsplit(".", 1)[-1] if "." in prefix else prefix
+        if tail in ("wq_a", "wkv", "wqkv_a"):
+            self._attn_a_pool.setdefault(layer_key, {})[tail] = A
+
+    def _try_fused_attn_shrink(self, x: torch.Tensor, A: torch.Tensor):
+        """If this module's paired attn sibling is registered, fire ONE concat
+        shrink for both and return this module's slice. Returns None when the
+        pair is not available (fallback to separate shrink)."""
+        if not self._fused_attn_enabled:
+            return None
+        cache = self._fused_attn_cache
+        if cache is not None and cache[0] == x.data_ptr():
+            # Second module of the pair — consume its slice.
+            fused_x2, consumed = cache[1], cache[2]
+            self._fused_attn_cache = (cache[0], fused_x2, consumed + 1)
+            r = A.shape[1]  # single-slice A: [num_lora, r, K]
+            return fused_x2[:, r:] if consumed == 0 else None
+        # First module: find paired sibling from the pool.
+        r = A.shape[1]
+        # Pairing: the caller passes its own A; sibling A comes from the pool.
+        # We cannot know our own tail here, so scan the pool for a sibling
+        # whose A differs from ours and whose row count matches.
+        for layer_key, mods in self._attn_a_pool.items():
+            for tail, sib_A in mods.items():
+                if sib_A is not A and sib_A.shape[1] == r and sib_A.shape[2] == A.shape[2]:
+                    a_fused = torch.cat([A, sib_A], dim=1)
+                    fused_x2 = chunked_sgmv_lora_shrink_forward(
+                        x=x, weights=a_fused, batch_info=self.batch_info,
+                        num_slices=2,
+                    )
+                    self._fused_attn_cache = (x.data_ptr(), fused_x2, 1)
+                    return fused_x2[:, :r]
+        return None
+
+    def _get_overlap_side_stream(self) -> torch.cuda.Stream:
+        if self._overlap_side_stream is None:
+            self._overlap_side_stream = torch.cuda.Stream()
+        return self._overlap_side_stream
+
+    def start_lora_a_overlap(self, x, A, num_slices=1, *args, **kwargs) -> None:
+        """Fire the chunked LoRA-A shrink on a side stream.
+
+        Called by the LoRA layer BEFORE its base GEMM, so the shrink runs
+        concurrently with the main-stream GEMM. The next shrink-consuming
+        entry (run_lora_a_sgemm / run_qkv_lora / run_gate_up_lora) waits on
+        the done event and reuses this output instead of re-running the
+        shrink serially.
+        """
+        import os as _os
+
+        side = self._get_overlap_side_stream()
+        side.wait_stream(torch.cuda.current_stream())  # x ready on main
+        with torch.cuda.stream(side):
+            self._overlap_a_out = chunked_sgmv_lora_shrink_forward(
+                x=x,
+                weights=A,
+                batch_info=self.batch_info,
+                num_slices=num_slices,
+            )
+            if _os.environ.get("SGLANG_DEBUG_LORA"):
+                _am = self._overlap_a_out.abs().max().item()
+                print(
+                    f"[AOV-START] slices={num_slices} shrink_absmax={_am:.6f} "
+                    f"x_absmax={x.abs().max().item() if x.numel() else 0:.4f}",
+                    flush=True,
+                )
+            self._overlap_done_event.record(side)
+
+    def _consume_overlap_shrink(self):
+        """Return the overlapped shrink output (waiting on the main stream),
+        or None when no overlap was started for this forward."""
+        import os as _os
+
+        if self._overlap_a_out is None:
+            if _os.environ.get("SGLANG_DEBUG_LORA"):
+                print("[AOV-CONSUME] MISS (no cached shrink)", flush=True)
+            return None
+        out = self._overlap_a_out
+        self._overlap_a_out = None
+        torch.cuda.current_stream().wait_event(self._overlap_done_event)
+        if _os.environ.get("SGLANG_DEBUG_LORA"):
+            _am = out.abs().max().item()
+            print(f"[AOV-CONSUME] HIT absmax={_am:.6f}", flush=True)
+        return out
 
     def run_lora_a_embedding(
         self,
@@ -83,11 +210,48 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         batch_info = (
             pruned_batch_info if pruned_batch_info is not None else self.batch_info
         )
+        # Fused attn shrink: when the paired sibling (wq_a/wkv) A is registered,
+        # ONE concat shrink covers both — consume this module's slice here.
+        if pruned_batch_info is None and stack_num == 1:
+            fused_slice = self._try_fused_attn_shrink(x, weights)
+            if fused_slice is not None:
+                return fused_slice
+        # LoRA-A overlap: if start_lora_a_overlap fired this forward on the
+        # side stream, reuse its output instead of re-running the shrink.
+        pre = None if pruned_batch_info is not None else self._consume_overlap_shrink()
+        if pre is not None:
+            return pre
         return chunked_sgmv_lora_shrink_forward(
             x=x,
             weights=weights,
             batch_info=batch_info,
             num_slices=stack_num,
+        )
+
+    def run_fused_attn_shrink(
+        self,
+        x: torch.Tensor,
+        a_qkv: torch.Tensor,
+        a_wqa: Optional[torch.Tensor] = None,
+        a_wkv: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Fused multi-module shrink: q_proj(3 slices) + wq_a + wkv share the
+        same input x — concat their A weights along the slice dim and fire ONE
+        chunked shrink. Returns [s, total_slices*r] which downstream expand
+        calls consume via x_stride_0/x_slice_off."""
+        if a_wqa is None or a_wkv is None:
+            # Fallback: unfused shrink of just qkv part.
+            r = 16
+            n_q = a_qkv.shape[1] // r
+            return chunked_sgmv_lora_shrink_forward(
+                x=x, weights=a_qkv, batch_info=self.batch_info, num_slices=n_q,
+            )
+        r = a_wqa.shape[1]  # single-slice A: [num_lora, r, K]
+        n_q = a_qkv.shape[1] // r  # q/k/v fused: 3 slices
+        a_fused = torch.cat([a_qkv, a_wqa, a_wkv], dim=1)
+        return chunked_sgmv_lora_shrink_forward(
+            x=x, weights=a_fused, batch_info=self.batch_info,
+            num_slices=n_q + 2,
         )
 
     def run_lora_b_sgemm(
@@ -113,6 +277,8 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
             slice_offsets=output_offset,
             max_slice_size=max_slice_size,
             base_output=base_output,
+            x_stride_0=kwargs.get("x_stride_0"),
+            x_slice_off=kwargs.get("x_slice_off", 0),
         )
 
     def run_qkv_lora(
@@ -133,12 +299,23 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         # qkv_lora_b: (num_lora, total_output_dim, r)
         assert isinstance(qkv_lora_b, torch.Tensor)
 
-        lora_a_output = chunked_sgmv_lora_shrink_forward(
-            x=x,
-            weights=qkv_lora_a,
-            batch_info=self.batch_info,
-            num_slices=n_slices,
-        )
+        # LoRA-A overlap: reuse the side-stream precomputed shrink when
+        # start_lora_a_overlap fired this forward (see forward orchestration
+        # in ColumnParallelLinearWithLoRA.forward).
+        lora_a_output = self._consume_overlap_shrink()
+        if lora_a_output is None and kwargs.get("fused_shrink") is not None:
+            lora_a_output = kwargs["fused_shrink"]
+        if lora_a_output is None:
+            lora_a_output = chunked_sgmv_lora_shrink_forward(
+                x=x,
+                weights=qkv_lora_a,
+                batch_info=self.batch_info,
+                num_slices=n_slices,
+            )
+        import os as _os
+
+        _dbg = _os.environ.get("SGLANG_DEBUG_LORA")
+        _pre = base_output.abs().max().item() if (_dbg and base_output is not None) else None
         lora_output = chunked_sgmv_lora_expand_forward(
             x=lora_a_output,
             weights=qkv_lora_b,
@@ -146,7 +323,16 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
             slice_offsets=output_offset,
             max_slice_size=max_qkv_out_dim,
             base_output=base_output,
+            x_stride_0=kwargs.get("x_stride_0"),
+            x_slice_off=kwargs.get("x_slice_off", 0),
         )
+        if _dbg and base_output is not None:
+            _post = base_output.abs().max().item()
+            print(
+                f"[AOV-EXPAND-qkv] pre={_pre:.6f} post={_post:.6f} "
+                f"base_changed={_pre != _post}",
+                flush=True,
+            )
         return lora_output
 
     def run_gate_up_lora(
@@ -167,12 +353,16 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         output_dim = gate_up_lora_b.shape[-2] // 2
 
         # lora_a_output: (s, 2 * r)
-        lora_a_output = chunked_sgmv_lora_shrink_forward(
-            x=x,
-            weights=gate_up_lora_a,
-            batch_info=self.batch_info,
-            num_slices=2,
-        )
+        # LoRA-A overlap: reuse the side-stream precomputed shrink when
+        # start_lora_a_overlap fired this forward.
+        lora_a_output = self._consume_overlap_shrink()
+        if lora_a_output is None:
+            lora_a_output = chunked_sgmv_lora_shrink_forward(
+                x=x,
+                weights=gate_up_lora_a,
+                batch_info=self.batch_info,
+                num_slices=2,
+            )
         lora_output = chunked_sgmv_lora_expand_forward(
             x=lora_a_output,
             weights=gate_up_lora_b,

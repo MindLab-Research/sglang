@@ -491,6 +491,11 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         self.set_lora = True
         self.A_buffer = A_buffer
         self.B_buffer = B_buffer
+        # Fused attn shrink: register this module's A into the backend pool so
+        # paired siblings (wq_a/wkv) can fire ONE concat shrink per layer.
+        reg = getattr(self.lora_backend, "register_attn_a", None)
+        if reg is not None:
+            reg(getattr(self.base_layer, "prefix", ""), A_buffer)
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         lora_a_output = self.lora_backend.run_lora_a_sgemm(x, self.A_buffer)

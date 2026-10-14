@@ -357,6 +357,11 @@ logger.info("[sdiag] get_lora_configs kernel=%s K=%s R=%s S=%s -> %s", kernel, K
 ### 🔬 kernel 微基准协议（2026-10-14 三 lane 实测教训）
 给 LoRA/csgmv 类小 kernel 计时，**「flush+sync 再 event」的 raw 协议会把 ~20–30µs 启动延迟算进数字**（空 kernel grid=1 实测 19.65µs），decode T=64 的真实 kernel 时间只有个位数 µs ⇒ raw 协议下「变体加速 2×」常常只是「少了一层 launch」。**判据必须用 CUDA Graph 内计时**（capture 后回放消掉 host launch），或 `graph[flush+kernel] − graph[flush]` 的 cold 口径。另：**权重不是 per-expert 读一次**——shrink 权重按 m-block 重复读（T=64 时 32×），算 issued 流量别按 per-expert；decode T=64 下 MoE shrink 两形状 graph 内合计仅 ~11µs（gate_up 6.59 + down 4.44），**先塞 graph/PDL 再谈 kernel 数学**。
 
+### 🏗️ e2e 收益与 GEMM 时间无关的两个掩盖层（2026-10-15 全闭环实测，勿再按 GEMM 微基准外推 e2e）
+1. **MoE GEMM 在 spec decode graph 内被完全掩盖**：GEMM 时间差 4.7ms/step（contiguous 48.66µs vs bmm 283.5µs/层 × 20）在 e2e 里收益=0——MoE GEMM 与 draft 计算重叠，不在关键路径。任何 MoE GEMM 引擎替换（contiguous/bmm/cubin）的 e2e 收益均为 0（实测三路确认）。
+2. **A-overlap 与 fused attn shrink 互斥**：两者都消 shrink launch 开销——A-overlap 移 side stream 与 base GEMM 重叠，fused 合并两个模块的 launch。叠加时 fused 收益被 overlap 吸收；独立开也都在噪声带内（shrink launch ~0.17ms < ±0.2ms 噪声带）。全部配置 per-step 26.4-26.6。
+3. **推理侧地板 = 7.344ms**（v3 三叠加最优：DEEPGEMM_V3 + MLP_OUT_LORA + A_OVERLAP，acc_len 3.59）。attention LoRA 归属 2.196ms（expand 不可合并——不同 base_output；shrink 被 overlap 吸收）；MoE 归属 0.226ms（GEMM 被掩盖）。**距 6ms 差 1.34ms——剩余全部在训练侧**（输出侧适配器重训 −1.5~2.0 / accept_len draft 质量）。
+
 ### ⛔ 红线（2026-10-12 用户下令）：**禁止把 LoRA 烘进权重**
 「把 LoRA 直接烘进权重、让 LoRA 请求走基座同一条快路径」——**绝对不行也不允许，必须动态**。
 - 即：**不得**物化 `W_eff = W + s·B·A` 去蹭基座的 fused 快路径；LoRA 的 delta 必须**每请求现算**。

@@ -1067,11 +1067,22 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora_two_stream(
                 if quant_info.gemm1_alpha is not None else 1.702)
         _g1b = (float(quant_info.gemm1_beta)
                 if quant_info.gemm1_beta is not None else 1.0)
-        output, _ = v3_gemm_stage(
-            hidden_states, topk_ids, topk_weights, _w13_bf, _w2_bf,
-            gate_up_delta, None, quant_info.gemm1_clamp_limit,
-            activation_lora_input, quant_info.local_num_experts, M_MAX=64,
-            gemm1_alpha=_g1a, gemm1_beta=_g1b)
+        if _o.environ.get("SGLANG_V3_CONTIG") == "1":
+            from sglang.kernels.ops.moe.trtllm_lora_temp.v3_contig import (
+                v3_gemm_stage_contig,
+            )
+            import deep_gemm as _dg
+            output, _ = v3_gemm_stage_contig(
+                hidden_states, topk_ids, topk_weights, _w13_bf, _w2_bf,
+                gate_up_delta, None, quant_info.gemm1_clamp_limit,
+                activation_lora_input, quant_info.local_num_experts, _dg,
+                gemm1_alpha=_g1a, gemm1_beta=_g1b)
+        else:
+            output, _ = v3_gemm_stage(
+                hidden_states, topk_ids, topk_weights, _w13_bf, _w2_bf,
+                gate_up_delta, None, quant_info.gemm1_clamp_limit,
+                activation_lora_input, quant_info.local_num_experts, M_MAX=64,
+                gemm1_alpha=_g1a, gemm1_beta=_g1b)
     else:
         output = trtllm_fp4_block_scale_routed_moe_lora(
             topk_ids=packed_topk_ids,

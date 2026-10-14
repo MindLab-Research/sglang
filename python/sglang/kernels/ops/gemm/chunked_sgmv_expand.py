@@ -12,7 +12,15 @@ from sglang.srt.utils import cached_triton_kernel
 @cached_triton_kernel(
     lambda _, kwargs: (kwargs["NUM_SLICES"], kwargs["BLOCK_M"], kwargs["OUTPUT_DIM"])
 )
-@triton.jit(do_not_specialize=["num_segs", "output_stride_0", "output_stride_1"])
+@triton.jit(
+    do_not_specialize=[
+        "num_segs",
+        "output_stride_0",
+        "output_stride_1",
+        "x_stride_0",
+        "x_slice_off",
+    ]
+)
 def _chunked_lora_expand_kernel(
     # Pointers to matrices
     x,
@@ -22,6 +30,12 @@ def _chunked_lora_expand_kernel(
     # accumulated into a wider base projection.
     output_stride_0,
     output_stride_1,
+    # Row stride of x. Normally NUM_SLICES * MAX_RANK, but a fused multi-module
+    # shrink output may be wider (x holds 5 modules' slices while this launch
+    # only consumes a contiguous range of them via x_slice_off).
+    x_stride_0,
+    # Column offset (in rank units) of the first slice this launch consumes.
+    x_slice_off,
     # Information on sequence lengths and weight id
     seg_indptr,
     weight_indices,
@@ -56,7 +70,6 @@ def _chunked_lora_expand_kernel(
         output (Tensor): The output tensor where the result is stored.
             Shape: (s, output_dim) or a wider base output.
     """
-    x_stride_0: tl.constexpr = NUM_SLICES * MAX_RANK
     x_stride_1: tl.constexpr = 1
 
     w_stride_0: tl.constexpr = OUTPUT_DIM * MAX_RANK
@@ -105,7 +118,7 @@ def _chunked_lora_expand_kernel(
 
     x_ptrs = (
         x
-        + slice_id * cur_rank * x_stride_1
+        + (x_slice_off + slice_id) * cur_rank * x_stride_1
         + (s_offset_physical[:, None] * x_stride_0 + k_offset[None, :] * x_stride_1)
     )
     w_ptrs = (weights + w_index * w_stride_0) + (
@@ -153,9 +166,13 @@ def chunked_sgmv_lora_expand_forward(
     slice_offsets: torch.Tensor,
     max_slice_size: int,
     base_output: Optional[torch.Tensor],
+    x_stride_0: Optional[int] = None,
+    x_slice_off: int = 0,
 ) -> torch.Tensor:
 
-    # x: (s, slice_num * r)
+    # x: (s, slice_num * r) — or wider: with x_stride_0/x_slice_off a fused
+    # multi-module shrink output can be passed, consuming only the contiguous
+    # slice range [x_slice_off, x_slice_off + num_slices).
     # weights: (num_lora, output_dim, r)
     # slice_offsets: boundaries for different slices in the output dimension
     # output: (s, output_dim)
@@ -175,7 +192,15 @@ def chunked_sgmv_lora_expand_forward(
     OUTPUT_DIM = weights.shape[1]
     MAX_RANK = weights.shape[2]
     num_slices = len(slice_offsets) - 1
-    assert input_dim == num_slices * MAX_RANK
+    if x_stride_0 is None:
+        x_stride_0 = num_slices * MAX_RANK
+    assert (x_slice_off + num_slices) * MAX_RANK <= input_dim, (
+        f"fused expand slice range [{x_slice_off}, {x_slice_off + num_slices}) "
+        f"exceeds x width {input_dim}"
+    )
+    assert x_stride_0 >= (x_slice_off + num_slices) * MAX_RANK or x_stride_0 == input_dim, (
+        f"x_stride_0={x_stride_0} too narrow for slice range"
+    )
 
     # Block shapes — use auto-tuned config if available, else defaults
     BLOCK_M = batch_info.max_len
@@ -218,6 +243,8 @@ def chunked_sgmv_lora_expand_forward(
         output=output,
         output_stride_0=output.stride(0),
         output_stride_1=output.stride(1),
+        x_stride_0=x_stride_0,
+        x_slice_off=x_slice_off,
         seg_indptr=batch_info.seg_indptr,
         weight_indices=batch_info.weight_indices,
         lora_ranks=batch_info.lora_ranks,
