@@ -476,28 +476,48 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
     ):
         chunk_size = self._determine_chunk_size(forward_batch)
 
-        permutation, weight_indices_reordered = ChunkedSgmvLoRABackend._get_permutation(
-            seq_weight_indices=weight_indices,
-            forward_batch=forward_batch,
-        )
+        # Cache pinned CPU tensors + permutation/segments: same adapter set +
+        # same rank/scaling content → identical tensors; avoid re-creating
+        # pinned memory (cudaHostAlloc ~100us each) on every decode step.
+        cache_key = (tuple(weight_indices), tuple(lora_ranks),
+                     tuple(scalings), forward_batch.batch_size)
+        cached = self._prep_cache.get(cache_key) if hasattr(self, "_prep_cache") else None
+        if cached is None:
+            permutation, weight_indices_reordered = (
+                ChunkedSgmvLoRABackend._get_permutation(
+                    seq_weight_indices=weight_indices,
+                    forward_batch=forward_batch,
+                )
+            )
+            seg_weight_indices, seg_indptr = self._get_segments_info(
+                weights_reordered=weight_indices_reordered,
+                chunk_size=chunk_size,
+            )
+            lora_ranks_tensor = torch.tensor(
+                lora_ranks, dtype=torch.int32, pin_memory=True, device="cpu"
+            )
+            scalings_tensor = torch.tensor(
+                scalings, dtype=torch.float, pin_memory=True, device="cpu"
+            )
+            req_wi_tensor = torch.tensor(
+                weight_indices, dtype=torch.int32, pin_memory=True, device="cpu"
+            )
+            if not hasattr(self, "_prep_cache"):
+                self._prep_cache = {}
+            self._prep_cache[cache_key] = (
+                permutation, weight_indices_reordered,
+                seg_weight_indices, seg_indptr,
+                lora_ranks_tensor, scalings_tensor, req_wi_tensor,
+            )
+        else:
+            (permutation, weight_indices_reordered,
+             seg_weight_indices, seg_indptr,
+             lora_ranks_tensor, scalings_tensor, req_wi_tensor) = cached
+            # seg_indptr/seg_weight_indices are views of weights_reordered;
+            # re-derive from cache (no recompute needed)
 
-        seg_weight_indices, seg_indptr = self._get_segments_info(
-            weights_reordered=weight_indices_reordered,
-            chunk_size=chunk_size,
-        )
         num_segments = len(seg_weight_indices)
-
-        lora_ranks_tensor = torch.tensor(
-            lora_ranks, dtype=torch.int32, pin_memory=True, device="cpu"
-        )
-        scalings_tensor = torch.tensor(
-            scalings, dtype=torch.float, pin_memory=True, device="cpu"
-        )
-
         bs = forward_batch.batch_size
-        req_wi_tensor = torch.tensor(
-            weight_indices, dtype=torch.int32, pin_memory=True, device="cpu"
-        )
         req_seg_indptr_cpu = self._build_req_seg_indptr(forward_batch)
         max_num_segments = 0
         has_unused_cuda_graph_segments = False
