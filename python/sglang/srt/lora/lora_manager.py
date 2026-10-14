@@ -800,20 +800,29 @@ class LoRAManager:
             self.fetch_new_loras(active_lora_ids)
 
         base_weight_index = self.memory_pool.uid_to_buffer_id.get(None, 0)
-        weight_indices = [base_weight_index] * len(forward_batch.lora_ids)
-        lora_ranks = [0] * self.max_loras_per_batch
-        scalings = [0] * self.max_loras_per_batch
-        for i, uid in enumerate(forward_batch.lora_ids):
-            if uid not in self.memory_pool.uid_to_buffer_id:
-                continue
-            weight_indices[i] = self.memory_pool.get_buffer_id(uid)
-        for uid in active_lora_ids:
-            if uid is None:
-                continue
-            weight_index = self.memory_pool.get_buffer_id(uid)
-            lora = self.loras[uid]
-            lora_ranks[weight_index] = lora.config.r
-            scalings[weight_index] = lora.scaling
+        # Cache the per-request weight_indices/lora_ranks/scalings lists: same
+        # lora_ids tuple → identical lists (uid→buffer_id / rank / scaling are
+        # adapter-static). Saves ~64 dict lookups + 3 list rebuilds per step.
+        _ids_key = tuple(forward_batch.lora_ids)
+        _cached_lists = getattr(self, "_prep_lists_cache", None)
+        if _cached_lists is not None and _cached_lists[0] == _ids_key:
+            weight_indices, lora_ranks, scalings = _cached_lists[1]
+        else:
+            weight_indices = [base_weight_index] * len(forward_batch.lora_ids)
+            lora_ranks = [0] * self.max_loras_per_batch
+            scalings = [0] * self.max_loras_per_batch
+            for i, uid in enumerate(forward_batch.lora_ids):
+                if uid not in self.memory_pool.uid_to_buffer_id:
+                    continue
+                weight_indices[i] = self.memory_pool.get_buffer_id(uid)
+            for uid in active_lora_ids:
+                if uid is None:
+                    continue
+                weight_index = self.memory_pool.get_buffer_id(uid)
+                lora = self.loras[uid]
+                lora_ranks[weight_index] = lora.config.r
+                scalings[weight_index] = lora.scaling
+            self._prep_lists_cache = (_ids_key, (weight_indices, lora_ranks, scalings))
         # Do in-place updates when CUDA graph is enabled and the batch forward mode
         # could use CUDA graph.
         self.lora_backend.prepare_lora_batch(
