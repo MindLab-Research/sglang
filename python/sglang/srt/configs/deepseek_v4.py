@@ -134,5 +134,7 @@ class DeepSeekV4Config(PretrainedConfig):
     hc_mult: int = 4
     hc_pre_from_prev_sublayer: bool = False
     q_head_norm: bool = True
-    hc_sinkhorn_iters: int = 20
+    hc_sinkhorn_iters: int = int(
+        __import__("os").environ.get("SGLANG_HC_SINKHORN_ITERS", "20")
+    )
     hc_eps: float = 1e-6
