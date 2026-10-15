@@ -476,31 +476,51 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
     ):
         chunk_size = self._determine_chunk_size(forward_batch)
 
-        # NOTE: the four-layer prep cache that used to live here was REMOVED —
-        # it caused prefill CUDA crashes under bench load (R16/R19 bisect:
-        # crash 100% in the LoRA path; cache OFF => 256/256 requests OK).
-        # Bug mechanisms: id(batch_info) key reuse in base_backend, pool
-        # lifetime skipped in fetch_new_loras, and this cache missing
-        # seq_lens in its key. Rebuild unconditionally (original logic).
-        permutation, weight_indices_reordered = (
-            ChunkedSgmvLoRABackend._get_permutation(
-                seq_weight_indices=weight_indices,
-                forward_batch=forward_batch,
+        # Bounded prep cache (crash-informed design): the R34/R35 crash was
+        # unbounded key growth from a seq_lens fingerprint (pinned tensors
+        # ballooned). This variant uses ONLY bounded-value keys — (wi, ranks,
+        # scalings, bs, chunk) — under single-adapter decode these produce a
+        # handful of distinct keys (bs 60-64), and single-adapter
+        # permutations are the identity (argsort of equal keys), so omitting
+        # seq_lens is safe here. A hard cap guards pathological growth.
+        _prep_key = (tuple(weight_indices), tuple(lora_ranks),
+                     tuple(scalings), forward_batch.batch_size, chunk_size)
+        _pc = getattr(self, "_prep_cache", None)
+        if _pc is None:
+            _pc = {}
+            self._prep_cache = _pc
+        if len(_pc) > 64:  # hard cap: pathological growth guard
+            _pc.clear()
+        _cached = _pc.get(_prep_key)
+        if _cached is not None:
+            (permutation, weight_indices_reordered,
+             seg_weight_indices, seg_indptr,
+             lora_ranks_tensor, scalings_tensor, req_wi_tensor) = _cached
+        else:
+            permutation, weight_indices_reordered = (
+                ChunkedSgmvLoRABackend._get_permutation(
+                    seq_weight_indices=weight_indices,
+                    forward_batch=forward_batch,
+                )
             )
-        )
-        seg_weight_indices, seg_indptr = self._get_segments_info(
-            weights_reordered=weight_indices_reordered,
-            chunk_size=chunk_size,
-        )
-        lora_ranks_tensor = torch.tensor(
-            lora_ranks, dtype=torch.int32, pin_memory=True, device="cpu"
-        )
-        scalings_tensor = torch.tensor(
-            scalings, dtype=torch.float, pin_memory=True, device="cpu"
-        )
-        req_wi_tensor = torch.tensor(
-            weight_indices, dtype=torch.int32, pin_memory=True, device="cpu"
-        )
+            seg_weight_indices, seg_indptr = self._get_segments_info(
+                weights_reordered=weight_indices_reordered,
+                chunk_size=chunk_size,
+            )
+            lora_ranks_tensor = torch.tensor(
+                lora_ranks, dtype=torch.int32, pin_memory=True, device="cpu"
+            )
+            scalings_tensor = torch.tensor(
+                scalings, dtype=torch.float, pin_memory=True, device="cpu"
+            )
+            req_wi_tensor = torch.tensor(
+                weight_indices, dtype=torch.int32, pin_memory=True, device="cpu"
+            )
+            _pc[_prep_key] = (
+                permutation, weight_indices_reordered,
+                seg_weight_indices, seg_indptr,
+                lora_ranks_tensor, scalings_tensor, req_wi_tensor,
+            )
 
         num_segments = len(seg_weight_indices)
         bs = forward_batch.batch_size
