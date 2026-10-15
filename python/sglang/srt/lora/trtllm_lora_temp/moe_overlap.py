@@ -1055,7 +1055,24 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora_two_stream(
     if _o.environ.get("SGLANG_LORA_DEEPGEMM_V3") == "1":
         # v3 path: bf16-bmm MoE-LoRA (DeepGEMM masked discarded; rel=3.6e-3 PASS).
         # GEMM segment only — delta VE stages and down-VE merge stay identical.
-        from sglang.srt.layers.quantization.mxfp4 import dequant_mxfp4
+        # NVIDIA torch dequant (the quark mx.dq_mxfp4 import is AMD-only and
+        # raised ImportError on CUDA — this was the sole blocker that kept the
+        # v3 path dead). Weights: [N, K/2] int8 packed e2m1 (low nibble =
+        # even k, high nibble = odd k); scales: [N, K/32] float8_e8m0fnu.
+        def _dequant_mxfp4_torch(x_int8, scale_e8m0, float_dtype):
+            LUT = torch.tensor(
+                [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                 -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+                dtype=torch.float32, device=x_int8.device,
+            )
+            xu = x_int8.to(torch.uint8).to(torch.long)
+            lo = (xu & 0xF)
+            hi = (xu >> 4)
+            vals = torch.stack([LUT[lo], LUT[hi]], dim=-1)
+            vals = vals.reshape(*x_int8.shape[:-1], x_int8.shape[-1] * 2)
+            s = scale_e8m0.to(torch.float32).repeat_interleave(32, dim=-1)
+            return (vals * s).to(float_dtype)
+
         global _DG_V3_WCACHE
         try:
             _DG_V3_WCACHE
@@ -1064,10 +1081,10 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora_two_stream(
         _wkey = quant_info.w13_weight.data_ptr()
         if _wkey not in _DG_V3_WCACHE:
             _DG_V3_WCACHE[_wkey] = (
-                dequant_mxfp4(quant_info.w13_weight,
-                              quant_info.w13_weight_scale, torch.bfloat16),
-                dequant_mxfp4(quant_info.w2_weight,
-                              quant_info.w2_weight_scale, torch.bfloat16),
+                _dequant_mxfp4_torch(quant_info.w13_weight,
+                                     quant_info.w13_weight_scale, torch.bfloat16),
+                _dequant_mxfp4_torch(quant_info.w2_weight,
+                                     quant_info.w2_weight_scale, torch.bfloat16),
             )
         _w13_bf, _w2_bf = _DG_V3_WCACHE[_wkey]
         from sglang.kernels.ops.moe.trtllm_lora_temp.deepgemm_path import (
