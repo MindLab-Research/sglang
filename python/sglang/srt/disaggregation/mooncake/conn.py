@@ -2304,8 +2304,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         if ret != 0:
                             with self.session_lock:
                                 self.session_failures[req.mooncake_session_id] += 1
-                                # Failures should never happen if the session is not dead, if the session fails once, mark it as failed
-                                if self.session_failures[req.mooncake_session_id] >= 1:
+                                # R76: raise threshold from 1 to 10 — transient RDMA
+                                # failures (common under high decode throughput with
+                                # POSTDELTA) should NOT permanently blacklist a session.
+                                # Probe recovery (SGLANG_ENABLE_FAILED_SESSION_PROBE=1)
+                                # can also restore sessions after transient failures.
+                                _threshold = int(os.environ.get(
+                                    "SGLANG_MOONCAKE_SESSION_FAILURE_THRESHOLD", "10"
+                                ))
+                                if self.session_failures[req.mooncake_session_id] >= _threshold:
                                     self.failed_sessions.add(req.mooncake_session_id)
                                     logger.error(
                                         f"Session {req.mooncake_session_id} failed."
