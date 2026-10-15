@@ -894,9 +894,14 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora_two_stream(
                 # Test mode: fixed random B'A'x (scale 0.01, seed=42)
                 if _o.environ.get("SGLANG_LORA_POSTDELTA_TEST") == "1":
                     _d = _x.shape[-1]
-                    _g = torch.Generator(device=_x.device).manual_seed(42)
-                    _ta = torch.randn(16, _d, device=_x.device, dtype=_x.dtype, generator=_g) * 0.01
-                    _tb = torch.randn(_d, 16, device=_x.device, dtype=_x.dtype, generator=_g) * 0.01
+                    _ta = globals().get("_PD_TA")
+                    _tb = globals().get("_PD_TB")
+                    if _ta is None or _ta.shape[-1] != _d or _ta.device != _x.device:
+                        _g = torch.Generator(device=_x.device).manual_seed(42)
+                        _ta = torch.randn(16, _d, device=_x.device, dtype=_x.dtype, generator=_g) * 0.01
+                        _tb = torch.randn(_d, 16, device=_x.device, dtype=_x.dtype, generator=_g) * 0.01
+                        globals()["_PD_TA"] = _ta
+                        globals()["_PD_TB"] = _tb
                     _delta = torch.nn.functional.linear(_x, _ta)
                     _delta = torch.nn.functional.linear(_delta, _tb)
                     _y_base = _y_base + _delta
@@ -1038,9 +1043,14 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora_two_stream(
                 if _o.environ.get("SGLANG_LORA_POSTDELTA_TEST") == "1":
                     _x = dispatch_output.hidden_states
                     _d = _x.shape[-1]
-                    _g = torch.Generator(device=_x.device).manual_seed(42)
-                    _ta = torch.randn(16, _d, device=_x.device, dtype=_x.dtype, generator=_g) * 0.01
-                    _tb = torch.randn(_d, 16, device=_x.device, dtype=_x.dtype, generator=_g) * 0.01
+                    _ta = globals().get("_PD_TA2")
+                    _tb = globals().get("_PD_TB2")
+                    if _ta is None or _ta.shape[-1] != _d or _ta.device != _x.device:
+                        _g = torch.Generator(device=_x.device).manual_seed(42)
+                        _ta = torch.randn(16, _d, device=_x.device, dtype=_x.dtype, generator=_g) * 0.01
+                        _tb = torch.randn(_d, 16, device=_x.device, dtype=_x.dtype, generator=_g) * 0.01
+                        globals()["_PD_TA2"] = _ta
+                        globals()["_PD_TB2"] = _tb
                     _delta = torch.nn.functional.linear(_x, _ta)
                     _delta = torch.nn.functional.linear(_delta, _tb)
                     _y_base = _y_base + _delta
