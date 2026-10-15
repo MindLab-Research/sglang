@@ -213,7 +213,14 @@ def _all_reduce_polls(polls, group):
             new_tensor, op=dist.ReduceOp.MIN, group=group, async_op=True
         )
         if prev is not None and prev[1].is_completed():
-            result = prev[0].tolist()
+            stale_result = prev[0].tolist()
+            # Don't propagate stale Success (poll=4) — decode raises
+            # ValueError on unexpected Success from 1-step staleness.
+            # Fallback to local polls for any stale Success entries.
+            if any(r == 4 for r in stale_result):
+                result = polls
+            else:
+                result = stale_result
         else:
             result = polls  # fallback to local polls (1-step staleness)
         _prev_async_state[gid] = (new_tensor, new_work)
