@@ -1039,10 +1039,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
         else:
             polls = poll_and_all_reduce(
-                [decode_req.kv_receiver for decode_req in self.queue],
-                self.gloo_group,
-                rids=[decode_req.req.rid for decode_req in self.queue],
-                site="dec_hs",
+                [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
             )
 
         for decode_req, poll in zip(self.queue, polls):
@@ -2588,8 +2585,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             self.gloo_group,
             decode_reqs=self.queue,
             metadata_buffers=self.metadata_buffers,
-            rids=[dr.req.rid for dr in self.queue],
-            site="dec_xf",
         )
 
     def _poll_with_staging(self) -> list:

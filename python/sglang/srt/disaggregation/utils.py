@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import random
-from collections import defaultdict, deque
+from collections import deque
 from contextlib import nullcontext
 from enum import Enum
 from typing import (
@@ -188,69 +188,55 @@ def _apply_metadata_gate(polls, decode_reqs, metadata_buffers) -> None:
                 polls[i] = int(KVPoll.Transferring)
 
 
-_ASYNC_POLL_STATE = {}  # (id(group), site) -> {"rids", "tensor", "work"}
-_CONFIRMED_POLLS = defaultdict(dict)  # (id(group), site) -> {rid: confirmed poll}
+_SHM_BOARDS = {}  # id(group) -> numpy array [world_size, max_len] uint8
 
 
-def _all_reduce_polls(
-    polls: List[int],
-    group: dist.ProcessGroup,
-    rids: Optional[List[str]] = None,
-    site: Optional[str] = None,
-) -> List[int]:
+def _all_reduce_polls(polls: List[int], group: dist.ProcessGroup) -> List[int]:
     """MIN-reduce poll states so no rank commits ahead of its peers."""
     if dist.get_world_size(group) == 1:
         return polls
 
     import os
 
-    # Only async when site is explicitly passed (decode handshake/transfer)
-    # AND POSTDELTA is enabled. Prefill (no site) uses sync (original behavior).
-    if site is not None and os.environ.get("SGLANG_LORA_FUSED_POSTDELTA") == "1":
-        rids = rids or [str(i) for i in range(len(polls))]
-        key = (id(group), site)
+    if os.environ.get("SGLANG_LORA_FUSED_POSTDELTA") == "1":
+        # Shared memory poll board: NO barrier, NO blocking main thread.
+        # Each rank writes its polls to its row; all read all rows and take MIN.
+        # Stale only lags (conservative) — Success is monotonic → safe.
+        # This replaces the gloo CPU all_reduce which blocked the main thread
+        # under POSTDELTA decode acceleration → detokenizer hang.
+        import numpy as np
+        from multiprocessing import shared_memory
 
-        # Pad to fixed length for cross-rank shape consistency (gloo async
-        # all_reduce requires all ranks to have the same tensor shape).
-        # 0xFF = MIN identity (255 > any KVPoll value, so MIN ignores padding).
-        _orig_len = len(polls)
-        _max_len = int(os.environ.get("SGLANG_MAX_RUNNING_REQUESTS", "256"))
-        _padded_polls = list(polls) + [0xFF] * (_max_len - _orig_len)
-        _padded_rids = list(rids) + [f"_pad_{i}" for i in range(_max_len - _orig_len)]
+        max_len = int(os.environ.get("SGLANG_MAX_RUNNING_REQUESTS", "256"))
+        gid = id(group)
+        if gid not in _SHM_BOARDS:
+            world_size = dist.get_world_size(group)
+            _shm_name = f"sglang_poll_{gid}"
+            try:
+                _shm = shared_memory.SharedMemory(
+                    name=_shm_name, create=True, size=world_size * max_len
+                )
+                _arr = np.ndarray(
+                    (world_size, max_len), dtype=np.uint8, buffer=_shm.buf
+                )
+                _arr[:] = 0xFF  # Initialize to MIN identity (0xFF > any KVPoll)
+            except FileExistsError:
+                _shm = shared_memory.SharedMemory(name=_shm_name)
+                _arr = np.ndarray(
+                    (world_size, max_len), dtype=np.uint8, buffer=_shm.buf
+                )
+            _SHM_BOARDS[gid] = _arr
 
-        # Harvest previous async result (rid-keyed, not position-keyed)
-        st = _ASYNC_POLL_STATE.get(key)
-        if st and st["work"].is_completed():
-            for r, v in zip(st["rids"], st["tensor"].tolist()):
-                if not r.startswith("_pad_"):
-                    _CONFIRMED_POLLS[key][r] = int(v)
-            _ASYNC_POLL_STATE.pop(key)
-            st = None
+        board = _SHM_BOARDS[gid]
+        rank = dist.get_rank(group)
 
-        # Start new async all_reduce (at most 1 in-flight per site)
-        if st is None:
-            t = torch.tensor(_padded_polls, dtype=torch.uint8, device="cpu")
-            w = dist.all_reduce(t, op=dist.ReduceOp.MIN, group=group, async_op=True)
-            _ASYNC_POLL_STATE[key] = {"rids": tuple(_padded_rids), "tensor": t, "work": w}
+        # Write local polls to this rank's row (pad with 0xFF = MIN identity)
+        padded = list(polls) + [0xFF] * (max_len - len(polls))
+        board[rank] = np.array(padded, dtype=np.uint8)
 
-        # Auto-clean stale confirmed polls (rids no longer in queue).
-        # Without this, _CONFIRMED_POLLS grows unbounded + bootstrap_room
-        # reuse causes rid collision → wrong poll state → detokenizer hang.
-        _current_rids = set(rids)
-        _stale = [r for r in list(_CONFIRMED_POLLS[key].keys()) if r not in _current_rids]
-        for r in _stale:
-            _CONFIRMED_POLLS[key].pop(r, None)
-
-        # Build result: use confirmed poll if available, else local poll
-        # with Success (4) downgraded to Transferring (3) — conservative,
-        # never advance ahead of peers.
-        out = []
-        for r, local in zip(rids, polls):
-            v = _CONFIRMED_POLLS[key].get(r)
-            if v is None:
-                v = 3 if int(local) == 4 else int(local)
-            out.append(v)
-        return out
+        # Read all ranks' rows and take MIN (NO barrier — no blocking!)
+        result = board.min(axis=0).tolist()
+        return result[: len(polls)]
     else:
         tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
         dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=group)
@@ -262,8 +248,6 @@ def poll_and_all_reduce(
     gloo_group: dist.ProcessGroup,
     decode_reqs=None,
     metadata_buffers: Optional[MetadataBuffers] = None,
-    rids=None,
-    site=None,
 ):
     # at a certain prob, the poll is failed to simulate failure
     polls = _poll_with_failure_injection(pollers)
@@ -271,7 +255,7 @@ def poll_and_all_reduce(
     # Apply metadata gate on the decode requests to downgrade Success → Transferring for requests whose metadata hasn't landed.
     if decode_reqs is not None and metadata_buffers is not None:
         _apply_metadata_gate(polls, decode_reqs, metadata_buffers)
-    return _all_reduce_polls(polls, gloo_group, rids=rids, site=site)
+    return _all_reduce_polls(polls, gloo_group)
 
 
 def poll_and_all_reduce_attn_cp_tp_group(
@@ -320,12 +304,7 @@ def poll_and_all_reduce_with_staging(
     # Apply metadata gate on the decode requests to downgrade Success → Transferring for requests whose metadata hasn't landed.
     if metadata_buffers is not None:
         _apply_metadata_gate(raw_polls, decode_reqs, metadata_buffers)
-    return _all_reduce_polls(
-        raw_polls,
-        gloo_group,
-        rids=[dr.req.rid for dr in decode_reqs],
-        site="dec_xf",
-    )
+    return _all_reduce_polls(raw_polls, gloo_group)
 
 
 #########################
