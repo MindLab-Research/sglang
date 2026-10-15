@@ -148,7 +148,17 @@ def _moe_rejects_bypassed_topk() -> bool:
     capture otherwise dies on the apply() guard.
     """
     rb = get_moe_runner_backend()
-    return rb.is_flashinfer_trtllm() or rb.is_flashinfer_mxfp4()
+    if rb.is_flashinfer_trtllm() or rb.is_flashinfer_mxfp4():
+        # POSTDELTA: allow BYPASSED dispatch so LoRA requests use the same graph
+        # as base (no STANDARD topk materialization in graph → no degradation
+        # under 256-bench). The POSTDELTA branch in moe_overlap handles delta
+        # outside graph (get_is_capture_mode gate).
+        import os
+
+        if os.environ.get("SGLANG_LORA_FUSED_POSTDELTA") == "1":
+            return False
+        return True
+    return False
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,

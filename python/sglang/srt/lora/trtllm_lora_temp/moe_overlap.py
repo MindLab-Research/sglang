@@ -878,9 +878,55 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora_two_stream(
             fused_experts_none_to_flashinfer_trtllm,
         )
 
-        return fused_experts_none_to_flashinfer_trtllm(
+        _combine = fused_experts_none_to_flashinfer_trtllm(
             dispatch_output, quant_info, runner_config
         )
+        # POSTDELTA: add delta OUTSIDE graph (BYPASSED dispatch → graph == base
+        # → no STANDARD topk materialization in graph → no degradation under
+        # 256-bench). Delta computed eagerly after graph replay.
+        if _o.environ.get("SGLANG_LORA_FUSED_POSTDELTA") == "1":
+            from sglang.srt.model_executor.runner_utils.capture_mode import (
+                get_is_capture_mode,
+            )
+            if not get_is_capture_mode():
+                _y_base = _combine.hidden_states
+                _x = dispatch_output.hidden_states
+                # Test mode: fixed random B'A'x (scale 0.01, seed=42)
+                if _o.environ.get("SGLANG_LORA_POSTDELTA_TEST") == "1":
+                    global _POSTDELTA_TEST_A, _POSTDELTA_TEST_B
+                    _d = _x.shape[-1]
+                    if (
+                        _POSTDELTA_TEST_A is None
+                        or _POSTDELTA_TEST_A.shape[-1] != _d
+                        or _POSTDELTA_TEST_A.device != _x.device
+                    ):
+                        _g = torch.Generator(device=_x.device).manual_seed(42)
+                        _POSTDELTA_TEST_A = (
+                            torch.randn(16, _d, device=_x.device, dtype=_x.dtype, generator=_g)
+                            * 0.01
+                        )
+                        _POSTDELTA_TEST_B = (
+                            torch.randn(_d, 16, device=_x.device, dtype=_x.dtype, generator=_g)
+                            * 0.01
+                        )
+                    _delta = torch.nn.functional.linear(_x, _POSTDELTA_TEST_A)
+                    _delta = torch.nn.functional.linear(_delta, _POSTDELTA_TEST_B)
+                    _y_base = _y_base + _delta
+                # Parallel adapter delta: B'A'x (real weights, when available)
+                _a = getattr(lora_info, "down_lora_a_weights", None)
+                if _a is not None:
+                    if _a.ndim == 3:
+                        _a = _a[0]
+                    if _a.shape[-1] == _x.shape[-1]:
+                        _b = getattr(lora_info, "down_lora_b_weights", None)
+                        if _b is not None:
+                            if _b.ndim == 3:
+                                _b = _b[0]
+                            _delta = torch.nn.functional.linear(_x, _a)
+                            _delta = torch.nn.functional.linear(_delta, _b)
+                            _y_base = _y_base + _delta
+                _combine = StandardCombineInput(hidden_states=_y_base)
+        return _combine
     assert TopKOutputChecker.format_is_standard(topk_output), (
         "experimental_sgl_trtllm MXFP4 LoRA needs materialized topk_ids; the "
         "logits-based (bypassed) routing does not expose them."
