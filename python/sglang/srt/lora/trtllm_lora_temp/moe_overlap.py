@@ -916,30 +916,61 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora_two_stream(
         dispatch_output = dispatch_output._replace(topk_output=topk_output)
 
     if _o.environ.get("SGLANG_LORA_FUSED_POSTDELTA") == "1":
-        from sglang.srt.model_executor.runner_utils.capture_mode import (
-            current_forward_is_decode,
-        )
-        if current_forward_is_decode():
-            # R50 user-directed route: the NVIDIA closed-source fused kernel
-            # computes the whole base MoE chain (routing -> GEMM1 -> gated-SwiGLU
-            # -> MXFP8 quant -> GEMM2 -> combine) via its routed (materialized-topk)
-            # entry — the same cubin the no-LoRA base path uses. The LoRA delta is
-            # applied OUTPUT-SIDE only (y += delta): there is no hook inside the
-            # closed cubin, and a zero delta added to the output is a bitwise
-            # no-op (x + 0.0 == x). Today this branch is exact for zero-weight /
-            # pass-through batches (delta == 0.0 identically). routed_scaling_factor
-            # is already materialized into topk_weights by the REAL FIX above and
-            # the kernel's TopK-only branch never applies mRouteScale (no double
-            # scaling).
-            # DECODE-ONLY gate: prefill's large-batch path is not yet validated
-            # under POSTDELTA (R51 256-bench prefill CUDA crash 16:47:47, 3
-            # subproc); prefill falls back to the decomposed path below.
-            # current_forward_is_decode() returns True for decode + decode-graph-
-            # capture (the API's design user is exactly this two-stream gate,
-            # per capture_mode.py:96-100).
-            return _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
-                dispatch_output, quant_info, runner_config
+        # R50 fused-kernel + output-side delta. The routed (STANDARD topk)
+        # cubin MMU-faults under 256-bench graph replay (R56 Xid 13/31).
+        # FIX: route through the BYPASSED logits cubin
+        # (trtllm_fp4_block_scale_moe) — verified safe under 256-bench graph
+        # replay (base 256/256 pass). Construct a BypassedTopKOutput from
+        # the StandardTopKOutput's preserved router_logits so _fused_experts
+        # takes the BYPASSED Situ branch (same path base uses — both
+        # prefill AND decode). For zero-weight / pass-through (delta=0)
+        # this is bitwise-identical to base (0+0=0). If router_logits is
+        # None, fall through to the decomposed path below.
+        # R59: removed the decode-only gate — prefill on the decomposed path
+        # accumulates resource degradation across consecutive 256-bench
+        # runs (R58b detokenizer hang after 3rd 256 bench, no Xid). Routing
+        # prefill through the same BYPASSED logits cubin eliminates the
+        # decomposed-path accumulation (prefill == base path, verified safe).
+        _topk_output = dispatch_output.topk_output
+        _rl = getattr(_topk_output, "router_logits", None)
+        if _rl is not None:
+            from sglang.srt.layers.moe.topk import (
+                BypassedTopKOutput,
+                TopKConfig,
             )
+            # Prefer the layer's full topk_config (contains n_group/
+            # topk_group/renormalize/routed_scaling_factor — matching
+            # base exactly). Fall back to minimal TopKConfig if layer
+            # is unavailable. R59 crash: the minimal TopKConfig may
+            # miss renormalize or other fields, causing detokenizer
+            # hang under prefill; using the layer's config eliminates
+            # the mismatch with the base path.
+            _layer = runner_config.layer
+            _tc = (
+                getattr(_layer, "topk_config", None)
+                if _layer is not None
+                else None
+            )
+            if _tc is None:
+                _tc = TopKConfig(
+                    top_k=runner_config.top_k,
+                    routed_scaling_factor=(
+                        runner_config.routed_scaling_factor
+                        if runner_config.routed_scaling_factor is not None
+                        else 1.0
+                    ),
+                )
+            _bypassed = BypassedTopKOutput(
+                hidden_states=dispatch_output.hidden_states,
+                router_logits=_rl,
+                topk_config=_tc,
+            )
+            return _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
+                dispatch_output._replace(topk_output=_bypassed),
+                quant_info,
+                runner_config,
+            )
+        # router_logits is None — fall through to decomposed path below
 
     # PASS-THROUGH PRECISION (zero-LoRA == base): no-adapter requests take the
     # SAME decomposed pipeline with zero deltas. The previous early-return to
