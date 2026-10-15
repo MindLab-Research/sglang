@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING
 
 from sglang.srt.arg_groups.overrides import (
@@ -239,7 +240,13 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
 
         if (
             read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
-            or cfg.disaggregation_transfer_backend != "mooncake"
+            or (
+                cfg.disaggregation_transfer_backend != "mooncake"
+                and not (
+                    os.environ.get("SGLANG_LORA_FUSED_POSTDELTA") == "1"
+                    and cfg.disaggregation_transfer_backend == "nixl"
+                )
+            )
             or cfg.dp_size != 1
             or cfg.enable_dp_attention
             or cfg.attn_cp_size != 1

@@ -974,50 +974,55 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora_two_stream(
             )
             _y_base = _combine.hidden_states
 
-            # Parallel adapter delta: B'A'x (output-side, A' eats layer input x).
-            # Sequential adapters have A' eating SwiGLU activation (I=2304), not
-            # layer input (d=5120) — so this only activates for parallel-adapter
-            # weights (training-side retrained per the R50 contract). Current
-            # sequential adapters fall through (delta=0, y_base returned).
-            _a = getattr(lora_info, "down_lora_a_weights", None)
-            if _a is not None:
-                if _a.ndim == 3:
-                    _a = _a[0]  # VE shared-outer [1, r, d] → [r, d]
-                _x = dispatch_output.hidden_states
-                if _a.shape[-1] == _x.shape[-1]:
-                    _b = getattr(lora_info, "down_lora_b_weights", None)
-                    if _b is not None:
-                        if _b.ndim == 3:
-                            _b = _b[0]  # VE shared-outer [1, d, r] → [d, r]
-                        _delta = torch.nn.functional.linear(_x, _a)
-                        _delta = torch.nn.functional.linear(_delta, _b)
-                        _y_base = _y_base + _delta
+            # Delta computation: OUTSIDE graph for replay (capture skips delta
+            # → graph only contains y_base, same as base graph → no degradation
+            # under 256-bench). R72 nixl also degrades → root cause is graph-
+            # internal delta, not transport backend. Moving delta outside
+            # graph eliminates the degradation (graph == base graph).
+            from sglang.srt.model_executor.runner_utils.capture_mode import (
+                get_is_capture_mode,
+            )
+            if not get_is_capture_mode():
+                # Replay or eager: add delta (outside graph for replay)
+                # Parallel adapter delta: B'A'x (A' eats layer input x).
+                _a = getattr(lora_info, "down_lora_a_weights", None)
+                if _a is not None:
+                    if _a.ndim == 3:
+                        _a = _a[0]
+                    _x = dispatch_output.hidden_states
+                    if _a.shape[-1] == _x.shape[-1]:
+                        _b = getattr(lora_info, "down_lora_b_weights", None)
+                        if _b is not None:
+                            if _b.ndim == 3:
+                                _b = _b[0]
+                            _delta = torch.nn.functional.linear(_x, _a)
+                            _delta = torch.nn.functional.linear(_delta, _b)
+                            _y_base = _y_base + _delta
 
-            # Test mode: inject fixed random delta (B'A'x) to verify the delta
-            # channel works end-to-end (rnd≠base) without needing training-side
-            # retrained parallel-adapter weights. Seed=42 for determinism.
-            # Scale 1e-4 = micro-perturbation (same as dzgu_s4 protocol).
-            if _o.environ.get("SGLANG_LORA_POSTDELTA_TEST") == "1":
-                global _POSTDELTA_TEST_A, _POSTDELTA_TEST_B
-                _x = dispatch_output.hidden_states
-                _d = _x.shape[-1]
-                if (
-                    _POSTDELTA_TEST_A is None
-                    or _POSTDELTA_TEST_A.shape[-1] != _d
-                    or _POSTDELTA_TEST_A.device != _x.device
-                ):
-                    _g = torch.Generator(device=_x.device).manual_seed(42)
-                    _POSTDELTA_TEST_A = (
-                        torch.randn(16, _d, device=_x.device, dtype=_x.dtype, generator=_g)
-                        * 0.01
-                    )
-                    _POSTDELTA_TEST_B = (
-                        torch.randn(_d, 16, device=_x.device, dtype=_x.dtype, generator=_g)
-                        * 0.01
-                    )
-                _delta = torch.nn.functional.linear(_x, _POSTDELTA_TEST_A)
-                _delta = torch.nn.functional.linear(_delta, _POSTDELTA_TEST_B)
-                _y_base = _y_base + _delta
+                # Test mode: inject fixed random delta (B'A'x) to verify the
+                # delta channel. Seed=42 for determinism, scale 0.01.
+                if _o.environ.get("SGLANG_LORA_POSTDELTA_TEST") == "1":
+                    global _POSTDELTA_TEST_A, _POSTDELTA_TEST_B
+                    _x = dispatch_output.hidden_states
+                    _d = _x.shape[-1]
+                    if (
+                        _POSTDELTA_TEST_A is None
+                        or _POSTDELTA_TEST_A.shape[-1] != _d
+                        or _POSTDELTA_TEST_A.device != _x.device
+                    ):
+                        _g = torch.Generator(device=_x.device).manual_seed(42)
+                        _POSTDELTA_TEST_A = (
+                            torch.randn(16, _d, device=_x.device, dtype=_x.dtype, generator=_g)
+                            * 0.01
+                        )
+                        _POSTDELTA_TEST_B = (
+                            torch.randn(_d, 16, device=_x.device, dtype=_x.dtype, generator=_g)
+                            * 0.01
+                        )
+                    _delta = torch.nn.functional.linear(_x, _POSTDELTA_TEST_A)
+                    _delta = torch.nn.functional.linear(_delta, _POSTDELTA_TEST_B)
+                    _y_base = _y_base + _delta
+            # capture: delta=0 (graph only contains y_base, same as base graph)
 
             return StandardCombineInput(hidden_states=_y_base)
         # router_logits is None — fall through to decomposed path below
