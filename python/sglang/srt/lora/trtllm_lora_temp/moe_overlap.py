@@ -965,11 +965,33 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora_two_stream(
                 router_logits=_rl,
                 topk_config=_tc,
             )
-            return _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
+            _combine = _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
                 dispatch_output._replace(topk_output=_bypassed),
                 quant_info,
                 runner_config,
             )
+            _y_base = _combine.hidden_states
+
+            # Parallel adapter delta: B'A'x (output-side, A' eats layer input x).
+            # Sequential adapters have A' eating SwiGLU activation (I=2304), not
+            # layer input (d=7168) — so this only activates for parallel-adapter
+            # weights (training-side retrained per the R50 contract). Current
+            # sequential adapters fall through (delta=0, y_base returned).
+            _a = getattr(lora_info, "down_lora_a_weights", None)
+            if _a is not None:
+                if _a.ndim == 3:
+                    _a = _a[0]  # VE shared-outer [1, r, d] → [r, d]
+                _x = dispatch_output.hidden_states
+                if _a.shape[-1] == _x.shape[-1]:
+                    _b = getattr(lora_info, "down_lora_b_weights", None)
+                    if _b is not None:
+                        if _b.ndim == 3:
+                            _b = _b[0]  # VE shared-outer [1, d, r] → [d, r]
+                        _delta = torch.nn.functional.linear(_x, _a)
+                        _delta = torch.nn.functional.linear(_delta, _b)
+                        _y_base = _y_base + _delta
+
+            return StandardCombineInput(hidden_states=_y_base)
         # router_logits is None — fall through to decomposed path below
 
     # PASS-THROUGH PRECISION (zero-LoRA == base): no-adapter requests take the
