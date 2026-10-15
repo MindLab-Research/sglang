@@ -895,7 +895,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora_two_stream(
                 # via globals() to eliminate 40 randn/step overhead (20 layers × 2).
                 # R82: cached A/B triggered gloo barrier; R85 adds FastQueue
                 # backpressure (0.5ms timeout) to auto-throttle → no gloo overwhelm.
-                if _o.environ.get("SGLANG_LORA_POSTDELTA_TEST") == "1":
+                if _o.environ.get("SGLANG_LORA_POSTDELTA_TEST") == "1" and id(runner_config.layer) % 2 == 0:
                     _d = _x.shape[-1]
                     _ta = globals().get("_PD_TA_BP")
                     _tb = globals().get("_PD_TB_BP")
@@ -1044,7 +1044,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora_two_stream(
                 # Test mode: inject fixed random delta (B'A'x) to verify the
                 # delta channel. Seed=42 for determinism, scale 0.01. CACHED
                 # via globals() to eliminate randn overhead.
-                if _o.environ.get("SGLANG_LORA_POSTDELTA_TEST") == "1":
+                if _o.environ.get("SGLANG_LORA_POSTDELTA_TEST") == "1" and id(runner_config.layer) % 2 == 0:
                     _x = dispatch_output.hidden_states
                     _d = _x.shape[-1]
                     _ta = globals().get("_PD_TA_PD")
