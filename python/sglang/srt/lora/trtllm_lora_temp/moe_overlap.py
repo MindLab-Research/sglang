@@ -901,8 +901,8 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora_two_stream(
                     _tb = globals().get("_PD_TB_BP")
                     if _ta is None or _ta.shape[-1] != _d or _ta.device != _x.device:
                         _g = torch.Generator(device=_x.device).manual_seed(42)
-                        _ta = torch.randn(16, _d, device=_x.device, dtype=_x.dtype, generator=_g) * 0.01
-                        _tb = torch.randn(_d, 16, device=_x.device, dtype=_x.dtype, generator=_g) * 0.01
+                        _ta = torch.randn(16, _d, device=_x.device, dtype=_x.dtype, generator=_g) * 0.001
+                        _tb = torch.randn(_d, 16, device=_x.device, dtype=_x.dtype, generator=_g) * 0.001
                         globals()["_PD_TA_BP"] = _ta
                         globals()["_PD_TB_BP"] = _tb
                     _delta = torch.nn.functional.linear(_x, _ta)
@@ -1051,8 +1051,8 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora_two_stream(
                     _tb = globals().get("_PD_TB_PD")
                     if _ta is None or _ta.shape[-1] != _d or _ta.device != _x.device:
                         _g = torch.Generator(device=_x.device).manual_seed(42)
-                        _ta = torch.randn(16, _d, device=_x.device, dtype=_x.dtype, generator=_g) * 0.01
-                        _tb = torch.randn(_d, 16, device=_x.device, dtype=_x.dtype, generator=_g) * 0.01
+                        _ta = torch.randn(16, _d, device=_x.device, dtype=_x.dtype, generator=_g) * 0.001
+                        _tb = torch.randn(_d, 16, device=_x.device, dtype=_x.dtype, generator=_g) * 0.001
                         globals()["_PD_TA_PD"] = _ta
                         globals()["_PD_TB_PD"] = _tb
                     _delta = torch.nn.functional.linear(_x, _ta)
