@@ -188,41 +188,52 @@ def _apply_metadata_gate(polls, decode_reqs, metadata_buffers) -> None:
                 polls[i] = int(KVPoll.Transferring)
 
 
-_prev_async_state = {}  # id(group) → (tensor, work) for async all_reduce
+_ASYNC_POLL_STATE = {}  # (id(group), site) -> {"rids", "tensor", "work"}
+_CONFIRMED_POLLS = defaultdict(dict)  # (id(group), site) -> {rid: confirmed poll}
 
 
-def _all_reduce_polls(polls: List[int], group: dist.ProcessGroup) -> List[int]:
+def _all_reduce_polls(
+    polls: List[int],
+    group: dist.ProcessGroup,
+    rids: Optional[List[str]] = None,
+    site: Optional[str] = None,
+) -> List[int]:
     """MIN-reduce poll states so no rank commits ahead of its peers."""
     if dist.get_world_size(group) == 1:
         return polls
 
     import os
 
-    if os.environ.get("SGLANG_LORA_FUSED_POSTDELTA") == "1":
-        # POSTDELTA: async all_reduce — main thread only blocks on Success.
-        # Non-Success states can be 1-step stale (safe, no blocking). Success
-        # (poll=4) requires real-time sync (wait for current all_reduce) to
-        # avoid decode ValueError (R79) and KV state machine corruption (R89).
-        # Success is infrequent (once per request) → main thread rarely blocks
-        # → decode acceleration doesn't trigger gloo barrier overwhelm.
-        gid = id(group)
-        prev = _prev_async_state.get(gid)
-        new_tensor = torch.tensor(polls, dtype=torch.uint8, device="cpu")
-        new_work = dist.all_reduce(
-            new_tensor, op=dist.ReduceOp.MIN, group=group, async_op=True
-        )
-        if prev is not None and prev[1].is_completed():
-            stale_result = prev[0].tolist()
-            if any(r == 4 for r in stale_result):
-                # Stale Success — need real-time: wait for current all_reduce
-                new_work.wait()
-                result = new_tensor.tolist()
-            else:
-                result = stale_result  # non-Success: 1-step stale (safe)
-        else:
-            result = polls  # fallback to local polls (1-step staleness)
-        _prev_async_state[gid] = (new_tensor, new_work)
-        return result
+    # Only async when site is explicitly passed (decode handshake/transfer)
+    # AND POSTDELTA is enabled. Prefill (no site) uses sync (original behavior).
+    if site is not None and os.environ.get("SGLANG_LORA_FUSED_POSTDELTA") == "1":
+        rids = rids or [str(i) for i in range(len(polls))]
+        key = (id(group), site)
+
+        # Harvest previous async result (rid-keyed, not position-keyed)
+        st = _ASYNC_POLL_STATE.get(key)
+        if st and st["work"].is_completed():
+            for r, v in zip(st["rids"], st["tensor"].tolist()):
+                _CONFIRMED_POLLS[key][r] = int(v)
+            _ASYNC_POLL_STATE.pop(key)
+            st = None
+
+        # Start new async all_reduce (at most 1 in-flight per site)
+        if st is None:
+            t = torch.tensor(polls, dtype=torch.uint8, device="cpu")
+            w = dist.all_reduce(t, op=dist.ReduceOp.MIN, group=group, async_op=True)
+            _ASYNC_POLL_STATE[key] = {"rids": tuple(rids), "tensor": t, "work": w}
+
+        # Build result: use confirmed poll if available, else local poll
+        # with Success (4) downgraded to Transferring (3) — conservative,
+        # never advance ahead of peers.
+        out = []
+        for r, local in zip(rids, polls):
+            v = _CONFIRMED_POLLS[key].get(r)
+            if v is None:
+                v = 3 if int(local) == 4 else int(local)
+            out.append(v)
+        return out
     else:
         tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
         dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=group)
@@ -234,6 +245,8 @@ def poll_and_all_reduce(
     gloo_group: dist.ProcessGroup,
     decode_reqs=None,
     metadata_buffers: Optional[MetadataBuffers] = None,
+    rids=None,
+    site=None,
 ):
     # at a certain prob, the poll is failed to simulate failure
     polls = _poll_with_failure_injection(pollers)
@@ -241,7 +254,7 @@ def poll_and_all_reduce(
     # Apply metadata gate on the decode requests to downgrade Success → Transferring for requests whose metadata hasn't landed.
     if decode_reqs is not None and metadata_buffers is not None:
         _apply_metadata_gate(polls, decode_reqs, metadata_buffers)
-    return _all_reduce_polls(polls, gloo_group)
+    return _all_reduce_polls(polls, gloo_group, rids=rids, site=site)
 
 
 def poll_and_all_reduce_attn_cp_tp_group(
@@ -290,7 +303,12 @@ def poll_and_all_reduce_with_staging(
     # Apply metadata gate on the decode requests to downgrade Success → Transferring for requests whose metadata hasn't landed.
     if metadata_buffers is not None:
         _apply_metadata_gate(raw_polls, decode_reqs, metadata_buffers)
-    return _all_reduce_polls(raw_polls, gloo_group)
+    return _all_reduce_polls(
+        raw_polls,
+        gloo_group,
+        rids=[dr.req.rid for dr in decode_reqs],
+        site="dec_xf",
+    )
 
 
 #########################
