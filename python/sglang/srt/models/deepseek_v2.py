@@ -120,7 +120,22 @@ def _lora_forces_standard_topk() -> bool:
     """
     from sglang.srt.runtime_context import get_lora
 
-    return bool(getattr(get_lora(), "enable_lora", False))
+    if bool(getattr(get_lora(), "enable_lora", False)):
+        # POSTDELTA: the fused-kernel + output-side delta path routes through
+        # the BYPASSED logits cubin (same as base). The parallel adapter's delta
+        # (B'A'x) does NOT need materialized topk_ids (A' eats the layer input x,
+        # not SwiGLU activation), so we can stay on BYPASSED dispatch — eliminating
+        # the STANDARD vs BYPASSED routing mismatch that costs ~2.2ms/step in
+        # accept_len (R62: zero acc 3.48 vs base 3.92 → per-step tax 19.4%).
+        # R68: FusedMoEWithLoRA now has forward_deferred_finalize (delegates to
+        # self.forward), so the deferred-finalize gate can safely call it when
+        # this returns False (no crash, unlike R63).
+        import os as _os
+
+        if _os.environ.get("SGLANG_LORA_FUSED_POSTDELTA") == "1":
+            return False
+        return True
+    return False
 
 
 def _moe_rejects_bypassed_topk() -> bool:
@@ -1160,6 +1175,7 @@ class DeepseekV2MoE(nn.Module):
             # forward_deferred_finalize; the LoRA dispatch finalizes the routed
             # output itself (and needs the ids materialized, hence STANDARD topk).
             and not _lora_forces_standard_topk()
+            and getattr(self.experts, 'supports_deferred_finalize', False)
         )
         deferred_finalize = use_fused_finalize_all_reduce or (
             has_shared_output

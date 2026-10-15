@@ -1229,6 +1229,15 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                 return self.base_layer.run_moe_core(dispatch_output, **kwargs)
         return super().run_moe_core(dispatch_output, **kwargs)
 
+    def forward_deferred_finalize(self, hidden_states, topk_output, **kwargs):
+        """Delegate to normal LoRA forward — LoRA dispatch finalizes the
+        routed output itself (not deferred). This method exists so
+        deepseek_v2's deferred-finalize gate can call it when
+        _lora_forces_standard_topk() returns False (POSTDELTA path uses
+        BYPASSED dispatch, eliminating STANDARD vs BYPASSED routing mismatch).
+        """
+        return self.forward(hidden_states, topk_output, **kwargs)
+
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput, **kwargs):
         """
         Forward pass with integrated LoRA computation.
