@@ -199,11 +199,12 @@ def _all_reduce_polls(polls: List[int], group: dist.ProcessGroup) -> List[int]:
     import os
 
     if os.environ.get("SGLANG_LORA_FUSED_POSTDELTA") == "1":
-        # POSTDELTA: async all_reduce to avoid gloo CPU barrier blocking main
-        # thread. Stale Success (poll=4) is downgraded to Transferring (3) —
-        # decode sees Transferring (not Success), waits for next all_reduce to
-        # confirm Success. Other states can be 1-step stale (safe). This avoids
-        # the decode ValueError crash (R79) and the KV abort (R80 local polls).
+        # POSTDELTA: async all_reduce — main thread only blocks on Success.
+        # Non-Success states can be 1-step stale (safe, no blocking). Success
+        # (poll=4) requires real-time sync (wait for current all_reduce) to
+        # avoid decode ValueError (R79) and KV state machine corruption (R89).
+        # Success is infrequent (once per request) → main thread rarely blocks
+        # → decode acceleration doesn't trigger gloo barrier overwhelm.
         gid = id(group)
         prev = _prev_async_state.get(gid)
         new_tensor = torch.tensor(polls, dtype=torch.uint8, device="cpu")
@@ -212,8 +213,12 @@ def _all_reduce_polls(polls: List[int], group: dist.ProcessGroup) -> List[int]:
         )
         if prev is not None and prev[1].is_completed():
             stale_result = prev[0].tolist()
-            # Downgrade stale Success (4) → Transferring (3)
-            result = [min(r, 3) for r in stale_result]
+            if any(r == 4 for r in stale_result):
+                # Stale Success — need real-time: wait for current all_reduce
+                new_work.wait()
+                result = new_tensor.tolist()
+            else:
+                result = stale_result  # non-Success: 1-step stale (safe)
         else:
             result = polls  # fallback to local polls (1-step staleness)
         _prev_async_state[gid] = (new_tensor, new_work)
