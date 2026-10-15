@@ -1059,19 +1059,31 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora_two_stream(
         # raised ImportError on CUDA — this was the sole blocker that kept the
         # v3 path dead). Weights: [N, K/2] int8 packed e2m1 (low nibble =
         # even k, high nibble = odd k); scales: [N, K/32] float8_e8m0fnu.
-        def _dequant_mxfp4_torch(x_int8, scale_e8m0, float_dtype):
+        # Chunked over the N dim + in-chunk scale broadcast to bound the
+        # peak intermediate (~9.4GB float32 in one shot OOM'd at graph-capture
+        # warmup with 858MB free; chunks keep it under ~700MB).
+        def _dequant_mxfp4_torch(x_int8, scale_e8m0, float_dtype, chunk=8):
             LUT = torch.tensor(
                 [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
                  -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
                 dtype=torch.float32, device=x_int8.device,
             )
-            xu = x_int8.to(torch.uint8).to(torch.long)
-            lo = (xu & 0xF)
-            hi = (xu >> 4)
-            vals = torch.stack([LUT[lo], LUT[hi]], dim=-1)
-            vals = vals.reshape(*x_int8.shape[:-1], x_int8.shape[-1] * 2)
-            s = scale_e8m0.to(torch.float32).repeat_interleave(32, dim=-1)
-            return (vals * s).to(float_dtype)
+            n = x_int8.shape[-2]
+            outs = []
+            for i in range(0, n, chunk):
+                xc = x_int8[..., i : i + chunk, :]
+                sc = scale_e8m0[..., i : i + chunk, :].to(torch.float32)
+                xu = xc.to(torch.uint8).to(torch.long)
+                lo = (xu & 0xF)
+                hi = (xu >> 4)
+                vals = torch.stack([LUT[lo], LUT[hi]], dim=-1)
+                # [.., n_c, K/2, 2] -> [.., n_c, K] -> [.., n_c, K/32, 32]
+                vals = vals.reshape(*xc.shape[:-1], xc.shape[-1] * 2)
+                vals = vals.reshape(*vals.shape[:-1], -1, 32)
+                out = vals * sc.unsqueeze(-1)
+                out = out.reshape(*out.shape[:-2], -1)
+                outs.append(out.to(float_dtype))
+            return torch.cat(outs, dim=-2)
 
         global _DG_V3_WCACHE
         try:
@@ -1108,7 +1120,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora_two_stream(
             output, _ = v3_gemm_stage(
                 hidden_states, topk_ids, topk_weights, _w13_bf, _w2_bf,
                 gate_up_delta, None, quant_info.gemm1_clamp_limit,
-                activation_lora_input, quant_info.local_num_experts, M_MAX=64,
+                activation_lora_input, quant_info.local_num_experts, M_MAX=8,
                 gemm1_alpha=_g1a, gemm1_beta=_g1b)
     else:
         output = trtllm_fp4_block_scale_routed_moe_lora(

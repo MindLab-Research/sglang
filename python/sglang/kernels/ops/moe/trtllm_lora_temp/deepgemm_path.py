@@ -111,7 +111,7 @@ def deepgemm_fp4_moe_lora(
     swiglu_limit: Optional[float],        # V4.1 production: 7.0
     deep_gemm=None,
     num_local_experts: int = 96,
-    M_MAX: int = 64,
+    M_MAX: int = 8,
 ) -> torch.Tensor:
     out, _ = v3_gemm_stage(
         hidden_states, topk_ids, topk_weights, w13_bf, w2_bf,
@@ -132,7 +132,7 @@ def v3_gemm_stage(
     swiglu_limit: Optional[float],
     activation_lora_input: Optional[torch.Tensor],  # [T, topk, I] out or None
     num_local_experts: int,
-    M_MAX: int = 64,
+    M_MAX: int = 8,
     gemm1_alpha: float = 1.702,
     gemm1_beta: float = 1.0,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -169,8 +169,17 @@ def v3_gemm_stage(
 
     BLOCK_I = triton.next_power_of_2(I)
     a2_flat = torch.empty(E * M_MAX, I, device=dev, dtype=torch.bfloat16)
+    # gemm1_clamp_limit may arrive as a per-expert (multi-element) tensor;
+    # the OAI clamp is a model-level hyperparameter (7.0) so all experts share
+    # it — take the first element. Falls back to 7.0 when absent.
+    if swiglu_limit is None:
+        _lim = 7.0
+    elif hasattr(swiglu_limit, "flatten"):
+        _lim = float(swiglu_limit.flatten()[0].item())
+    else:
+        _lim = float(swiglu_limit)
     _k_act[(nrows,)](d1f, gate_up_lora_delta, a2_flat, valid_pos, exp_of_row,
-                     NI=NI, I=I, LIM=float(swiglu_limit or 7.0),
+                     NI=NI, I=I, LIM=_lim,
                      ALPHA=gemm1_alpha, BETA=gemm1_beta, M_MAX=M_MAX,
                      BLOCK_I=BLOCK_I)
 
@@ -179,7 +188,14 @@ def v3_gemm_stage(
 
     out = torch.zeros(T, K, device=dev, dtype=torch.float32)
     BLOCK_K = triton.next_power_of_2(min(1024, K))
-    _k_fin[(nrows,)](d2f, down_lora_delta.reshape(nrows, K), out,
+    # down_lora_delta may be None (the caller computes the down VE delta
+    # externally) — feed zeros so the finalize kernel's delta add is a no-op.
+    _dld = (
+        down_lora_delta
+        if down_lora_delta is not None
+        else torch.zeros(nrows, K, device=dev, dtype=torch.bfloat16)
+    )
+    _k_fin[(nrows,)](d2f, _dld.reshape(nrows, K), out,
                      valid_pos, exp_of_row, wsel, tok,
                      K=K, M_MAX=M_MAX, BLOCK=BLOCK_K)
 
