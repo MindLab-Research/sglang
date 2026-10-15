@@ -893,24 +893,12 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora_two_stream(
                 _x = dispatch_output.hidden_states
                 # Test mode: fixed random B'A'x (scale 0.01, seed=42)
                 if _o.environ.get("SGLANG_LORA_POSTDELTA_TEST") == "1":
-                    global _POSTDELTA_TEST_A, _POSTDELTA_TEST_B
                     _d = _x.shape[-1]
-                    if (
-                        _POSTDELTA_TEST_A is None
-                        or _POSTDELTA_TEST_A.shape[-1] != _d
-                        or _POSTDELTA_TEST_A.device != _x.device
-                    ):
-                        _g = torch.Generator(device=_x.device).manual_seed(42)
-                        _POSTDELTA_TEST_A = (
-                            torch.randn(16, _d, device=_x.device, dtype=_x.dtype, generator=_g)
-                            * 0.01
-                        )
-                        _POSTDELTA_TEST_B = (
-                            torch.randn(_d, 16, device=_x.device, dtype=_x.dtype, generator=_g)
-                            * 0.01
-                        )
-                    _delta = torch.nn.functional.linear(_x, _POSTDELTA_TEST_A)
-                    _delta = torch.nn.functional.linear(_delta, _POSTDELTA_TEST_B)
+                    _g = torch.Generator(device=_x.device).manual_seed(42)
+                    _ta = torch.randn(16, _d, device=_x.device, dtype=_x.dtype, generator=_g) * 0.01
+                    _tb = torch.randn(_d, 16, device=_x.device, dtype=_x.dtype, generator=_g) * 0.01
+                    _delta = torch.nn.functional.linear(_x, _ta)
+                    _delta = torch.nn.functional.linear(_delta, _tb)
                     _y_base = _y_base + _delta
                 # Parallel adapter delta: B'A'x (real weights, when available)
                 _a = getattr(lora_info, "down_lora_a_weights", None)
@@ -1048,25 +1036,13 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora_two_stream(
                 # Test mode: inject fixed random delta (B'A'x) to verify the
                 # delta channel. Seed=42 for determinism, scale 0.01.
                 if _o.environ.get("SGLANG_LORA_POSTDELTA_TEST") == "1":
-                    global _POSTDELTA_TEST_A, _POSTDELTA_TEST_B
                     _x = dispatch_output.hidden_states
                     _d = _x.shape[-1]
-                    if (
-                        _POSTDELTA_TEST_A is None
-                        or _POSTDELTA_TEST_A.shape[-1] != _d
-                        or _POSTDELTA_TEST_A.device != _x.device
-                    ):
-                        _g = torch.Generator(device=_x.device).manual_seed(42)
-                        _POSTDELTA_TEST_A = (
-                            torch.randn(16, _d, device=_x.device, dtype=_x.dtype, generator=_g)
-                            * 0.01
-                        )
-                        _POSTDELTA_TEST_B = (
-                            torch.randn(_d, 16, device=_x.device, dtype=_x.dtype, generator=_g)
-                            * 0.01
-                        )
-                    _delta = torch.nn.functional.linear(_x, _POSTDELTA_TEST_A)
-                    _delta = torch.nn.functional.linear(_delta, _POSTDELTA_TEST_B)
+                    _g = torch.Generator(device=_x.device).manual_seed(42)
+                    _ta = torch.randn(16, _d, device=_x.device, dtype=_x.dtype, generator=_g) * 0.01
+                    _tb = torch.randn(_d, 16, device=_x.device, dtype=_x.dtype, generator=_g) * 0.01
+                    _delta = torch.nn.functional.linear(_x, _ta)
+                    _delta = torch.nn.functional.linear(_delta, _tb)
                     _y_base = _y_base + _delta
             # capture: delta=0 (graph only contains y_base, same as base graph)
 
