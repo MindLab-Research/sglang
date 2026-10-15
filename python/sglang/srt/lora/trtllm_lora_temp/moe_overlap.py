@@ -805,6 +805,8 @@ def fused_experts_none_to_experimental_sgl_trtllm_bf16_lora_two_stream(
 
 # M2-v2 rebase (step3): known-good single-stream mxfp4 body + incremental side-stream delta.
 _MB_ENTERED = [False]  # M2-v2 tracer state
+_POSTDELTA_TEST_A = None  # R66 test-mode parallel adapter A' (fixed random, seed=42)
+_POSTDELTA_TEST_B = None  # R66 test-mode parallel adapter B' (fixed random, seed=42)
 import os as _o
 
 
@@ -974,7 +976,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora_two_stream(
 
             # Parallel adapter delta: B'A'x (output-side, A' eats layer input x).
             # Sequential adapters have A' eating SwiGLU activation (I=2304), not
-            # layer input (d=7168) — so this only activates for parallel-adapter
+            # layer input (d=5120) — so this only activates for parallel-adapter
             # weights (training-side retrained per the R50 contract). Current
             # sequential adapters fall through (delta=0, y_base returned).
             _a = getattr(lora_info, "down_lora_a_weights", None)
@@ -990,6 +992,32 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora_two_stream(
                         _delta = torch.nn.functional.linear(_x, _a)
                         _delta = torch.nn.functional.linear(_delta, _b)
                         _y_base = _y_base + _delta
+
+            # Test mode: inject fixed random delta (B'A'x) to verify the delta
+            # channel works end-to-end (rnd≠base) without needing training-side
+            # retrained parallel-adapter weights. Seed=42 for determinism.
+            # Scale 1e-4 = micro-perturbation (same as dzgu_s4 protocol).
+            if _o.environ.get("SGLANG_LORA_POSTDELTA_TEST") == "1":
+                global _POSTDELTA_TEST_A, _POSTDELTA_TEST_B
+                _x = dispatch_output.hidden_states
+                _d = _x.shape[-1]
+                if (
+                    _POSTDELTA_TEST_A is None
+                    or _POSTDELTA_TEST_A.shape[-1] != _d
+                    or _POSTDELTA_TEST_A.device != _x.device
+                ):
+                    _g = torch.Generator(device=_x.device).manual_seed(42)
+                    _POSTDELTA_TEST_A = (
+                        torch.randn(16, _d, device=_x.device, dtype=_x.dtype, generator=_g)
+                        * 0.01
+                    )
+                    _POSTDELTA_TEST_B = (
+                        torch.randn(_d, 16, device=_x.device, dtype=_x.dtype, generator=_g)
+                        * 0.01
+                    )
+                _delta = torch.nn.functional.linear(_x, _POSTDELTA_TEST_A)
+                _delta = torch.nn.functional.linear(_delta, _POSTDELTA_TEST_B)
+                _y_base = _y_base + _delta
 
             return StandardCombineInput(hidden_states=_y_base)
         # router_logits is None — fall through to decomposed path below
