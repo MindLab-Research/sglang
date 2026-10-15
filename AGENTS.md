@@ -45,6 +45,18 @@
 > ⇒ 该组合下**只能** `Mooncake`；要真正走 NCCL，需另想办法（例如不带 DSpark 跑 nixl，或改用 `--disaggregation-ib-device` 把 mooncake 的 RDMA 路径配通）。
 > **教训**：改传输后端前**先跑一次 `--help`/启动 dry-run 验证该 backend 被模型接受**，不要直接重启——否则会把服务打挂（本次 30100/30200 双挂约 22 分钟）。
 
+> ⚠️ **`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 会杀死 Mooncake PD（2026-10-15 R50 实锤）**：
+> 它让 PyTorch 的 CUDA VA 段可重映射，而 mooncake RDMA 的 MR 注册依赖稳定 VA ⇒ prefill↔decode session
+> 双向死亡，日志形态：`KVTransferError: remote mooncake session 10.0.58.56:xxxx is not alive`
+> （10.0.58.56 = 1101 自身接口 IP，见 `transfer_engine_impl.cpp:182` 监听行——**不是外部串扰**）。
+> 三发全部 500、bench 全 503，但 P/D health 都是 200（进程活着，传输死了）。
+> 该参数原本是给 v3 解碎片的——**v3 已死，此参数永久禁用**。
+
+> ⚠️ **`KVTransferError: Aborted by AbortReq` 是结果不是原因（2026-10-15 R51 教训）**：
+> bench 客户端超时断连 → 服务端 abort 请求 → KV 传输中止报错。排查 256 长跑雪崩时，
+> 248 条 KVTransferError 全是 AbortReq 形态——**先看客户端超时与真实初因（acc_len 崩塌/
+> prefill 排队），别把 Abort 流水当传输故障修**。
+
 ## 投机解码：模型**自带 MTP / dspark**，永不依赖外部 draft 权重
 
 我们线上用的所有模型都**自带 MTP（nextn）预测层**或 **dspark** 头；投机解码的
@@ -384,3 +396,29 @@ logger.info("[sdiag] get_lora_configs kernel=%s K=%s R=%s S=%s -> %s", kernel, K
 - **但 LoRA 只在 `experimental_sgl_trtllm` 一个 backend 里实现**（`srt/lora/trtllm_lora_temp/lora_layer.py` 的 `init_/dispatch_experimental_sgl_trtllm_lora`；`srt/lora/` 全树对 `deep_gemm` 引用数 = 0）⇒ **`--moe-runner-backend deep_gemm` 会完全绕过 LoRA ⇒ 只能先测 base。**
 - 变体启动器 `/root/exp_l20_dg.sh`（只插 `--moe-runner-backend deep_gemm`，原 `exp_l20.sh` 不动）；base-only 基准脚本 `/tmp/bench_dg_base.sh`。
 - **判据**：base p50 显著优于 **5.087–5.216 ms** ⇒ 63% 可攻；持平/更差 ⇒ **两者都要落 bf16 gate_up（4× 写带宽结构不变）就是墙**。
+
+## ★ R50 方案：融合核 + 输出侧 Δ（用户拍板，2026-10-15 落地）
+
+**方向定论**：decode 带宽受限，**任何 bf16 路线（v3 bmm 的 22.6GB cache）都是反方向**（用户令 + R49a/b/c 三轮 capture OOM 实锤：avail 越大 capture 吸得越多，配置层无解，v3 永久关闭）。
+
+**新方案**：`y = y_fused(x) + Δ(x)`——STANDARD topk 的 LoRA batch 直接进 NVIDIA 闭源融合核的 **routed 入口**
+（`_fused_experts_flashinfer_mxfp4_sm100_trtllm_gen`，flashinfer_trtllm.py 的 is_standard+silu 分支——
+它天然吃物化 topk、gated-SwiGLU、OAI 三参数、biases），LoRA delta 输出侧相加。
+
+**实现**：`moe_overlap.py::fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora_two_stream` 的
+REAL FIX 段后加 `SGLANG_LORA_FUSED_POSTDELTA=1` 门控分支（R51 三发全过、mini bench 64/64 零错误）。
+routed_scaling_factor 已被 REAL FIX 物化进 weights，融合核 TopK-only 分支核内不设 mRouteScale——**无双乘**。
+
+**结构契约（训练侧，已通知）**：
+- 放弃 `gate_up_proj` 注入（δ₁ 在 SwiGLU 内——闭源核无挂钩点）
+- `down_proj` 改 **parallel adapter（并联适配器）**：`y = FusedMoE(x) + Σ sₖ·B′A′x`
+  ——A′ 输入从 SwiGLU 后激活（I=2304）改为**层输入（d=7168）**，权重形状 [r,7168]/[7168,r]；
+  建议注入点名 `moe_output`（别与原 down_proj 混淆）；路由二选一（per-expert 带路由 / 纯并联单套）
+- 现存 dzgu（A 吃 2304）**不能直接迁移**，需重训；moe_zero 仍可用作推理侧地基基线
+
+**验证状态与已知现象**：
+- R51 三发输出正常；zero≠base 一词之差 = STANDARD 入口 vs BYPASSED 入口的**路由舍入差**
+  （贪心解码发散的同款现象，非 bug——两条路径分别自洽：zero==rnd 逐字一致）
+- **Δ≡0 时是地基测量**（delta 通道未接）——LoRA 严格生效证明（rnd≠base）必须等并联适配器到位
+- **口径铁律**：报数必须 TPOT p50 × 稳态 accept_len（per-step），acc 从 bench **中段**抓
+  （bench 结束后的残余值 3.8-4.6 不是稳态，mini bench 的 wall/4096 粗口径数字作废）
