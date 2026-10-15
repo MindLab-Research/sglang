@@ -70,12 +70,19 @@ def unpack_int_lists(buf: bytes, fmt: str) -> List[List[int]]:
 
 
 class FastQueue:
-    def __init__(self):
+    def __init__(self, max_size: int = 0):
         self._buf = deque()
         self._cond = threading.Condition()
+        self._max_size = max_size  # 0 = unbounded (original behavior)
 
     def put(self, item):
         with self._cond:
+            if self._max_size > 0:
+                # Backpressure: block until queue has space (prevents unbounded
+                # accumulation under POSTDELTA decode acceleration → gloo barrier
+                # never gets overwhelmed → no detokenizer hang).
+                while len(self._buf) >= self._max_size:
+                    self._cond.wait(timeout=0.1)  # 100ms timeout to avoid infinite block
             self._buf.append(item)
             # wake up a thread of wait()
             self._cond.notify()
@@ -85,7 +92,10 @@ class FastQueue:
             # if queue is empty  ,block until is notified()
             while not self._buf:
                 self._cond.wait()
-            return self._buf.popleft()
+            item = self._buf.popleft()
+            if self._max_size > 0:
+                self._cond.notify_all()  # wake blocked put() threads
+            return item
 
 
 class AuxDataCodec:

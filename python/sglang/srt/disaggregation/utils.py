@@ -193,43 +193,9 @@ def _all_reduce_polls(polls: List[int], group: dist.ProcessGroup) -> List[int]:
     if dist.get_world_size(group) == 1:
         return polls
 
-_prev_async_state = {}  # id(group) → (tensor, work) for async all_reduce
-
-
-def _all_reduce_polls(polls, group):
-    import os
-
-    if os.environ.get("SGLANG_LORA_FUSED_POSTDELTA") == "1":
-        # POSTDELTA: async all_reduce to avoid gloo CPU barrier blocking the
-        # scheduler main thread. POSTDELTA accelerates decode → denser KV
-        # transfer → gloo all_reduce takes longer → if sync, main thread
-        # blocks → GPU forward stops → detokenizer hangs. Async returns the
-        # previous all_reduce result (or local polls if not yet completed),
-        # so the main thread never blocks.
-        gid = id(group)
-        prev = _prev_async_state.get(gid)
-        new_tensor = torch.tensor(polls, dtype=torch.uint8, device="cpu")
-        new_work = dist.all_reduce(
-            new_tensor, op=dist.ReduceOp.MIN, group=group, async_op=True
-        )
-        if prev is not None and prev[1].is_completed():
-            stale_result = prev[0].tolist()
-            # Don't propagate stale Success (poll=4) — decode raises
-            # ValueError on unexpected Success from 1-step staleness.
-            # Fallback to local polls for any stale Success entries.
-            if any(r == 4 for r in stale_result):
-                result = polls
-            else:
-                result = stale_result
-        else:
-            result = polls  # fallback to local polls (1-step staleness)
-        _prev_async_state[gid] = (new_tensor, new_work)
-        return result
-    else:
-        # Non-POSTDELTA: sync all_reduce (original behavior, safe for base)
-        tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
-        dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=group)
-        return tensor_to_reduce.tolist()
+    tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
+    dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=group)
+    return tensor_to_reduce.tolist()
 
 
 def poll_and_all_reduce(

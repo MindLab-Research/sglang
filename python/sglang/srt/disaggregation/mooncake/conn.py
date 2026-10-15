@@ -261,7 +261,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 transfer_thread_pool_size = min(max(4, int(0.5 * cpu_count) // 8), 12)
             transfer_queue_size = envs.SGLANG_DISAGGREGATION_QUEUE_SIZE.get()
             self.transfer_queues: List[FastQueue] = [
-                FastQueue() for _ in range(transfer_queue_size)
+                FastQueue(max_size=int(os.environ.get("SGLANG_MOONCAKE_FASTQUEUE_MAX_SIZE", "0"))) for _ in range(transfer_queue_size)
             ]
             assert transfer_thread_pool_size >= transfer_queue_size, (
                 f"The environment variable SGLANG_DISAGGREGATION_THREAD_POOL_SIZE={transfer_thread_pool_size} must be "
