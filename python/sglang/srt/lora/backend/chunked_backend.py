@@ -481,6 +481,15 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         # pinned memory (cudaHostAlloc ~100us each) on every decode step.
         cache_key = (tuple(weight_indices), tuple(lora_ranks),
                      tuple(scalings), forward_batch.batch_size)
+        _diag_n = getattr(self, "_prep_diag_n", 0)
+        if _diag_n < 60:
+            self._prep_diag_n = _diag_n + 1
+            print(
+                f"[prep-diag #{_diag_n}] bs={forward_batch.batch_size} wi[:4]={tuple(weight_indices[:4])} "
+                f"ranks={tuple(lora_ranks[:4])} scalings[:2]={tuple(scalings[:2])} chunk={chunk_size} "
+                f"hit={cache_key in getattr(self, '_prep_cache', {})}",
+                flush=True,
+            )
         cached = self._prep_cache.get(cache_key) if hasattr(self, "_prep_cache") else None
         if cached is None:
             permutation, weight_indices_reordered = (
