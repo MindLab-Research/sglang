@@ -233,6 +233,14 @@ def _all_reduce_polls(
             w = dist.all_reduce(t, op=dist.ReduceOp.MIN, group=group, async_op=True)
             _ASYNC_POLL_STATE[key] = {"rids": tuple(_padded_rids), "tensor": t, "work": w}
 
+        # Auto-clean stale confirmed polls (rids no longer in queue).
+        # Without this, _CONFIRMED_POLLS grows unbounded + bootstrap_room
+        # reuse causes rid collision → wrong poll state → detokenizer hang.
+        _current_rids = set(rids)
+        _stale = [r for r in list(_CONFIRMED_POLLS[key].keys()) if r not in _current_rids]
+        for r in _stale:
+            _CONFIRMED_POLLS[key].pop(r, None)
+
         # Build result: use confirmed poll if available, else local poll
         # with Success (4) downgraded to Transferring (3) — conservative,
         # never advance ahead of peers.
