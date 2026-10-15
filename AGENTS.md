@@ -422,3 +422,13 @@ routed_scaling_factor 已被 REAL FIX 物化进 weights，融合核 TopK-only �
 - **Δ≡0 时是地基测量**（delta 通道未接）——LoRA 严格生效证明（rnd≠base）必须等并联适配器到位
 - **口径铁律**：报数必须 TPOT p50 × 稳态 accept_len（per-step），acc 从 bench **中段**抓
   （bench 结束后的残余值 3.8-4.6 不是稳态，mini bench 的 wall/4096 粗口径数字作废）
+
+> ⚠️ **POSTDELTA prefill crash 未解（R51/R54 同模式，2026-10-15）**：
+> R54 加了 **decode-only 门控**（`current_forward_is_decode()`，capture_mode.py:121——该 API 的设计用户就是 moe_overlap 的 two-stream gate），
+> prefill 走原分解链——**acc 崩塌修了**（R51 的 2.15 → R54 的 3.50-3.89 正常），但 **256 bench 后 prefill 仍 crash**（P=000，和 R51 同模式 16:47:47）。
+> ⇒ POSTDELTA 的 **decode 路径本身**对 prefill 有深层副作用（非 prefill 走不走 POSTDELTA 的问题）：
+> 嫌疑 = decode 走融合核更快 → mooncake KV 传输模式变化 → prefill 传输线程压力/资源耗尽。
+> **POSTDELTA 当前关**（生产恢复 R55），代码保留供专项调查。调查清单：
+> ① prefill crash 栈（libc 段错误，无 Python 帧——需 CUDA coredump 或 valgrind）
+> ② mooncake session 状态（256 bench 期间的 KVTransferError 形态——是 AbortReq 还是 session-not-alive）
+> ③ POSTDELTA decode 路径的 KV 传输时序 vs 分解链（融合核更快是否导致 KV 请求密度变化）

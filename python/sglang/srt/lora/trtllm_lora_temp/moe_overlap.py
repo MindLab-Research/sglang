@@ -916,20 +916,30 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora_two_stream(
         dispatch_output = dispatch_output._replace(topk_output=topk_output)
 
     if _o.environ.get("SGLANG_LORA_FUSED_POSTDELTA") == "1":
-        # R50 user-directed route: the NVIDIA closed-source fused kernel
-        # computes the whole base MoE chain (routing -> GEMM1 -> gated-SwiGLU
-        # -> MXFP8 quant -> GEMM2 -> combine) via its routed (materialized-topk)
-        # entry — the same cubin the no-LoRA base path uses. The LoRA delta is
-        # applied OUTPUT-SIDE only (y += delta): there is no hook inside the
-        # closed cubin, and a zero delta added to the output is a bitwise
-        # no-op (x + 0.0 == x). Today this branch is exact for zero-weight /
-        # pass-through batches (delta == 0.0 identically). routed_scaling_factor
-        # is already materialized into topk_weights by the REAL FIX above and
-        # the kernel's TopK-only branch never applies mRouteScale (no double
-        # scaling).
-        return _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
-            dispatch_output, quant_info, runner_config
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            current_forward_is_decode,
         )
+        if current_forward_is_decode():
+            # R50 user-directed route: the NVIDIA closed-source fused kernel
+            # computes the whole base MoE chain (routing -> GEMM1 -> gated-SwiGLU
+            # -> MXFP8 quant -> GEMM2 -> combine) via its routed (materialized-topk)
+            # entry — the same cubin the no-LoRA base path uses. The LoRA delta is
+            # applied OUTPUT-SIDE only (y += delta): there is no hook inside the
+            # closed cubin, and a zero delta added to the output is a bitwise
+            # no-op (x + 0.0 == x). Today this branch is exact for zero-weight /
+            # pass-through batches (delta == 0.0 identically). routed_scaling_factor
+            # is already materialized into topk_weights by the REAL FIX above and
+            # the kernel's TopK-only branch never applies mRouteScale (no double
+            # scaling).
+            # DECODE-ONLY gate: prefill's large-batch path is not yet validated
+            # under POSTDELTA (R51 256-bench prefill CUDA crash 16:47:47, 3
+            # subproc); prefill falls back to the decomposed path below.
+            # current_forward_is_decode() returns True for decode + decode-graph-
+            # capture (the API's design user is exactly this two-stream gate,
+            # per capture_mode.py:96-100).
+            return _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
+                dispatch_output, quant_info, runner_config
+            )
 
     # PASS-THROUGH PRECISION (zero-LoRA == base): no-adapter requests take the
     # SAME decomposed pipeline with zero deltas. The previous early-return to
