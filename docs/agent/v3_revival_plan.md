@@ -34,6 +34,9 @@ v3 分支（moe_overlap.py:1055，bf16-bmm MoE-LoRA）被关的唯一原因：`d
 - 与分解 trtllm 的差异: GEMM 引擎不同（bmm vs trtllm-gen grouped）——**bmm 在小 M（decode）下
   的 launch 效率可能显著优于 grouped trtllm**（之前 R21 时代的 bmm 数据是假进程——无效）
 
-## 铁律提醒（AGENTS.md 已固化）
-- 输出正确性先于一切数字；per-step 口径（TPOT×acc）；层 20-39 不变；同轮 A/B；
-  出错先找根因不盲目重启；报告前自检（输出/成功率/层配置/加载）
+## v3 复活实施清单（下 session 从 R48 基线续）
+4. **graph 池显存方案（新发现 cuda_graph_setup.py:183）**：
+   - `ElasticCudaGraphConfig.capture_bs: tuple[int, ...]` 控制 graph 捕获的 bs 列表
+   - 当前 `--cuda-graph-max-bs-decode 128`（capture_bs 到 128）——**bench 64 并发只需 64**
+   - **改 capture_bs 上限到 64 → graph 池约减半（几十 GB 释放）→ v3 的 30.5GB cache/a 有空间**
+   - 另有 `set_global_graph_memory_pool(None)`（:361）的 graph 池全局管理可查
