@@ -967,8 +967,18 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora_two_stream(
     lora_event = torch.cuda.Event()
     _mb_side = get_lora_side_stream()
     _mb_side.wait_stream(torch.cuda.current_stream())
+    # Static zero-weight detection for the gate_up LoRA (down-only adapters
+    # deploy with zero gate_up weights, R29-verified path): when the gate_up
+    # B weights are all zero the VE output is exactly zero, so the GEMM can
+    # be skipped entirely. The flag lives on the pool weight tensor (stable
+    # object; a reload binds a fresh tensor and recomputes).
+    _gw = lora_info.gate_up_lora_b_weights
+    _gu_zero = getattr(_gw, "_gu_zero_flag", None)
+    if _gu_zero is None:
+        _gu_zero = bool((_gw == 0).all().item())
+        _gw._gu_zero_flag = _gu_zero
     with torch.cuda.stream(_mb_side):
-        if has_active_lora:
+        if has_active_lora and not _gu_zero:
             merged_experts_fused_moe_lora_add(
                 output=gate_up_delta_ve,
                 hidden_states=hidden_states,
