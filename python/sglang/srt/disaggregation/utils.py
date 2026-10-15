@@ -188,59 +188,14 @@ def _apply_metadata_gate(polls, decode_reqs, metadata_buffers) -> None:
                 polls[i] = int(KVPoll.Transferring)
 
 
-_SHM_BOARDS = {}  # id(group) -> numpy array [world_size, max_len] uint8
-
-
 def _all_reduce_polls(polls: List[int], group: dist.ProcessGroup) -> List[int]:
     """MIN-reduce poll states so no rank commits ahead of its peers."""
     if dist.get_world_size(group) == 1:
         return polls
 
-    import os
-
-    if os.environ.get("SGLANG_LORA_FUSED_POSTDELTA") == "1":
-        # Shared memory poll board: NO barrier, NO blocking main thread.
-        # Each rank writes its polls to its row; all read all rows and take MIN.
-        # Stale only lags (conservative) — Success is monotonic → safe.
-        # This replaces the gloo CPU all_reduce which blocked the main thread
-        # under POSTDELTA decode acceleration → detokenizer hang.
-        import numpy as np
-        from multiprocessing import shared_memory
-
-        max_len = int(os.environ.get("SGLANG_MAX_RUNNING_REQUESTS", "256"))
-        gid = id(group)
-        if gid not in _SHM_BOARDS:
-            world_size = dist.get_world_size(group)
-            _shm_name = f"sglang_poll_{gid}"
-            try:
-                _shm = shared_memory.SharedMemory(
-                    name=_shm_name, create=True, size=world_size * max_len
-                )
-                _arr = np.ndarray(
-                    (world_size, max_len), dtype=np.uint8, buffer=_shm.buf
-                )
-                _arr[:] = 0xFF  # Initialize to MIN identity (0xFF > any KVPoll)
-            except FileExistsError:
-                _shm = shared_memory.SharedMemory(name=_shm_name)
-                _arr = np.ndarray(
-                    (world_size, max_len), dtype=np.uint8, buffer=_shm.buf
-                )
-            _SHM_BOARDS[gid] = _arr
-
-        board = _SHM_BOARDS[gid]
-        rank = dist.get_rank(group)
-
-        # Write local polls to this rank's row (pad with 0xFF = MIN identity)
-        padded = list(polls) + [0xFF] * (max_len - len(polls))
-        board[rank] = np.array(padded, dtype=np.uint8)
-
-        # Read all ranks' rows and take MIN (NO barrier — no blocking!)
-        result = board.min(axis=0).tolist()
-        return result[: len(polls)]
-    else:
-        tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
-        dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=group)
-        return tensor_to_reduce.tolist()
+    tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
+    dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=group)
+    return tensor_to_reduce.tolist()
 
 
 def poll_and_all_reduce(

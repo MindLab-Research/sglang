@@ -877,7 +877,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         def set_transfer_blocks(
             src_ptr: int, dst_ptr: int, item_len: int
         ) -> List[Tuple[int, int, int]]:
-            transfer_blocks = []
             if dst_device_data_ptrs and int(dst_ptr) in dst_device_data_ptrs:
                 assert (
                     device_prefill_kv_blocks is not None
@@ -889,12 +888,18 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 )
             else:
                 src_blocks, dst_blocks = prefill_kv_blocks, dst_kv_blocks
-            for prefill_index, decode_index in zip(src_blocks, dst_blocks):
-                src_addr = src_ptr + int(prefill_index[0]) * item_len
-                dst_addr = dst_ptr + int(decode_index[0]) * item_len
-                length = item_len * len(prefill_index)
-                transfer_blocks.append((src_addr, dst_addr, length))
-            return transfer_blocks
+            # numpy vectorized: reduce Python loop → reduce GIL hold time
+            # (SubAgent gil-pybind-fix: transfer_blocks Python construction
+            # is the GIL contention source → gloo barrier blocking → detokenizer hang)
+            import numpy as np
+
+            src_starts = np.array([b[0] for b in src_blocks], dtype=np.int64)
+            dst_starts = np.array([b[0] for b in dst_blocks], dtype=np.int64)
+            src_lens = np.array([len(b) for b in src_blocks], dtype=np.int64)
+            src_addrs = (src_ptr + src_starts * item_len).tolist()
+            dst_addrs = (dst_ptr + dst_starts * item_len).tolist()
+            lengths = (item_len * src_lens).tolist()
+            return list(zip(src_addrs, dst_addrs, lengths))
 
         # Worker function for processing a single layer
         def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
