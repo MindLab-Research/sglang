@@ -210,19 +210,28 @@ def _all_reduce_polls(
         rids = rids or [str(i) for i in range(len(polls))]
         key = (id(group), site)
 
+        # Pad to fixed length for cross-rank shape consistency (gloo async
+        # all_reduce requires all ranks to have the same tensor shape).
+        # 0xFF = MIN identity (255 > any KVPoll value, so MIN ignores padding).
+        _orig_len = len(polls)
+        _max_len = int(os.environ.get("SGLANG_MAX_RUNNING_REQUESTS", "256"))
+        _padded_polls = list(polls) + [0xFF] * (_max_len - _orig_len)
+        _padded_rids = list(rids) + [f"_pad_{i}" for i in range(_max_len - _orig_len)]
+
         # Harvest previous async result (rid-keyed, not position-keyed)
         st = _ASYNC_POLL_STATE.get(key)
         if st and st["work"].is_completed():
             for r, v in zip(st["rids"], st["tensor"].tolist()):
-                _CONFIRMED_POLLS[key][r] = int(v)
+                if not r.startswith("_pad_"):
+                    _CONFIRMED_POLLS[key][r] = int(v)
             _ASYNC_POLL_STATE.pop(key)
             st = None
 
         # Start new async all_reduce (at most 1 in-flight per site)
         if st is None:
-            t = torch.tensor(polls, dtype=torch.uint8, device="cpu")
+            t = torch.tensor(_padded_polls, dtype=torch.uint8, device="cpu")
             w = dist.all_reduce(t, op=dist.ReduceOp.MIN, group=group, async_op=True)
-            _ASYNC_POLL_STATE[key] = {"rids": tuple(rids), "tensor": t, "work": w}
+            _ASYNC_POLL_STATE[key] = {"rids": tuple(_padded_rids), "tensor": t, "work": w}
 
         # Build result: use confirmed poll if available, else local poll
         # with Success (4) downgraded to Transferring (3) — conservative,

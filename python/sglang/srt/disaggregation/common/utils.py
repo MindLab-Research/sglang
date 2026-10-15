@@ -70,34 +70,22 @@ def unpack_int_lists(buf: bytes, fmt: str) -> List[List[int]]:
 
 
 class FastQueue:
-    def __init__(self, max_size: int = 0):
+    def __init__(self):
         self._buf = deque()
         self._cond = threading.Condition()
-        self._max_size = max_size  # 0 = unbounded (original behavior)
 
     def put(self, item):
         with self._cond:
-            if self._max_size > 0:
-                # Backpressure: brief wait (0.5ms) if queue full, then overflow
-                # anyway. Prevents unbounded accumulation under POSTDELTA decode
-                # acceleration without causing startup deadlock (R82's 100ms
-                # timeout caused deadlock; 0.5ms is safe).
-                import time
-
-                _deadline = time.monotonic() + 0.0005
-                while len(self._buf) >= self._max_size and time.monotonic() < _deadline:
-                    self._cond.wait(timeout=0.0005)
             self._buf.append(item)
+            # wake up a thread of wait()
             self._cond.notify()
 
     def get(self):
         with self._cond:
+            # if queue is empty  ,block until is notified()
             while not self._buf:
                 self._cond.wait()
-            item = self._buf.popleft()
-            if self._max_size > 0:
-                self._cond.notify_all()
-            return item
+            return self._buf.popleft()
 
 
 class AuxDataCodec:
