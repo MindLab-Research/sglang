@@ -78,23 +78,25 @@ class FastQueue:
     def put(self, item):
         with self._cond:
             if self._max_size > 0:
-                # Backpressure: block until queue has space (prevents unbounded
-                # accumulation under POSTDELTA decode acceleration → gloo barrier
-                # never gets overwhelmed → no detokenizer hang).
-                while len(self._buf) >= self._max_size:
-                    self._cond.wait(timeout=0.1)  # 100ms timeout to avoid infinite block
+                # Backpressure: brief wait (0.5ms) if queue full, then overflow
+                # anyway. Prevents unbounded accumulation under POSTDELTA decode
+                # acceleration without causing startup deadlock (R82's 100ms
+                # timeout caused deadlock; 0.5ms is safe).
+                import time
+
+                _deadline = time.monotonic() + 0.0005
+                while len(self._buf) >= self._max_size and time.monotonic() < _deadline:
+                    self._cond.wait(timeout=0.0005)
             self._buf.append(item)
-            # wake up a thread of wait()
             self._cond.notify()
 
     def get(self):
         with self._cond:
-            # if queue is empty  ,block until is notified()
             while not self._buf:
                 self._cond.wait()
             item = self._buf.popleft()
             if self._max_size > 0:
-                self._cond.notify_all()  # wake blocked put() threads
+                self._cond.notify_all()
             return item
 
 

@@ -891,12 +891,20 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora_two_stream(
             if not get_is_capture_mode():
                 _y_base = _combine.hidden_states
                 _x = dispatch_output.hidden_states
-                # Test mode: fixed random B'A'x (scale 0.01, seed=42)
+                # Test mode: fixed random B'A'x (scale 0.01, seed=42) — CACHED
+                # via globals() to eliminate 40 randn/step overhead (20 layers × 2).
+                # R82: cached A/B triggered gloo barrier; R85 adds FastQueue
+                # backpressure (0.5ms timeout) to auto-throttle → no gloo overwhelm.
                 if _o.environ.get("SGLANG_LORA_POSTDELTA_TEST") == "1":
                     _d = _x.shape[-1]
-                    _g = torch.Generator(device=_x.device).manual_seed(42)
-                    _ta = torch.randn(16, _d, device=_x.device, dtype=_x.dtype, generator=_g) * 0.01
-                    _tb = torch.randn(_d, 16, device=_x.device, dtype=_x.dtype, generator=_g) * 0.01
+                    _ta = globals().get("_PD_TA_BP")
+                    _tb = globals().get("_PD_TB_BP")
+                    if _ta is None or _ta.shape[-1] != _d or _ta.device != _x.device:
+                        _g = torch.Generator(device=_x.device).manual_seed(42)
+                        _ta = torch.randn(16, _d, device=_x.device, dtype=_x.dtype, generator=_g) * 0.01
+                        _tb = torch.randn(_d, 16, device=_x.device, dtype=_x.dtype, generator=_g) * 0.01
+                        globals()["_PD_TA_BP"] = _ta
+                        globals()["_PD_TB_BP"] = _tb
                     _delta = torch.nn.functional.linear(_x, _ta)
                     _delta = torch.nn.functional.linear(_delta, _tb)
                     _y_base = _y_base + _delta
@@ -1034,13 +1042,19 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora_two_stream(
                             _y_base = _y_base + _delta
 
                 # Test mode: inject fixed random delta (B'A'x) to verify the
-                # delta channel. Seed=42 for determinism, scale 0.01.
+                # delta channel. Seed=42 for determinism, scale 0.01. CACHED
+                # via globals() to eliminate randn overhead.
                 if _o.environ.get("SGLANG_LORA_POSTDELTA_TEST") == "1":
                     _x = dispatch_output.hidden_states
                     _d = _x.shape[-1]
-                    _g = torch.Generator(device=_x.device).manual_seed(42)
-                    _ta = torch.randn(16, _d, device=_x.device, dtype=_x.dtype, generator=_g) * 0.01
-                    _tb = torch.randn(_d, 16, device=_x.device, dtype=_x.dtype, generator=_g) * 0.01
+                    _ta = globals().get("_PD_TA_PD")
+                    _tb = globals().get("_PD_TB_PD")
+                    if _ta is None or _ta.shape[-1] != _d or _ta.device != _x.device:
+                        _g = torch.Generator(device=_x.device).manual_seed(42)
+                        _ta = torch.randn(16, _d, device=_x.device, dtype=_x.dtype, generator=_g) * 0.01
+                        _tb = torch.randn(_d, 16, device=_x.device, dtype=_x.dtype, generator=_g) * 0.01
+                        globals()["_PD_TA_PD"] = _ta
+                        globals()["_PD_TB_PD"] = _tb
                     _delta = torch.nn.functional.linear(_x, _ta)
                     _delta = torch.nn.functional.linear(_delta, _tb)
                     _y_base = _y_base + _delta
