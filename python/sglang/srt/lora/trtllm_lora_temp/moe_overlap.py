@@ -874,6 +874,11 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora_two_stream(
     # natively consumes the bypassed format and keeps the base batch on the
     # fast fused route). LoRA-active batches always arrive STANDARD.
     if TopKOutputChecker.format_is_bypassed(topk_output):
+        # BRANCH TRACE: which path is live?
+        import os as _os2
+        if _os2.environ.get("SGLANG_PD_BRANCH_TRACE") == "1":
+            from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode as _gcm
+            print("PD-TRACE BYPASSED branch hit, capture=%s, has_lora=%s", _gcm(), lora_info is not None)
         from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
             fused_experts_none_to_flashinfer_trtllm,
         )
@@ -960,6 +965,10 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora_two_stream(
         dispatch_output = dispatch_output._replace(topk_output=topk_output)
 
     if _o.environ.get("SGLANG_LORA_FUSED_POSTDELTA") == "1":
+        # BRANCH TRACE
+        if _o.environ.get("SGLANG_PD_BRANCH_TRACE") == "1":
+            from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode as _gcm2
+            print("PD-TRACE POSTDELTA branch hit, capture=%s, has_lora=%s", _gcm2(), lora_info is not None)
         # R50 fused-kernel + output-side delta. The routed (STANDARD topk)
         # cubin MMU-faults under 256-bench graph replay (R56 Xid 13/31).
         # FIX: route through the BYPASSED logits cubin

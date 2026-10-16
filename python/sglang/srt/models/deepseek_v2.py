@@ -3603,6 +3603,14 @@ def dsv2_flashinfer_moe_dual_stream_graph(
     _bypass_allowed = not (
         _lora_forces_standard_topk() or _moe_rejects_bypassed_topk()
     )
+    # POSTDELTA: don't flip bypass in prefill (dual_stream) — this changes
+    # prefill's MoE execution path from STANDARD (decomposed) to BYPASSED
+    # (fused kernel), which causes cumulative degradation under continuous
+    # 256-bench → crash. Keep prefill on STANDARD (same as base) → stable.
+    import os as _os
+
+    if _os.environ.get("SGLANG_LORA_FUSED_POSTDELTA") == "1":
+        _bypass_allowed = False
     with get_forward().scoped(
         fuse_mlp_allreduce=fuse_mlp_allreduce,
         mlp_reduce_scatter=mlp_reduce_scatter,

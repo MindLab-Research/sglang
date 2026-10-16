@@ -64,7 +64,11 @@ scheduler 主循环被卡的三个具体机制：
 
 ## 7. 与 POSTDELTA 的关联（density 假设的机制）
 
-POSTDELTA（`lora/trtllm_lora_temp/moe_overlap.py:920` 起，`SGLANG_LORA_FUSED_POSTDELTA=1`）让 decode forward 更快 ⇒ 单位时间完成/新建请求更多 ⇒ decode 侧 `pop_preallocated`/`send_metadata`/abort 密度上升 ⇒ prefill 传输队列（无界）涨得更快。叠加第 1–3 节的固定超时与一次失败即拉黑，**退化是累积的**：worker 被 30s 超时占死 → 队列堆积 → `send()` 返回非 0 → session 拉黑 → 该 session 上所有 room 立刻 Failed → decode abort → 进 deferred-release → 30s 后强行释放仍在被远端写的页 → KV 污染/进程崩溃。
+POSTDELTA（`lora/trtllm_lora_temp/moe_overlap.py:962` 起的主分支 + `:1007` 的 BYPASSED 合成，环境变量 `SGLANG_LORA_FUSED_POSTDELTA=1`；REAL FIX 段在 `:946-960`）让 decode forward 更快 ⇒ 单位时间完成/新建请求更多 ⇒ decode 侧 `pop_preallocated`/`send_metadata`/abort 密度上升 ⇒ prefill 传输队列（无界）涨得更快。叠加第 1–3 节的固定超时与一次失败即拉黑，**退化是累积的**：worker 被 30s 超时占死 → 队列堆积 → `send()` 返回非 0 → session 拉黑 → 该 session 上所有 room 立刻 Failed → decode abort → 进 deferred-release → 30s 后强行释放仍在被远端写的页 → KV 污染/进程崩溃。
+
+> ⚠️ **2026-10-16 群组核实补充**：本节 density 假设**未被证实且与用户判断冲突**（用户明确「不可能是传输速度」）。已核实两条影响归因的代码事实：
+> ① `_lora_forces_standard_topk()` / `_moe_rejects_bypassed_topk()` 返回 False **并不能让 LoRA 请求变成 BYPASSED dispatch** —— 此时 `output_format=None` 会落进 `topk.py:663-681` 的 auto-detect，而它在 `is_experimental_sgl_trtllm()` 分支读的是**服务级** `get_lora().enable_lora`（launch 带 `--enable-lora`）⇒ 仍判 STANDARD。真正的 BYPASSED 只是 `moe_overlap.py:1007` 手工合成的 `BypassedTopKOutput`，只影响那一次融合核调用。
+> ② `get_is_capture_mode()`（`runner_utils/capture_mode.py:44-45`）在 decode 全图 capture 期（`decode_cuda_graph_runner.py:489` 的 `model_capture_mode()`）为真 ⇒ capture 期 delta 被跳过；且全树 **`_process_output_after_replay` 无任何 override**（仅 `decode_cuda_graph_runner.py:1526` 调用点 + `:1567` 基类定义）⇒ 不存在「graph 后 eager 补算 delta」的机制。
 
 ## 8. 修复方向（代码级）
 
