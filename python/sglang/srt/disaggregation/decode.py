@@ -2825,10 +2825,30 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 continue
             kv_mgr = decode_req.kv_receiver.kv_mgr
             drained = kv_mgr.is_abort_release_safe(room, required_acks)
-            if not drained and now < deadline:
+            if drained:
+                to_release.append((decode_req, idx, room, True))
+            elif now < deadline:
                 still_held.append((decode_req, deadline, idx, required_acks))
             else:
-                to_release.append((decode_req, idx, room, drained))
+                # A timeout cannot prove that a remote write has stopped: releasing
+                # here reclaims a KV page the prefill may still be writing into via
+                # RDMA/GDDR, and the in-flight write then lands in a page reallocated
+                # to a NEW request → GPU memory corruption → Xid 13 (illegal
+                # instruction encoding). Keep holding and re-arm a longer deadline;
+                # the page is only reclaimed once the drain ack actually arrives.
+                logger.warning(
+                    f"Deferred KV release for room {room} still has no full drain "
+                    f"ack from prefill after {self.deferred_kv_release_timeout}s; "
+                    f"HOLDING the page (a timeout cannot prove the remote write stopped)."
+                )
+                still_held.append(
+                    (
+                        decode_req,
+                        now + self.deferred_kv_release_timeout,
+                        idx,
+                        required_acks,
+                    )
+                )
         # Commit the survivors before releasing so a _do_release exception can't
         # leave a released entry in the list (double-free / None receiver on retry).
         self._deferred_releases = still_held
