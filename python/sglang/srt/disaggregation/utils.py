@@ -193,19 +193,9 @@ def _all_reduce_polls(polls: List[int], group: dist.ProcessGroup) -> List[int]:
     if dist.get_world_size(group) == 1:
         return polls
 
-    # Use NCCL (GPU) for sub-ms all_reduce instead of gloo (CPU) which
-    # blocks the main thread under 64-concurrent pressure → detokenizer hang.
-    # The gloo group has the same ranks as the NCCL TP group, so the
-    # default NCCL group (dist.group.WORLD) covers the same ranks.
-    if torch.cuda.is_available():
-        device = torch.cuda.current_device()
-        tensor_to_reduce = torch.tensor(polls, dtype=torch.int32, device=device)
-        dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN)
-        return tensor_to_reduce.cpu().tolist()
-    else:
-        tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
-        dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=group)
-        return tensor_to_reduce.tolist()
+    tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
+    dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=group)
+    return tensor_to_reduce.tolist()
 
 
 def poll_and_all_reduce(

@@ -152,12 +152,16 @@ def get_deep_gemm_prefill_data(
     ), "the DeepGEMM prefill indexer needs the CPU length vectors"
     device = pos.device
     # Visible compressed positions per request; (pos + 1) // ratio bounds each row.
-    lc_per_req = [s // ratio for s in seq_lens_cpu]
+    # Clamp to the req_to_token column bound UP FRONT: clamping only inside the
+    # loop left lens_per_request at the uncapped value while k_slots/request_starts
+    # used the capped one → downstream DeepGEMM indexed past the concatenated
+    # slot array → GPU fault (Xid 13 illegal-instruction).
+    _max_lc = max(1, req_to_token.shape[1] // ratio)
+    lc_per_req = [min(s // ratio, _max_lc) for s in seq_lens_cpu]
     req_pool_indices = inputs.req_pool_indices.to(torch.int64)
     slot_chunks, starts, start = [], [], 0
     for r, lc in enumerate(lc_per_req):
         starts.append(start)
-        lc = min(lc, req_to_token.shape[1] // ratio)  # clamp to prevent OOB
         if lc == 0:
             continue
         j = torch.arange(lc, device=device)
