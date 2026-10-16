@@ -97,7 +97,14 @@ def _jit_silu_mul_quant_contig_module(
 
 @cache_once
 def _jit_silu_and_mul_clamp_module(dtype: torch.dtype):
-    args = make_cpp_args(dtype, is_arch_support_pdl())
+    # R139: force kUsePDL=false. The PDL variant (griddepcontrol wait/trigger
+    # instructions) hit an intermittent Xid-13 "illegal instruction encoding"
+    # on B300 prefill under load (R129-R138, ESR 0x1f81fb60/0x1174 identical
+    # every time); a fresh JIT rebuild (R138) ruled out a corrupt cached build,
+    # so the PDL instruction stream itself is the suspect. The non-PDL
+    # specialization has identical math — only launch overlap is lost, which
+    # is negligible for this short elementwise kernel.
+    args = make_cpp_args(dtype, False)
     return load_jit(
         make_name("silu_and_mul_clamp"),
         *args,
