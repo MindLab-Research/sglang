@@ -156,7 +156,7 @@ def _moe_rejects_bypassed_topk() -> bool:
         import os
 
         if os.environ.get("SGLANG_LORA_FUSED_POSTDELTA") == "1":
-            return False
+            return True  # R124: keep BYPASSED → graph == base → no crash
         return True
     return False
 from sglang.srt.layers.moe.utils import (
