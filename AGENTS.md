@@ -434,3 +434,66 @@ routed_scaling_factor 已被 REAL FIX 物化进 weights，融合核 TopK-only �
 > ① prefill crash 栈（libc 段错误，无 Python 帧——需 CUDA coredump 或 valgrind）
 > ② mooncake session 状态（256 bench 期间的 KVTransferError 形态——是 AbortReq 还是 session-not-alive）
 > ③ POSTDELTA decode 路径的 KV 传输时序 vs 分解链（融合核更快是否导致 KV 请求密度变化）
+
+## ★ R125-R150：连续 256 崩溃根因闭环 + per-GEMM routing cache 修复（2026-10-16，本轮结案）
+
+**现象**：POSTDELTA 各配置（ON/OFF × mooncake/nixl × 原始/自编 engine.so）连续 256 bench 必崩，
+prefill detokenizer 挂 → 503；dmesg **Xid 13**（"Illegal Instruction Encoding" + "MMU Fault"），
+ESR `0x5787b0=0x… 0x…a8=0x1f81fb60 0x…ac=0x1174` **每次崩溃完全相同**（同一确定性越界模式）。
+Xid 归属杂乱（dsw-agent 988 次 / amperf-collecto / cache_mgr_main / gdu_diag / sglang 各 pid）——
+**归属进程 = fault 当时占该 SM 的上下文，平台采集器是"目击者"不是凶手**（单 GPU 上同时只有
+它自己的轻量监控 kernel 在跑时 fault 被记到它头上）。
+
+**排查走过的死路（勿再走）**：
+1. ~~POSTDELTA 代码~~：POSTDELTA OFF（R129）同崩。
+2. ~~engine.so / mooncake / nixl~~：三套传输全崩（nixl 不加载 engine.so 照崩）。
+3. ~~indexer scoring.py 越界~~：R129/R130 的 traceback 报 `scoring.py:164 req_to_token[req_pool_indices[r], j*ratio]`
+   是**异步错误的浮现点不是 fault 点**；IDX-TRACE 探针（R132-R138）从未触发=lc 从不越界，红鲱鱼。
+4. ~~坏 JIT build~~：R138 删缓存重编仍崩。
+5. ~~PDL~~：R139 禁 PDL（`silu_and_mul_clamp` 的 kUsePDL=False）仍崩。
+6. ~~硬件~~：R140 GPU 对调（prefill→4-7，decode→0-3）崩**跟着角色走**（Xid 落在 prefill 新占的卡），
+   decode 卡全程零 Xid → 排除硬件。
+7. ~~LoRA 调优 env~~：R144 去掉 per-group/tactic/nocontig 仍崩。
+
+**定位方法论（按判别力排序，每轮 ~8 分钟）**：
+- **R142 base 256**（无 adapter 数据）：**全过（256/256 零 Xid）** → fault 100% 在 LoRA batch 路径。
+- **R143 同 server base 过 → zero 崩**：同进程同卡同代码，唯一变量 = lora_info 有无 → 铁证。
+- **R145b/R146 单侧 adapter**：`--lora-target-modules gate_up_proj`（配 moe_zero_gu 80 张量）与
+  `down_proj`（配 moe_zero_dp 40 张量）**各自都稳** → fault = 双 GEMM 真权重交互。
+  （注：adapter 张量 key 是 `gate_proj/up_proj/down_proj`，`gate_up_proj` 由 normalize 合并；
+  单挂时另一侧走 lora_a=None 的跳过路径。）
+- **R147a/R148 双挂+单 GEMM 跳过**（env `SGLANG_LORA_NO_GU_DELTA`/`NO_VE_DELTA` 让对应 GEMM 走
+  None 跳过）：**任一跳过都稳** → 双真权重才崩。
+- **R149 双挂全真权重 + VE 调用 routing_cache=None**（`SGLANG_LORA_NO_RCACHE`）：**稳** → 定罪。
+
+**根因**：`lora_dispatch.py` 分解链里 gate_up delta GEMM 和 VE down delta GEMM **共享同一个
+`fused_lora_routing_cache` dict**。两次调用的 stage 语义不同（gate_up 是 a 侧 shared-outer=True，
+VE 是 b 侧 shared-outer=True），`cache_key=(num_experts, shared_outer, block_size)` 在两侧发生碰撞，
+VE 的 expand 复用了 gate_up shrink 的 routing 元组（含 shrink 的 `tight_padded` 截断语义）→
+错误索引 → 间歇性越界写 → Xid 13 → CUDA context 毒化 → scheduler 挂死 → detokenizer 20s 超时 → 503。
+单侧挂载时另一侧 lora_a=None 不写 cache，碰撞不发生——这就是为什么单挂稳、双挂崩。
+
+**修复（R150）**：per-GEMM routing cache——每个 GEMM 自己的 dict（`ve_routing_cache`），GEMM 内部
+stage A/B prewarm 保持（性能不降：align 每 GEMM 重算一次 ~10µs 级）。全部 4 个 dispatch 函数
+已统一修（fn4 的 both-sides-shared 变体 `:1053` 未动，那条路径若启用需 review）。
+诊断开关 `SGLANG_LORA_NO_GU_DELTA`/`NO_VE_DELTA` 保留（默认关）。
+
+**R150 验证（POSTDELTA ON + 双挂全真权重 + nixl）**：zero **3×256 连续全过** + rnd 256 全过 +
+base 2×256 全过，**零 Xid、零 prefill 错误、P/D 全程 200/200**。
+**per-step 实测（TPOT×acc 口径，bench 中段抓取）**：rnd gen≈12800 tok/s acc≈4.0 → TPOT≈5.0ms →
+per-step≈20.0ms；base gen≈12500 acc≈3.95 → per-step≈20.2ms → **LoRA 税 ≈ 0-2%（历史分解链 36%）**。
+
+**诊断工具箱（本轮验证有效）**：
+- `CUDA_LAUNCH_BLOCKING=1`：让异步 CUDA 错误在**真实 faulting kernel** 处上报（否则 traceback 是
+  下一个 launch 的浮现点，红鲱鱼）。
+- `py-spy dump --pid <scheduler>`：scheduler 挂死时看主线程卡在哪个调用（区分"挂死"vs"崩退"）。
+- dmesg Xid 的 `pid=…, name=…` 归属：只说明 fault 瞬间谁占着该 SM；DSW 平台的 dsw-agent/
+  amperf-collecto/cache_mgr_main 是**目击者**（`/etc/dsw/bin/pai-dsw` 是 DSW 虚拟化环境本体）。
+- GPU 对调实验：崩跟卡走=硬件；跟角色走=负载触发（R140 方法）。
+- 单侧 adapter 隔离：safetensors 按 key 拆半（gate_proj/up_proj → gu；down_proj → dp）。
+
+**mooncake 侧同步修复（本轮顺手，§8 清单）**：
+- `decode.py` deferred release 不再超时强放（超时改为挂起+告警+重武装——强放会回收仍被远端
+  RDMA 写的页 → 写进新请求的页 → GPU 显存污染）。
+- `conn.py` `maybe_send_extra`/`send_aux` 失败改走 SESSION_FAILURE_THRESHOLD（不再一次即拉黑）。
+- engine.so 恢复自编 sleep-patch 版（`/root/mc_src/build/...`，batchTransferSync 忙等加 10µs）。
