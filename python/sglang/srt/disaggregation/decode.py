@@ -3175,6 +3175,25 @@ class SchedulerDisaggregationDecodeMixin:
             # if there are still retracted requests, we do not allocate new requests
             return
 
+        # Adaptive throttle (R116): if running-req >= threshold, skip pop_transferred
+        # → don't admit new requests → let KV transfer catch up
+        # → decode speed matches KV transfer capacity → no gloo barrier blocking
+        # Systemic fix: base path's slow decomposed chain naturally limits decode
+        # speed → low KV transfer density → gloo not blocked → stable.
+        # POSTDELTA's fast fused kernel removes this limit → high KV transfer
+        # density → gloo blocked → crash. This throttle restores the limit
+        # adaptively → stable under any pressure.
+        import os as _os
+
+        _throttle_max = int(_os.environ.get("SGLANG_POSTDELTA_THROTTLE_MAX", "0"))
+        if (
+            _throttle_max > 0
+            and _os.environ.get("SGLANG_LORA_FUSED_POSTDELTA") == "1"
+            and self.running_batch
+            and len(self.running_batch.reqs) >= _throttle_max
+        ):
+            return  # Skip pop_transferred → don't admit new requests
+
         if not hasattr(self, "polling_count"):
             self.polling_count = 0
             self.polling_interval = get_disagg().disaggregation_decode_polling_interval
