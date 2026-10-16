@@ -151,36 +151,8 @@ def get_deep_gemm_prefill_data(
         and inputs.rows_per_request_device is not None
     ), "the DeepGEMM prefill indexer needs the CPU length vectors"
     device = pos.device
-    # DIAG: capture the indexer's address arithmetic if it is about to go out of
-    # range (env-gated; the crash at `req_to_token[req_pool_indices[r], j*ratio]`
-    # is an illegal-access/MMU-fault we still cannot attribute without values).
-    import os as _os
-
-    if _os.environ.get("SGLANG_INDEXER_TRACE") == "1":
-        _rp = inputs.req_pool_indices
-        _n_lc = len(seq_lens_cpu)
-        _n_idx = int(_rp.numel())
-        _n_rows = int(req_to_token.shape[0])
-        _n_cols = int(req_to_token.shape[1])
-        _idx_max = int(_rp.max().item()) if _n_idx else -1
-        _idx_min = int(_rp.min().item()) if _n_idx else -1
-        _lc_max = max((s // ratio) for s in seq_lens_cpu) if _n_lc else 0
-        if (_n_lc != _n_idx) or (_idx_max >= _n_rows) or (_lc_max * ratio >= _n_cols):
-            print(
-                f"[IDX-TRACE] n_lc={_n_lc} n_idx={_n_idx} n_rows={_n_rows} "
-                f"cols={_n_cols} ratio={ratio} lc_max={_lc_max} jmax={_lc_max * ratio} "
-                f"idx_min={_idx_min} idx_max={_idx_max} "
-                f"rows_per_req={list(inputs.rows_per_request or [])[:8]} "
-                f"seq_lens={list(seq_lens_cpu)[:8]}",
-                flush=True,
-            )
     # Visible compressed positions per request; (pos + 1) // ratio bounds each row.
-    # Clamp to the req_to_token column bound UP FRONT: clamping only inside the
-    # loop left lens_per_request at the uncapped value while k_slots/request_starts
-    # used the capped one → downstream DeepGEMM indexed past the concatenated
-    # slot array → GPU fault (Xid 13 illegal-instruction).
-    _max_lc = max(1, req_to_token.shape[1] // ratio)
-    lc_per_req = [min(s // ratio, _max_lc) for s in seq_lens_cpu]
+    lc_per_req = [s // ratio for s in seq_lens_cpu]
     req_pool_indices = inputs.req_pool_indices.to(torch.int64)
     slot_chunks, starts, start = [], [], 0
     for r, lc in enumerate(lc_per_req):
@@ -311,7 +283,6 @@ def prefill_requests(
         tok = (req == r).nonzero().squeeze(1)
         lens = compress_lens[tok]
         lc = int(lens.max().item())
-        lc = min(lc, req_to_token.shape[1] // ratio)  # clamp to prevent OOB
         if lc == 0:
             continue
         j = torch.arange(lc, device=pos.device)
