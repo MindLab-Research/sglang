@@ -268,7 +268,11 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora(
             mul_routed_weight=True,
             experts_shared_outer_loras_a=False,
             experts_shared_outer_loras_b=lora_info.experts_shared_outer_loras,
-            routing_cache=fused_lora_routing_cache,
+            routing_cache=(
+                None
+                if __import__("os").environ.get("SGLANG_LORA_NO_RCACHE") == "1"
+                else fused_lora_routing_cache
+            ),
             fuse_add_to_output=False,
             fuse_sum_all_reduce=True,
             use_direct_expand_add=lora_info.max_lora_rank <= 64,
@@ -303,7 +307,11 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora(
             mul_routed_weight=True,
             experts_shared_outer_loras_a=False,
             experts_shared_outer_loras_b=lora_info.experts_shared_outer_loras,
-            routing_cache=fused_lora_routing_cache,
+            routing_cache=(
+                None
+                if __import__("os").environ.get("SGLANG_LORA_NO_RCACHE") == "1"
+                else fused_lora_routing_cache
+            ),
             fuse_add_to_output=False,
         )
     elif hooks.after_down is not None:
