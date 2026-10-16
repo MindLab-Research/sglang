@@ -500,6 +500,15 @@ class DeepseekV2MLP(nn.Module):
                     bias=0,
                     interleaved=False,
                 )
+            elif __import__("os").environ.get("SGLANG_DISABLE_SILU_CLAMP_JIT") == "1":
+                # R141 isolation test: pure-torch fallback mirroring the JIT
+                # kernel's math exactly (gate clamped to +limit, up clamped to
+                # ±limit, silu(gate)*up) — used to attribute the Xid-13 fault.
+                _lim = float(self.swiglu_limit)
+                _half = gate_up.shape[-1] // 2
+                _g = gate_up[..., :_half].clamp(max=_lim)
+                _u = gate_up[..., _half:].clamp(min=-_lim, max=_lim)
+                x = (torch.nn.functional.silu(_g) * _u).to(gate_up.dtype)
             else:
                 M, N = gate_up.shape
                 x = gate_up.new_empty((M, N // 2))
