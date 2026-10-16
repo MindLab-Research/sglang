@@ -131,10 +131,20 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora(
         hooks = None
         token_lora_mapping = lora_info.token_lora_mapping
         fused_lora_routing_cache: dict = {}
+        # R150: per-GEMM routing cache — the gate_up and down/VE delta GEMMs must
+        # NOT share routing entries: their stage keys collide and the cross-GEMM
+        # reuse feeds one GEMM's (tight_padded-truncated) routing tuple to the
+        # other's kernel -> intermittent OOB write -> Xid 13 (ESR 0x1f81fb60/0x1174).
+        ve_routing_cache: dict = {}
     else:
         hooks = build_lora_hooks(hidden_states, lora_info, topk_ids)
         token_lora_mapping = None
         fused_lora_routing_cache = {}
+        # R150: per-GEMM routing cache — the gate_up and down/VE delta GEMMs must
+        # NOT share routing entries: their stage keys collide and the cross-GEMM
+        # reuse feeds one GEMM's (tight_padded-truncated) routing tuple to the
+        # other's kernel -> intermittent OOB write -> Xid 13 (ESR 0x1f81fb60/0x1174).
+        ve_routing_cache: dict = {}
 
     # Fuse the per-token scale transpose into the quant kernel (column-major scales) so the
     # `.t()` is a free view -> drops the standalone ~2us transpose+copy. Byte/shape-identical.
@@ -268,11 +278,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora(
             mul_routed_weight=True,
             experts_shared_outer_loras_a=False,
             experts_shared_outer_loras_b=lora_info.experts_shared_outer_loras,
-            routing_cache=(
-                None
-                if __import__("os").environ.get("SGLANG_LORA_NO_RCACHE") == "1"
-                else fused_lora_routing_cache
-            ),
+            routing_cache=ve_routing_cache,
             fuse_add_to_output=False,
             fuse_sum_all_reduce=True,
             use_direct_expand_add=lora_info.max_lora_rank <= 64,
@@ -307,11 +313,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora(
             mul_routed_weight=True,
             experts_shared_outer_loras_a=False,
             experts_shared_outer_loras_b=lora_info.experts_shared_outer_loras,
-            routing_cache=(
-                None
-                if __import__("os").environ.get("SGLANG_LORA_NO_RCACHE") == "1"
-                else fused_lora_routing_cache
-            ),
+            routing_cache=ve_routing_cache,
             fuse_add_to_output=False,
         )
     elif hooks.after_down is not None:
@@ -433,6 +435,11 @@ def fused_experts_none_to_experimental_sgl_trtllm_bf16_lora(
     assert use_virtual_lora_store, "BF16 trtllm LoRA requires virtual-experts."
     token_lora_mapping = lora_info.token_lora_mapping
     fused_lora_routing_cache: dict = {}
+    # R150: per-GEMM routing cache — the gate_up and down/VE delta GEMMs must
+    # NOT share routing entries: their stage keys collide and the cross-GEMM
+    # reuse feeds one GEMM's (tight_padded-truncated) routing tuple to the
+    # other's kernel -> intermittent OOB write -> Xid 13 (ESR 0x1f81fb60/0x1174).
+    ve_routing_cache: dict = {}
 
     inter = runner_config.intermediate_size_per_partition
 
@@ -532,7 +539,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_bf16_lora(
         mul_routed_weight=True,
         experts_shared_outer_loras_a=False,
         experts_shared_outer_loras_b=lora_info.experts_shared_outer_loras,
-        routing_cache=fused_lora_routing_cache,
+        routing_cache=ve_routing_cache,
         fuse_add_to_output=False,
         fuse_sum_all_reduce=True,
         use_direct_expand_add=lora_info.max_lora_rank <= 64,
@@ -623,6 +630,11 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp4_lora(
     assert use_virtual_lora_store, "NVFP4 trtllm LoRA requires virtual-experts."
     token_lora_mapping = lora_info.token_lora_mapping
     fused_lora_routing_cache: dict = {}
+    # R150: per-GEMM routing cache — the gate_up and down/VE delta GEMMs must
+    # NOT share routing entries: their stage keys collide and the cross-GEMM
+    # reuse feeds one GEMM's (tight_padded-truncated) routing tuple to the
+    # other's kernel -> intermittent OOB write -> Xid 13 (ESR 0x1f81fb60/0x1174).
+    ve_routing_cache: dict = {}
 
     inter = quant_info.intermediate_size_per_partition
 
@@ -728,7 +740,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp4_lora(
         mul_routed_weight=True,
         experts_shared_outer_loras_a=False,
         experts_shared_outer_loras_b=lora_info.experts_shared_outer_loras,
-        routing_cache=fused_lora_routing_cache,
+        routing_cache=ve_routing_cache,
         fuse_add_to_output=False,
         fuse_sum_all_reduce=True,
         use_direct_expand_add=lora_info.max_lora_rank <= 64,
@@ -861,6 +873,11 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora(
     )
     token_lora_mapping = lora_info.token_lora_mapping
     fused_lora_routing_cache: dict = {}
+    # R150: per-GEMM routing cache — the gate_up and down/VE delta GEMMs must
+    # NOT share routing entries: their stage keys collide and the cross-GEMM
+    # reuse feeds one GEMM's (tight_padded-truncated) routing tuple to the
+    # other's kernel -> intermittent OOB write -> Xid 13 (ESR 0x1f81fb60/0x1174).
+    ve_routing_cache: dict = {}
 
     inter = quant_info.intermediate_size_per_partition
 
