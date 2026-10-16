@@ -157,6 +157,7 @@ def get_deep_gemm_prefill_data(
     slot_chunks, starts, start = [], [], 0
     for r, lc in enumerate(lc_per_req):
         starts.append(start)
+        lc = min(lc, req_to_token.shape[1] // ratio)  # clamp to prevent OOB
         if lc == 0:
             continue
         j = torch.arange(lc, device=device)
@@ -283,6 +284,7 @@ def prefill_requests(
         tok = (req == r).nonzero().squeeze(1)
         lens = compress_lens[tok]
         lc = int(lens.max().item())
+        lc = min(lc, req_to_token.shape[1] // ratio)  # clamp to prevent OOB
         if lc == 0:
             continue
         j = torch.arange(lc, device=pos.device)
