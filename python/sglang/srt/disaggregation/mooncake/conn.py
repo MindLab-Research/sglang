@@ -2339,9 +2339,25 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                         self.session_failures[
                                             req.mooncake_session_id
                                         ] += 1
-                                        self.failed_sessions.add(
-                                            req.mooncake_session_id
+                                        # R138: route this through the same
+                                        # threshold as the KV path. A single
+                                        # transient aux/state hiccup must not
+                                        # permanently blacklist the session.
+                                        _thr = int(
+                                            os.environ.get(
+                                                "SGLANG_MOONCAKE_SESSION_FAILURE_THRESHOLD",
+                                                "10",
+                                            )
                                         )
+                                        if (
+                                            self.session_failures[
+                                                req.mooncake_session_id
+                                            ]
+                                            >= _thr
+                                        ):
+                                            self.failed_sessions.add(
+                                                req.mooncake_session_id
+                                            )
                                     self.conclude_failure(
                                         bootstrap_room=kv_chunk.room,
                                         failure_reason=(
