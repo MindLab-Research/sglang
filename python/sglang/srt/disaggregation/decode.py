@@ -2964,35 +2964,6 @@ class SchedulerDisaggregationDecodeMixin:
             # Update last_batch
             self.last_batch = batch
 
-            # Systemic fix (R120): minimum scheduler iteration interval.
-            # Base path's slow decomposed chain naturally limits scheduler
-            # iteration frequency → gloo collective (_broadcast_reqs_across_ranks
-            # + _all_reduce_polls) frequency is low → no barrier blocking → stable.
-            # POSTDELTA's fast fused kernel removes this limit → scheduler iteration
-            # frequency is high → gloo collective frequency is high → barrier
-            # blocking → detokenizer hang → crash.
-            # This minimum interval restores the limit → gloo collective frequency
-            # matches base path → stable under any pressure.
-            # Does NOT affect per-step (TPOT is determined by GPU forward, not
-            # scheduler iteration frequency). Does NOT block main thread (sleep
-            # is at end of loop, not before gloo).
-            import os as _os
-            import time as _time
-
-            _min_interval = float(
-                _os.environ.get("SGLANG_POSTDELTA_MIN_SCHED_INTERVAL", "0")
-            )
-            if (
-                _min_interval > 0
-                and _os.environ.get("SGLANG_LORA_FUSED_POSTDELTA") == "1"
-            ):
-                if not hasattr(self, "_sched_loop_start"):
-                    self._sched_loop_start = _time.monotonic()
-                _elapsed = _time.monotonic() - self._sched_loop_start
-                if _elapsed < _min_interval:
-                    _time.sleep(_min_interval - _elapsed)
-                self._sched_loop_start = _time.monotonic()
-
     def _run_batch_prebuilt(
         self: Scheduler, batch: ScheduleBatch
     ) -> GenerationBatchResult:
@@ -3203,25 +3174,6 @@ class SchedulerDisaggregationDecodeMixin:
         if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
             # if there are still retracted requests, we do not allocate new requests
             return
-
-        # Adaptive throttle (R116): if running-req >= threshold, skip pop_transferred
-        # → don't admit new requests → let KV transfer catch up
-        # → decode speed matches KV transfer capacity → no gloo barrier blocking
-        # Systemic fix: base path's slow decomposed chain naturally limits decode
-        # speed → low KV transfer density → gloo not blocked → stable.
-        # POSTDELTA's fast fused kernel removes this limit → high KV transfer
-        # density → gloo blocked → crash. This throttle restores the limit
-        # adaptively → stable under any pressure.
-        import os as _os
-
-        _throttle_max = int(_os.environ.get("SGLANG_POSTDELTA_THROTTLE_MAX", "0"))
-        if (
-            _throttle_max > 0
-            and _os.environ.get("SGLANG_LORA_FUSED_POSTDELTA") == "1"
-            and self.running_batch
-            and len(self.running_batch.reqs) >= _throttle_max
-        ):
-            return  # Skip pop_transferred → don't admit new requests
 
         if not hasattr(self, "polling_count"):
             self.polling_count = 0

@@ -31,6 +31,8 @@
 > 是 DSV4.1 融合核攻坚的本地镜像（10-12 攻坚的热修改主要在 1101 盒子上，尚未回灌）。
 > 见到它**不要**误判「DSV4.1 工作在 pr17」；收口时把盒子热修改回灌到**本树**提交。
 
+> 📖 **PD/Mooncake KV 传输的完整机制（超时表 / session 判死 / deferred-release / detokenizer 挂的根因链）见 `docs/agent/disaggregation-mooncake.md`（2026-10-15 核实）。排查传输类问题先读它。**
+
 **PD/KV 传输铁律（2026-10-10 用户下令写死）——**
 **单台机器内的卡间 KV 传输必须走 NCCL。`--disaggregation-transfer-backend` 一律用 `nixl`（该版本的 nixl 后端即 NCCL/UCX 路径），严禁 `mooncake`。**
 - mooncake 走 RDMA/IB：本机没指定 IB 设备时日志为 `No IB devices specified for Mooncake backend, falling back to auto discovery` ⇒ P2P handshake 建不起来。

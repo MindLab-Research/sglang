@@ -907,7 +907,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora_two_stream(
                         globals()["_PD_TB_BP"] = _tb
                     _delta = torch.nn.functional.linear(_x, _ta)
                     _delta = torch.nn.functional.linear(_delta, _tb)
-                    _y_base = _y_base + _delta
+                    _y_base.add_(_delta)
                 # Parallel adapter delta: B'A'x (real weights, when available)
                 _a = getattr(lora_info, "down_lora_a_weights", None)
                 if _a is not None:
@@ -920,7 +920,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora_two_stream(
                                 _b = _b[0]
                             _delta = torch.nn.functional.linear(_x, _a)
                             _delta = torch.nn.functional.linear(_delta, _b)
-                            _y_base = _y_base + _delta
+                            _y_base.add_(_delta)
                 _combine = StandardCombineInput(hidden_states=_y_base)
         return _combine
     assert TopKOutputChecker.format_is_standard(topk_output), (
@@ -1039,7 +1039,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora_two_stream(
                                 _b = _b[0]
                             _delta = torch.nn.functional.linear(_x, _a)
                             _delta = torch.nn.functional.linear(_delta, _b)
-                            _y_base = _y_base + _delta
+                            _y_base.add_(_delta)
 
                 # Test mode: inject fixed random delta (B'A'x) to verify the
                 # delta channel. Seed=42 for determinism, scale 0.01. CACHED
@@ -1057,7 +1057,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_mxfp4_lora_two_stream(
                         globals()["_PD_TB_PD"] = _tb
                     _delta = torch.nn.functional.linear(_x, _ta)
                     _delta = torch.nn.functional.linear(_delta, _tb)
-                    _y_base = _y_base + _delta
+                    _y_base.add_(_delta)
             # capture: delta=0 (graph only contains y_base, same as base graph)
 
             return StandardCombineInput(hidden_states=_y_base)
