@@ -158,11 +158,14 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora(
         else hidden_states.new_zeros(gate_up_delta_shape)
     )
     if use_virtual_lora_store:
+        # R147 isolation: SGLANG_LORA_NO_GU_DELTA=1 routes the gate_up delta GEMM
+        # through the same None-weights skip that a down-only mount takes.
+        _no_gu = __import__("os").environ.get("SGLANG_LORA_NO_GU_DELTA") == "1"
         merged_experts_fused_moe_lora_add(
             output=gate_up_delta,
             hidden_states=hidden_states,
-            lora_a=lora_info.gate_up_lora_a_weights,
-            lora_b=lora_info.gate_up_lora_b_weights,
+            lora_a=None if _no_gu else lora_info.gate_up_lora_a_weights,
+            lora_b=None if _no_gu else lora_info.gate_up_lora_b_weights,
             topk_ids=topk_ids,
             topk_weights=topk_weights,
             token_lora_mapping=token_lora_mapping,
@@ -251,11 +254,14 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora(
         # staged shared-expert add (if any) can run on the main stream concurrent with
         # the down-LoRA shrink below; the expand waits on it via expand_wait_event.
         shared_add_done = maybe_overlap_staged_shared_add(output)
+        # R147 isolation: SGLANG_LORA_NO_VE_DELTA=1 routes the VE down delta GEMM
+        # through the same None-weights skip that a gate_up-only mount takes.
+        _no_ve = __import__("os").environ.get("SGLANG_LORA_NO_VE_DELTA") == "1"
         merged_experts_fused_moe_lora_add(
             output=output,
             hidden_states=activation_lora_input.view(-1, quant_info.intermediate_size),
-            lora_a=lora_info.down_lora_a_weights,
-            lora_b=lora_info.down_lora_b_weights,
+            lora_a=None if _no_ve else lora_info.down_lora_a_weights,
+            lora_b=None if _no_ve else lora_info.down_lora_b_weights,
             topk_ids=topk_ids,
             topk_weights=topk_weights,
             token_lora_mapping=token_lora_mapping,
@@ -285,11 +291,12 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora(
         else hidden_states.new_zeros(down_delta_shape)
     )
     if use_virtual_lora_store:
+        _no_ve2 = __import__("os").environ.get("SGLANG_LORA_NO_VE_DELTA") == "1"
         merged_experts_fused_moe_lora_add(
             output=down_delta,
             hidden_states=activation_lora_input.view(-1, quant_info.intermediate_size),
-            lora_a=lora_info.down_lora_a_weights,
-            lora_b=lora_info.down_lora_b_weights,
+            lora_a=None if _no_ve2 else lora_info.down_lora_a_weights,
+            lora_b=None if _no_ve2 else lora_info.down_lora_b_weights,
             topk_ids=topk_ids,
             topk_weights=topk_weights,
             token_lora_mapping=token_lora_mapping,
