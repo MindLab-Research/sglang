@@ -124,15 +124,23 @@ class TestSubprocessWatchdog(CustomTestCase):
         time.sleep(0.3)
         self.assertFalse(self.sigquit_triggered.is_set())
 
-    def test_normal_exit_no_sigquit(self):
+    def test_unexpected_zero_exit_triggers_sigquit(self):
         proc = self._spawn(noop_worker)
         proc.join(timeout=2)
         self._watch(proc)
-        time.sleep(0.3)
-        self.assertFalse(
-            self.sigquit_triggered.is_set(),
-            "SIGQUIT should not be triggered for normal exit (exitcode=0)",
+        self.assertTrue(
+            self.sigquit_triggered.wait(timeout=5),
+            "A persistent serving worker exiting zero must be detected",
         )
+
+    def test_expected_exit_after_stop_does_not_trigger_sigquit(self):
+        proc = self._spawn(healthy_worker)
+        monitor = self._watch(proc)
+        monitor.stop()
+        proc.terminate()
+        proc.join(timeout=2)
+        self.assertFalse(monitor._check_processes())
+        self.assertFalse(self.sigquit_triggered.is_set())
 
 
 if __name__ == "__main__":

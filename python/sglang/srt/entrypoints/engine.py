@@ -1945,7 +1945,7 @@ def _set_envs_and_config(server_args: ServerArgs):
                 logger.error(
                     "Received sigquit from a child process. It usually means the child failed."
                 )
-                kill_process_tree(os.getpid())
+                kill_process_tree(os.getpid(), exit_code=1)
 
             signal.signal(signal.SIGQUIT, launch_phase_sigquit_handler)
         else:

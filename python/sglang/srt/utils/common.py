@@ -2484,6 +2484,7 @@ def kill_process_tree(
     include_parent: bool = True,
     skip_pid: int = None,
     wait_timeout: Optional[float] = 60,
+    exit_code: int = 0,
 ):
     """Kill the process and all its child processes.
 
@@ -2492,7 +2493,8 @@ def kill_process_tree(
     returning without waiting leaves the GPU context, the pinned host memory
     and the ports held for seconds; pass `None` only where blocking is
     unacceptable, such as a `__del__`. The `parent_pid == os.getpid()` branch
-    calls `sys.exit(0)` and cannot wait for itself -- use
+    calls `sys.exit(exit_code)` if SIGKILL cannot terminate it (e.g. PID 1)
+    and cannot wait for itself -- use
     `include_parent=False` if child reap must finish first.
     """
     logger.info(
@@ -2524,7 +2526,7 @@ def kill_process_tree(
         try:
             if parent_pid == os.getpid():
                 itself.kill()
-                sys.exit(0)
+                sys.exit(exit_code)
 
             itself.kill()
 

@@ -209,8 +209,12 @@ class SubprocessWatchdog:
             logger.error(f"SubprocessWatchdog thread crashed: {e}", exc_info=True)
 
     def _check_processes(self) -> bool:
+        if self._stop_event.is_set():
+            return False
         for proc, name in zip(self._processes, self._names):
-            if proc.is_alive() or proc.exitcode == 0:
+            # These are persistent serving workers. Even exit(0) is a loss of
+            # service unless shutdown has explicitly stopped this watchdog.
+            if proc.is_alive() or proc.exitcode is None:
                 continue
 
             logger.error(
