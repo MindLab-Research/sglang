@@ -76,7 +76,7 @@ then releases that temporary weight. It does not retain complete merged models
 per adapter. This deliberately adds weight traffic and merge arithmetic to
 every forward; measure latency and peak memory before choosing it for serving.
 
-Its current supported configuration is TP1/DP1/PP1, unquantized BF16 weights,
+Its current supported configuration is DP1/PP1, unquantized BF16 weights,
 deterministic inference, eager execution, an explicit maximum LoRA rank of
 1 through 64, and dense targets only:
 
@@ -111,6 +111,56 @@ For GDN models, check the resolved request limit in startup logs as well as
 `--max-running-requests`: the Mamba state pool can cap it below the requested
 value. Reserve enough state slots for the concurrent requests and cache
 snapshots, and report observed GPU batch sizes separately from HTTP concurrency.
+
+The merged row-parallel projection reduces the locally merged output once;
+it must not enter the factorized A/B reduction path afterwards. Attention DP
+uses local attention routing and globally gathered MLP routing. Even an idle or
+base-only local attention rank must join those global metadata collectives.
+The existing attention-DP LoRA restriction still applies: adapters must be
+pinned, and the supported layout has `--attn-dp-size` equal to `--tp-size`.
+
+For Qwen3.8-27B, TP2 and TP2/attention-DP2 each passed the same-topology
+30-input, 256-token, four-round cold/hot comparison: 240 pairs and 111,184
+scores, with zero differences in all three phases. This covers the real dense
+adapter under deterministic eager BF16 execution. Larger TP/attention-DP
+layouts, adapted GDN targets in those layouts, DCP and PD require their own
+acceptance results; accepting a configuration at startup is not such a result.
+
+## Compare sequential instances on the same GPUs
+
+When D and M cannot coexist, export and seal M's original scores, stop M, then
+replay the sealed reference on D with the same GPU placement and configuration:
+
+```bash
+python benchmark/lora/compare_frozen.py reference \
+  --url http://127.0.0.1:30002 --topology tp2-dp1-pp1 \
+  --corpus /evidence/corpus.json --provenance /evidence/source.json \
+  --output /evidence/merged-reference
+# Stop M, then launch D on the same GPUs and with the same numerical settings.
+python benchmark/lora/compare_frozen.py dynamic \
+  --url http://127.0.0.1:30000 --topology tp2-dp1-pp1 \
+  --reference /evidence/merged-reference \
+  --adapter-path /adapters/example --provenance /evidence/source.json \
+  --output /evidence/dynamic-replay
+```
+
+The provenance JSON is a user-supplied source/image and input manifest. The
+client retains the resolved server configuration, responses and per-rank
+captures, hashes every reference artifact, and verifies that seal before
+loading D's adapter. It checks execution-setting equality, step/token indices
+and identical scores across sampling TP replicas. A reference-only run has
+no D/M score result. Cold/hot labels still do not establish actual cache reuse.
+Attention-DP replay loads a pinned adapter automatically. Output directories
+must be new, and the reference must remain unchanged.
+
+The experimental direct PD client adds `--prefill-url` and `--bootstrap-port`
+to both stages. It sends paired native requests with the same bootstrap room,
+retains both sides' raw responses, and joins prefill step zero with decode
+steps one onward before comparing scores. It rejects a fake transfer backend.
+The protocol unit tests use mocked endpoints; actual KV/SSM transfer,
+same-layout D/M accuracy, transfer costs and 4P4D kernels must be validated on
+real servers before claiming PD support or speed. Stop and start both sides
+of an experimental PD pair together.
 
 ## Check prefix consistency
 

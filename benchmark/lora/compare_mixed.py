@@ -20,6 +20,8 @@ class CaptureAndForce(CustomLogitProcessor):
     def __call__(self, logits, custom_param_list=None):
         import json
 
+        import torch.distributed as dist
+
         for i, params in enumerate(custom_param_list):
             step = params.get("_capture_step", 0)
             params["_capture_step"] = step + 1
@@ -31,7 +33,7 @@ class CaptureAndForce(CustomLogitProcessor):
                 "logprob": original.log_softmax(-1)[token].item(),
                 "argmax": original.argmax(-1).item(),
             }
-            with open(params["capture_file"], "a") as f:
+            with open(params["capture_file"] + f".rank-{dist.get_rank()}", "a") as f:
                 f.write(json.dumps(row) + "\n")
             logits[i].fill_(-float("inf"))
             logits[i, token] = 0
@@ -46,6 +48,10 @@ def main(args):
     assert corpus and len({c["id"] for c in corpus}) == len(corpus)
     args.output.mkdir(parents=True, exist_ok=False)
     args.capture_dir.mkdir(parents=True, exist_ok=True)
+    info = call(args.url, "/get_server_info")
+    (args.output / "server-info.json").write_text(json.dumps(info, indent=2))
+    config = info.get("server_args", info)
+    replicas = config["tp_size"] // config["attn_dp_size"]
     processor = CaptureAndForce.to_str()
     loaded = []
     references = []
@@ -57,7 +63,7 @@ def main(args):
 
     def request(ref, label):
         capture = args.capture_dir / (label + ".jsonl")
-        assert not capture.exists(), capture
+        assert not list(capture.parent.glob(capture.name + ".rank-*")), capture
         return {
             "input_ids": ref["input_ids"],
             "lora_path": ref["adapter"],
@@ -72,10 +78,11 @@ def main(args):
         }
 
     def read_scores(label, continuation):
-        rows = [
-            json.loads(s)
-            for s in (args.capture_dir / (label + ".jsonl")).read_text().splitlines()
-        ]
+        paths = sorted(args.capture_dir.glob(label + ".jsonl.rank-*"))
+        assert len(paths) == replicas, (label, paths, replicas)
+        rank_rows = [[json.loads(s) for s in p.read_text().splitlines()] for p in paths]
+        rows = rank_rows[0]
+        assert all(other == rows for other in rank_rows[1:])
         assert [r["step"] for r in rows] == list(range(args.decode_tokens))
         assert [r["token"] for r in rows] == continuation
         return [(r["logprob"], r["argmax"]) for r in rows]
@@ -85,7 +92,11 @@ def main(args):
             call(
                 args.url,
                 "/load_lora_adapter",
-                {"lora_name": adapter["name"], "lora_path": adapter["path"]},
+                {
+                    "lora_name": adapter["name"],
+                    "lora_path": adapter["path"],
+                    "pinned": config["attn_dp_size"] > 1,
+                },
             )
             loaded.append(adapter["name"])
         for adapter in [None] + names:
