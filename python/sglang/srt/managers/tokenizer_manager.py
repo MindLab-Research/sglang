@@ -3781,7 +3781,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             if lora_path not in self.lora_ref_cache:
                 raise ValueError(
-                    f"Got LoRA adapter that has never been loaded: {lora_path}\n"
+                    f"Got LoRA adapter that has never been loaded or was explicitly unloaded: {lora_path}\n"
                     f"All loaded adapters: {self.lora_ref_cache.keys()}."
                 )
 
@@ -3792,7 +3792,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     lora_name=new_lora_ref.lora_name,
                     lora_path=new_lora_ref.lora_path,
                     pinned=new_lora_ref.pinned,
-                )
+                ),
+                _expected_lora_ref=new_lora_ref,
             )
             if (
                 not load_result.success

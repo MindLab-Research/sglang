@@ -656,6 +656,8 @@ class TokenizerControlMixin:
         self: TokenizerManager,
         obj: LoadLoRAAdapterReqInput,
         _: Optional[fastapi.Request] = None,
+        *,
+        _expected_lora_ref: Optional[LoRARef] = None,
     ) -> LoadLoRAAdapterReqOutput:
         self.auto_create_handle_loop()
 
@@ -675,6 +677,17 @@ class TokenizerControlMixin:
             )
 
             async with self.lora_update_lock:
+                # An implicit reload may have waited behind an explicit unload
+                # or replacement. Recheck the cached generation under the same
+                # lock before restoring any weights or registry entries.
+                if (
+                    _expected_lora_ref is not None
+                    and self.lora_ref_cache.get(obj.lora_name) is not _expected_lora_ref
+                ):
+                    raise ValueError(
+                        f"LoRA adapter '{obj.lora_name}' was unloaded or replaced "
+                        "before its implicit reload."
+                    )
                 if obj.lora_name in self.pending_lora_unloads:
                     raise ValueError(
                         f"LoRA adapter '{obj.lora_name}' has an incomplete unload. "
@@ -850,6 +863,22 @@ class TokenizerControlMixin:
             )
 
             async with self.lora_update_lock:
+                # Explicit removal revokes automatic reload immediately. LRU
+                # eviction calls _unload_lora_adapter_locked directly and keeps
+                # this metadata so an evicted adapter can still be restored.
+                cached = self.lora_ref_cache.pop(obj.lora_name, None)
+                if (
+                    cached is not None
+                    and obj.lora_name not in self.lora_registry.get_all_adapters()
+                    and obj.lora_name not in self.pending_lora_unloads
+                ):
+                    return UnloadLoRAAdapterReqOutput(
+                        success=True,
+                        loaded_adapters={
+                            name: ref.lora_path
+                            for name, ref in self.lora_registry.get_all_adapters().items()
+                        },
+                    )
                 return await self._unload_lora_adapter_locked(obj)
         except ValueError as e:
             return UnloadLoRAAdapterReqOutput(success=False, error_message=str(e))

@@ -16,10 +16,12 @@
 
 import asyncio
 import unittest
+from types import MethodType
 from unittest.mock import AsyncMock, Mock
 
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.io_struct import (
+    GenerateReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
     LoRAUpdateOutput,
@@ -140,6 +142,124 @@ class TestMergeLoRAUpdateResults(CustomTestCase):
                 for duplicate in (True, False):
                     with self.subTest(from_tensors=from_tensors, duplicate=duplicate):
                         asyncio.run(scenario(from_tensors, duplicate))
+
+
+class TestExplicitLoRAUnload(CustomTestCase):
+    def _manager(self, *, registered=True):
+        from sglang.srt.managers.tokenizer_manager import TokenizerManager
+
+        ref = LoRARef(lora_name="a", lora_path="path-a", pinned=False)
+        manager = TokenizerControlMixin()
+        manager.auto_create_handle_loop = Mock()
+        manager.lora_update_lock = asyncio.Lock()
+        manager.lora_registry = LoRARegistry([ref] if registered else [])
+        manager.pending_lora_unloads = {}
+        manager.lora_ref_cache = {"a": ref}
+        manager.update_lora_adapter_communicator = AsyncMock(return_value=[_ok()])
+        manager._resolve_lora_path = MethodType(
+            TokenizerManager._resolve_lora_path, manager
+        )
+        return manager, ref
+
+    def test_explicit_unload_rejects_new_requests_while_draining(self):
+        async def scenario():
+            manager, original = self._manager()
+            await manager.lora_registry.acquire("a")
+            unload = asyncio.create_task(
+                manager.unload_lora_adapter(UnloadLoRAAdapterReqInput(lora_name="a"))
+            )
+            for _ in range(20):
+                if "a" not in manager.lora_registry.get_all_adapters():
+                    break
+                await asyncio.sleep(0)
+            self.assertNotIn("a", manager.lora_registry.get_all_adapters())
+            self.assertNotIn("a", manager.lora_ref_cache)
+            self.assertFalse(unload.done())
+            manager.update_lora_adapter_communicator.assert_not_awaited()
+            with self.assertRaisesRegex(ValueError, "explicitly unloaded"):
+                await manager._resolve_lora_path(GenerateReqInput(lora_path="a"))
+            await manager.lora_registry.release(original.lora_id)
+            self.assertTrue((await unload).success)
+            with self.assertRaisesRegex(ValueError, "explicitly unloaded"):
+                await manager._resolve_lora_path(GenerateReqInput(lora_path="a"))
+            # Reusing the alias requires an explicit load and gets a fresh ID.
+            self.assertTrue(
+                (
+                    await manager.load_lora_adapter(
+                        LoadLoRAAdapterReqInput(lora_name="a", lora_path="path-b")
+                    )
+                ).success
+            )
+            request = GenerateReqInput(lora_path="a")
+            await manager._resolve_lora_path(request)
+            self.assertNotEqual(request.lora_id, original.lora_id)
+            self.assertEqual(manager.lora_ref_cache["a"].lora_path, "path-b")
+            await manager.lora_registry.release(request.lora_id)
+
+        with get_context().override_server_args(enable_lora=True, dp_size=1):
+            asyncio.run(scenario())
+
+    def test_lru_eviction_keeps_implicit_reload_available(self):
+        async def scenario():
+            manager, original = self._manager()
+            async with manager.lora_update_lock:
+                result = await manager._unload_lora_adapter_locked(
+                    UnloadLoRAAdapterReqInput(lora_name="a")
+                )
+            self.assertTrue(result.success)
+            self.assertIs(manager.lora_ref_cache["a"], original)
+            request = GenerateReqInput(lora_path="a")
+            await manager._resolve_lora_path(request)
+            self.assertEqual(
+                manager.lora_registry.get_all_adapters()["a"].lora_path, "path-a"
+            )
+            self.assertEqual(manager.update_lora_adapter_communicator.await_count, 2)
+            await manager.lora_registry.release(request.lora_id)
+
+        with get_context().override_server_args(enable_lora=True, dp_size=1):
+            asyncio.run(scenario())
+
+    def test_queued_reload_cannot_resurrect_explicitly_removed_evicted_adapter(self):
+        async def scenario():
+            manager, _ = self._manager(registered=False)
+            await manager.lora_update_lock.acquire()
+            unload = asyncio.create_task(
+                manager.unload_lora_adapter(UnloadLoRAAdapterReqInput(lora_name="a"))
+            )
+            await asyncio.sleep(0)
+            reload = asyncio.create_task(
+                manager._resolve_lora_path(GenerateReqInput(lora_path="a"))
+            )
+            await asyncio.sleep(0)
+            manager.lora_update_lock.release()
+            self.assertTrue((await unload).success)
+            with self.assertRaisesRegex(ValueError, "unloaded or replaced"):
+                await reload
+            self.assertEqual(manager.lora_registry.get_all_adapters(), {})
+            self.assertEqual(manager.lora_ref_cache, {})
+            manager.update_lora_adapter_communicator.assert_not_awaited()
+
+        with get_context().override_server_args(enable_lora=True, dp_size=1):
+            asyncio.run(scenario())
+
+    def test_failed_unload_stays_closed_and_is_retryable(self):
+        async def scenario():
+            manager, original = self._manager()
+            manager.update_lora_adapter_communicator.side_effect = [
+                [_err("rank failed")],
+                [_ok()],
+            ]
+            request = UnloadLoRAAdapterReqInput(lora_name="a")
+            self.assertFalse((await manager.unload_lora_adapter(request)).success)
+            self.assertNotIn("a", manager.lora_ref_cache)
+            self.assertEqual(manager.pending_lora_unloads, {"a": original.lora_id})
+            with self.assertRaisesRegex(ValueError, "explicitly unloaded"):
+                await manager._resolve_lora_path(GenerateReqInput(lora_path="a"))
+            self.assertTrue((await manager.unload_lora_adapter(request)).success)
+            self.assertEqual(manager.pending_lora_unloads, {})
+
+        with get_context().override_server_args(enable_lora=True, dp_size=1):
+            asyncio.run(scenario())
 
 
 if __name__ == "__main__":
