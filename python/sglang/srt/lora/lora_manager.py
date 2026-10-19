@@ -1037,7 +1037,7 @@ class LoRAManager:
         self.memory_pool = LoRAMemoryPool(
             base_hf_config=self.base_hf_config,
             max_loras_per_batch=self.max_loras_per_batch,
-            dtype=self.dtype,
+            dtype=getattr(self.lora_backend, "factor_dtype", self.dtype),
             max_lora_rank=self.max_lora_rank,
             target_modules=self.target_modules,
             base_model=self.base_model,

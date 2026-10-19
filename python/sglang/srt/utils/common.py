@@ -4791,6 +4791,14 @@ SUPPORTED_LORA_TARGET_MODULES = [
     "down_proj",
     "qkv_proj",
     "gate_up_proj",
+    # Qwen GDN projections, including their checkpoint and packed names.
+    "in_proj_qkv",
+    "in_proj_z",
+    "in_proj_qkvz",
+    "in_proj_b",
+    "in_proj_a",
+    "in_proj_ba",
+    "out_proj",
     "embed_tokens",
     "lm_head",
     # Inkling attention projections (merged q/k/v/r and its row-parallel output).

@@ -501,12 +501,14 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
             self.start_lora_a_overlap(input_)
 
         bias = self.base_layer.bias if not self.base_layer.skip_bias_add else None
-        output_parallel = self.base_layer.quant_method.apply(
-            self.base_layer, input_, bias
-        )
-
-        if lora_active:
-            output_parallel = self.apply_lora(output_parallel, input_)
+        if lora_active and getattr(self.lora_backend, "merges_weights", False):
+            output_parallel = self.lora_backend.run_merged_linear(self, input_, bias)
+        else:
+            output_parallel = self.base_layer.quant_method.apply(
+                self.base_layer, input_, bias
+            )
+            if lora_active:
+                output_parallel = self.apply_lora(output_parallel, input_)
 
         if self.base_layer.gather_output:
             output = tensor_model_parallel_all_gather(output_parallel)
@@ -821,9 +823,17 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
             if (tp_rank > 0 or self.base_layer.skip_bias_add)
             else self.base_layer.bias
         )
-        output_parallel = self.base_layer.quant_method.apply(
-            self.base_layer, input_parallel, bias=bias_
+        merged_lora = lora_active and getattr(
+            self.lora_backend, "merges_weights", False
         )
+        if merged_lora:
+            output_parallel = self.lora_backend.run_merged_linear(
+                self, input_parallel, bias_
+            )
+        else:
+            output_parallel = self.base_layer.quant_method.apply(
+                self.base_layer, input_parallel, bias=bias_
+            )
 
         should_reduce = (
             self.base_layer.reduce_results
@@ -853,7 +863,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
                 base_output=output_,
             )
         else:
-            if lora_active:
+            if lora_active and not merged_lora:
                 output_parallel = self.apply_lora(output_parallel, input_parallel)
             if should_reduce:
                 output_ = all_reduce(output_parallel)

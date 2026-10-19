@@ -67,6 +67,39 @@ separately for each phase. Maximum error and argmax agreement are also reported.
 A short run passing, a kernel test passing, or HF/PEFT agreement does not establish
 end-to-end acceptance. Do not relax thresholds to accommodate observed failures.
 
+## Experimental BF16 merged-rounding backend
+
+The opt-in `--lora-backend merged_bf16` backend keeps one immutable BF16 base
+model and FP32 adapter factors. For each active adapter and projection, it
+computes `(W.float() + (B @ A) * scale).bfloat16()`, runs the BF16 projection,
+then releases that temporary weight. It does not retain complete merged models
+per adapter. This deliberately adds weight traffic and merge arithmetic to
+every forward; measure latency and peak memory before choosing it for serving.
+
+Its current supported configuration is TP1/DP1/PP1, unquantized BF16 weights,
+deterministic inference, eager execution, an explicit maximum LoRA rank of
+1 through 64, and dense targets only:
+
+```text
+--lora-backend merged_bf16 --max-lora-rank 32
+--lora-target-modules qkv_proj o_proj gate_up_proj down_proj in_proj_qkvz in_proj_ba out_proj
+--enable-deterministic-inference
+--cuda-graph-backend-decode disabled --cuda-graph-backend-prefill disabled
+--attention-backend triton --linear-attn-prefill-backend triton
+--bf16-gemm-backend torch
+```
+
+Speculative decoding, overlap loading, embeddings, LM head and MoE targets
+are rejected. Qwen GDN input/output projections use the same packed dense
+path. TF32 must remain disabled. Existing backends keep their original
+factor dtype and projection path. Packed QKV/gate-up projections retain their
+separate A factors and leave any unadapted output suffix unchanged. Native
+cuBLAS FP32 `mm.out` and a separate scale/add precede BF16 rounding. The merge
+GEMM uses fixed weight shapes and retains cuBLAS under the batch-invariant
+operator overrides; the BF16 activation GEMM remains deterministic. Equality with
+the independent reference must still be established by the full comparison
+matrix above, including real adapters, mixed routing and long contexts.
+
 ## Check prefix consistency
 
 Shape-dependent arithmetic can make an unchanged causal prefix score differently

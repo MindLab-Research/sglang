@@ -59,3 +59,10 @@ def get_backend_from_name(name: str) -> Type[BaseLoRABackend]:
         raise ValueError(f"Invalid backend: {name}")
     lora_backend = LORA_SUPPORTED_BACKENDS[name]()
     return lora_backend
+
+
+@register_lora_backend("merged_bf16")
+def create_merged_bf16_backend():
+    from sglang.srt.lora.backend.merged_bf16_backend import MergedBF16LoRABackend
+
+    return MergedBF16LoRABackend
