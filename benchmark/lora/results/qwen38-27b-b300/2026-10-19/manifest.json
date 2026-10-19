@@ -1,0 +1,18 @@
+{
+  "status": "Partial experimental snapshot; full multi-GPU/DCP/4P4D goal is not accepted.",
+  "as_of_utc": "2026-10-19T18:25:00Z",
+  "model": "Qwen3.8-27B",
+  "model_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+  "cache_runtime_commit": "7e6ef6016cd951b92157051723b91c4474da5400",
+  "cache_runtime_image": "sha256:c342c0de02976dd3fa3ca83cf1cdd5323a84ee0c82c775dfe1949ba78ae877f7",
+  "external_client_commit": "2d11fdbf218fe0fe0e364002887b3fb3e64cb7d1",
+  "topology_runtime_commit": "a589b336780051bbf26755cf1ea0aba56fbd029c",
+  "scope": "Dedicated eight-B300 host; individual controls used the documented subset of GPUs while other experiments ran. Throughput ratios are observations, not isolated causal attribution. TP4 pure-base and larger topology/PD controls pending. No raw prompts, generated text, token IDs, or weights are included.",
+  "files_sha256": {
+    "cache-threeway-comparison-r49.json": "0b4b6bc5082b558673cdb486928183353d28f8e413f6d97ab7df1fb1df287f38",
+    "cache-threeway-profile-audit-r49.json": "a149614e2886da7ba32f906bd05bf2780a70bc3dbf459c3ff0ddd9520651088f",
+    "tp4-kernel-audit-r48.json": "9f13c19aad112c2efb24917811a5cc582e141893aa37deb06925ad864879ec7c",
+    "tp4-independent-audit-r40.json": "3f2938d6d3dc7a2589370ac3739c2d4d0ca38ab19009d26a1ef1fa8fa5ffbe37"
+  },
+  "topology_runtime_image": "sha256:a2b256e2b1370dc3968977d0c4af04a7f908ed0d4dfa54f3631c13730a117288"
+}

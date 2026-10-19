@@ -126,9 +126,11 @@ The cached trace had no repeated FP32 weight-merge or rounding kernels, versus
 and 1,056 GDN/convolution events. Trace duration sums are not end-to-end wall-time
 shares. These warmed measurements do not cover first projection fill, multiple
 active adapters, actual KV-prefix restoration or their lifecycle acceptance.
-Raw requests, resolved settings and trace hashes are audited in
-`cache-threeway-comparison-r49.json` and `cache-threeway-profile-audit-r49.json`
-under the dedicated experiment's `qwen38-mol-multigpu-20261019` evidence root.
+The [aggregate result snapshot](results/qwen38-27b-b300/2026-10-19/manifest.json)
+includes resolved execution settings, these metrics and raw-artifact hashes;
+it contains no prompts, output token IDs or weights. Complete raw requests and
+traces remain under the dedicated experiment's
+`qwen38-mol-multigpu-20261019` evidence root.
 
 Its current supported configuration is DP1/PP1, unquantized BF16 weights,
 deterministic inference, eager execution, an explicit maximum LoRA rank of
@@ -186,6 +188,8 @@ all-reduces. This short profile does not establish a wall-time bottleneck or a
 TP speedup. TP4's pure-base performance control remains pending. Larger
 TP/attention-DP layouts, other adapted GDN layouts, DCP and PD require their own
 acceptance results; accepting a configuration at startup is not such a result.
+The same result snapshot includes TP4's per-phase accuracy audit and all four
+dynamic rank trace hashes and kernel counts.
 
 ## Compare sequential instances on the same GPUs
 

@@ -1,0 +1,42 @@
+{
+  "scope": "10-step short prefill/decode profile on TP4; counts from all4 actual rank traces, gzip hashes verified. Summed durations include waiting and tracing overhead; do not infer wall-time shares.",
+  "traces": [
+    {
+      "trace": "1792433335.3701348-TP-0.trace.json.gz",
+      "kernel_events": 17595,
+      "FP32_merge": 2560,
+      "merge_round": 2560,
+      "tree_allreduce": 1290,
+      "tree_summed_ms": 1717.0968150000006,
+      "sha256": "94b029ccace243ea51da7b80f838019329b12a572359148eb19ec4eca8cd7897"
+    },
+    {
+      "trace": "1792433335.3701348-TP-1.trace.json.gz",
+      "kernel_events": 17595,
+      "FP32_merge": 2560,
+      "merge_round": 2560,
+      "tree_allreduce": 1290,
+      "tree_summed_ms": 1495.6149400000008,
+      "sha256": "5e6d14b9a4f44ee96e9179896ab7a8f8e35be7d30f311014d376d4abd85b8187"
+    },
+    {
+      "trace": "1792433335.3701348-TP-2.trace.json.gz",
+      "kernel_events": 17595,
+      "FP32_merge": 2560,
+      "merge_round": 2560,
+      "tree_allreduce": 1290,
+      "tree_summed_ms": 2163.830282999999,
+      "sha256": "07491fabe6b9b251f1ee86521cebe814943935445a7e68a89ca77d531e09438f"
+    },
+    {
+      "trace": "1792433335.3701348-TP-3.trace.json.gz",
+      "kernel_events": 17595,
+      "FP32_merge": 2560,
+      "merge_round": 2560,
+      "tree_allreduce": 1290,
+      "tree_summed_ms": 112.53989499999999,
+      "sha256": "6213ce46b60e28f48da27cf0080350e1e9f4b26fd09cd2f56f743f8ed7c2812f"
+    }
+  ],
+  "total_cuda_events": 70380
+}

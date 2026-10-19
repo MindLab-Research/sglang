@@ -1,0 +1,34 @@
+{
+  "d": {
+    "events": 8719,
+    "categories": {
+      "GEMM / GEMV (dtype not inferred)": 4340,
+      "other": 2626,
+      "GDN / convolution": 1056,
+      "copy / routing": 697
+    },
+    "trace_sha256": "9d489b945dd8f7925b9e222781086f8c2312534163a8cbfd8e7daf762e82fcb4"
+  },
+  "nocache": {
+    "events": 16399,
+    "categories": {
+      "FP32 GEMM": 2560,
+      "LoRA scale/add/BF16 store": 2560,
+      "GEMM / GEMV (dtype not inferred)": 4340,
+      "copy / routing": 3257,
+      "other": 2626,
+      "GDN / convolution": 1056
+    },
+    "trace_sha256": "f85ea3a41a374c7f54f6de8ebb3fe129693420fce58121a1a3807b497afae614"
+  },
+  "m": {
+    "events": 8537,
+    "categories": {
+      "GEMM / GEMV (dtype not inferred)": 4340,
+      "other": 2530,
+      "GDN / convolution": 1056,
+      "copy / routing": 611
+    },
+    "trace_sha256": "64087494551937c0b6678994a9a54753f3a0cd57a6c5032a8d1fd844e59150bd"
+  }
+}
