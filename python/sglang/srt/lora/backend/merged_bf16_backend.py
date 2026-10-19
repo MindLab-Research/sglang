@@ -98,14 +98,13 @@ class MergedBF16LoRABackend(TritonLoRABackend):
     name = "merged_bf16"
     merges_weights = True
     factor_dtype = torch.float32
-    supports_dp_attention = False
+    supports_dp_attention = True
     supports_prefill_cuda_graph = False
     skip_inactive_lora_batches = True
 
     def __init__(self, max_loras_per_batch, device, server_args, **kwargs):
         if (
-            server_args.tp_size != 1
-            or server_args.dp_size != 1
+            server_args.dp_size != 1
             or server_args.pp_size != 1
             or not cuda_graph_fully_disabled()
             or torch.backends.cuda.matmul.allow_tf32
@@ -117,12 +116,15 @@ class MergedBF16LoRABackend(TritonLoRABackend):
             or not 0 < server_args.max_lora_rank <= 64
         ):
             raise ValueError(
-                "merged_bf16 requires TP1/DP1/PP1, eager deterministic inference, "
+                "merged_bf16 requires DP1/PP1, eager deterministic inference, "
                 "unquantized weights, IEEE FP32 matmul, explicit max-lora-rank <=64, "
                 "no speculation or overlap loading"
             )
         super().__init__(max_loras_per_batch, device, **kwargs)
         self.merge_groups = []
+        self.global_merge_groups = []
+        self._merge_ranks = []
+        self._merge_scalings = []
 
     def set_layer_adapter_presence(self, layer, slot, present):
         # Updated by the pool on every slot load, including slot reuse. No
@@ -134,6 +136,9 @@ class MergedBF16LoRABackend(TritonLoRABackend):
     def reset_batch_state(self):
         super().reset_batch_state()
         self.merge_groups = []
+        self.global_merge_groups = []
+        self._merge_ranks = []
+        self._merge_scalings = []
 
     def validate_lora_targets(self, base_model, target_modules):
         from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
@@ -183,23 +188,47 @@ class MergedBF16LoRABackend(TritonLoRABackend):
         )
         if len(weight_indices) != len(lengths):
             raise ValueError("merged_bf16 routing length mismatch")
+        self._merge_ranks = list(lora_ranks)
+        self._merge_scalings = list(scalings)
+        self.global_merge_groups = []
+        self.merge_groups = self._make_merge_groups(
+            weight_indices, lengths, self.batch_info.expected_tokens
+        )
+
+    def _make_merge_groups(self, weight_indices, lengths, expected_tokens):
         groups = {}
         start = 0
         for slot, length in zip(weight_indices, lengths):
             groups.setdefault(slot, []).extend(range(start, start + length))
             start += length
-        if start != self.batch_info.expected_tokens:
+        if start != expected_tokens:
             raise ValueError("merged_bf16 routing does not cover all input tokens")
-        self.merge_groups = [
+        return [
             (
                 slot,
-                lora_ranks[slot],
-                scalings[slot],
+                self._merge_ranks[slot],
+                self._merge_scalings[slot],
                 torch.tensor(rows, dtype=torch.long, device=self.device),
             )
             for slot, rows in groups.items()
             if rows
         ]
+
+    def prepare_global_lora_batch(self, forward_batch):
+        previous_local = self.batch_info
+        super().prepare_global_lora_batch(forward_batch)
+        # Global eager routing is token ordered, including padding and tokens
+        # from otherwise idle ranks. Copy once per batch, never once per layer.
+        if self.batch_info is not previous_local:
+            indices = self.batch_info.weight_indices.tolist()
+            self.merge_groups = self._make_merge_groups(
+                indices, [1] * len(indices), self.batch_info.expected_tokens
+            )
+        if self.global_batch_info is not None:
+            indices = self.global_batch_info.weight_indices.tolist()
+            self.global_merge_groups = self._make_merge_groups(
+                indices, [1] * len(indices), self.global_batch_info.expected_tokens
+            )
 
     def run_merged_linear(self, layer, x, bias):
         a = getattr(layer, "A_buffer", None)
@@ -208,9 +237,13 @@ class MergedBF16LoRABackend(TritonLoRABackend):
             a, b = layer.A_buffer_qkv, layer.B_buffer_qkv
         weight = layer.base_layer.weight
         present = getattr(layer, "merged_bf16_adapter_present", None)
+        routing = self.merge_groups
+        global_info = getattr(self, "global_batch_info", None)
+        if global_info is not None and self.get_batch_info() is global_info:
+            routing = self.global_merge_groups
         groups = [
             (slot, rank if present is None or present[slot] else 0, scale, rows)
-            for slot, rank, scale, rows in self.merge_groups
+            for slot, rank, scale, rows in routing
         ]
         if not any(rank for _, rank, _, _ in groups):
             return F.linear(x, weight, bias)

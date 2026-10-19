@@ -849,7 +849,10 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
             all_reduce = get_parallel().attn_tp_group.all_reduce
         else:
             all_reduce = tensor_model_parallel_all_reduce
-        if lora_active and should_reduce:
+        # The merged backend already included the complete local weight
+        # update before projection. Reduce that result once; the factorized
+        # path below would add the adapter a second time under TP.
+        if lora_active and should_reduce and not merged_lora:
             lora_a_output = self.lora_backend.run_lora_a_sgemm(
                 input_parallel, self.A_buffer
             )

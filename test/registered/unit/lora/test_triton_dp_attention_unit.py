@@ -8,7 +8,6 @@ from unittest.mock import patch
 
 import pytest
 import torch
-
 from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.layers.layer_boundary import (
     NORM_QUANT_READOUT,
@@ -20,6 +19,7 @@ from sglang.srt.layers.layer_boundary import (
 from sglang.srt.layers.layer_boundary.contracts import BatchVariant, EntryPath
 from sglang.srt.layers.layer_boundary.prepare import _run_entry, _update_read
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
+from sglang.srt.lora.backend.merged_bf16_backend import MergedBF16LoRABackend
 from sglang.srt.lora.backend.triton_backend import (
     TritonLoRABackend,
     gather_dp_attention_lora_batch_info,
@@ -106,11 +106,20 @@ class _LocalOnlyLoRABackend(BaseLoRABackend):
 class TestDPAttentionBackendContract(CustomTestCase):
     def test_manager_requires_global_routing_only_for_dp_attention(self):
         """DPA must not proceed with local-only routing; non-DPA remains supported."""
-        for attn_dp_enabled in (False, True):
-            with self.subTest(attn_dp_enabled=attn_dp_enabled):
+        for attn_dp_enabled, local_base_only in (
+            (False, False),
+            (True, False),
+            (True, True),
+        ):
+            with self.subTest(
+                attn_dp_enabled=attn_dp_enabled, local_base_only=local_base_only
+            ):
                 backend = _LocalOnlyLoRABackend(
                     max_loras_per_batch=3, device=torch.device("cpu")
                 )
+                # An inactive local rank must still join global collectives
+                # when a different attention-DP rank has an adapter.
+                backend.skip_inactive_lora_batches = True
                 pool = LoRAMemoryPool.__new__(LoRAMemoryPool)
                 pool.max_loras_per_batch = 3
                 pool.uid_to_buffer_id = {None: 0, "adapter": 1}
@@ -136,7 +145,7 @@ class TestDPAttentionBackendContract(CustomTestCase):
                     seq_lens=tokens,
                     out_cache_loc=tokens,
                     seq_lens_sum=0,
-                    lora_ids=[None, "adapter"],
+                    lora_ids=[None, None] if local_base_only else [None, "adapter"],
                 )
                 tp_group = SimpleNamespace(
                     all_gather_object=lambda ids: [ids, ["adapter"]]
@@ -156,10 +165,14 @@ class TestDPAttentionBackendContract(CustomTestCase):
                 ):
                     manager.prepare_lora_batch(forward_batch)
 
-                self.assertEqual(_routes(backend.batch_info), [0, 1])
+                self.assertEqual(
+                    _routes(backend.batch_info), [0, 0] if local_base_only else [0, 1]
+                )
                 self.assertEqual(backend.batch_info.lora_ranks.tolist(), [0, 8, 0])
                 self.assertEqual(backend.batch_info.scalings.tolist(), [0.0, 2.0, 0.0])
-                self.assertTrue(backend.batch_info.has_active_lora)
+                self.assertEqual(
+                    backend.batch_info.has_active_lora, not local_base_only
+                )
 
 
 def test_layout_selects_routing_without_shape_inference():
@@ -175,6 +188,70 @@ def test_layout_selects_routing_without_shape_inference():
     with get_forward().scoped(lora_batch_layout=LoRABatchLayout.TP_GLOBAL):
         assert _routes(backend._sgemm_info()) == [2, 1]
     assert _routes(backend._sgemm_info()) == [1, 0]
+
+
+@pytest.mark.parametrize("local_ids,padded", [([1, 0], 2), ([1], 2), ([], 0)])
+def test_merged_backend_uses_explicit_global_routing(monkeypatch, local_ids, padded):
+    backend = MergedBF16LoRABackend.__new__(MergedBF16LoRABackend)
+    TritonLoRABackend.__init__(backend, 3, torch.device("cpu"))
+    backend._merge_ranks = [0, 2, 2]
+    backend._merge_scalings = [0, 1.5, 0.5]
+    backend.batch_info = _batch_info(local_ids, [1] * len(local_ids))
+    backend.merge_groups = backend._make_merge_groups(
+        local_ids, [1] * len(local_ids), len(local_ids)
+    )
+    backend.global_merge_groups = []
+    backend.has_global_active_lora = True
+    global_ids = local_ids + [0] * (padded - len(local_ids)) + [2, 2]
+
+    def gather(output, local, forward_batch):
+        assert local.tolist() == global_ids[:padded]
+        output.copy_(torch.tensor(global_ids, dtype=torch.int32))
+
+    monkeypatch.setattr(
+        "sglang.srt.lora.backend.triton_backend.dp_gather_replicate", gather
+    )
+    backend.prepare_global_lora_batch(
+        SimpleNamespace(
+            global_num_tokens_cpu=[padded, 2],
+            global_num_tokens_for_logprob_cpu=None,
+            is_extend_in_batch=False,
+        )
+    )
+    if not local_ids:
+        # The manager clears this after all idle-rank collectives complete.
+        backend.batch_info = None
+    torch.manual_seed(89)
+    layer = SimpleNamespace(
+        base_layer=SimpleNamespace(weight=torch.randn(4, 8).bfloat16()),
+        A_buffer=torch.randn(3, 2, 8) * 0.1,
+        B_buffer=torch.randn(3, 4, 2) * 0.1,
+        output_offset_cpu=torch.tensor([0, 4]),
+    )
+    for layout, ids in (
+        (LoRABatchLayout.TP_GLOBAL, global_ids),
+        (LoRABatchLayout.DP_LOCAL, global_ids[:padded]),
+    ):
+        x = torch.randn(len(ids), 8).bfloat16()
+        with get_forward().scoped(lora_batch_layout=layout):
+            actual = backend.run_merged_linear(layer, x, None)
+        expected = []
+        for i, slot in enumerate(ids):
+            w = layer.base_layer.weight
+            if slot:
+                w = (
+                    w.float()
+                    + (layer.B_buffer[slot] @ layer.A_buffer[slot])
+                    * backend._merge_scalings[slot]
+                ).bfloat16()
+            expected.append(torch.nn.functional.linear(x[i : i + 1], w))
+        if expected:
+            torch.testing.assert_close(actual, torch.cat(expected), atol=0, rtol=0)
+        else:
+            assert actual.shape == (0, 4)
+    backend.reset_batch_state()
+    assert backend.merge_groups == backend.global_merge_groups == []
+    assert backend.batch_info is backend.global_batch_info is None
 
 
 @pytest.mark.parametrize(

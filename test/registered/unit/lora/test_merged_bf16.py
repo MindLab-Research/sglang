@@ -73,7 +73,6 @@ class TestMergedBF16Configuration(unittest.TestCase):
 
     def test_rejects_unsupported_execution_modes(self):
         cases = [
-            {"tp_size": 2},
             {"dp_size": 2},
             {"pp_size": 2},
             {"enable_deterministic_inference": False},
@@ -91,7 +90,7 @@ class TestMergedBF16Configuration(unittest.TestCase):
                     "sglang.srt.lora.backend.merged_bf16_backend.cuda_graph_fully_disabled",
                     return_value=True,
                 ),
-                self.assertRaisesRegex(ValueError, "requires TP1"),
+                self.assertRaisesRegex(ValueError, "requires DP1/PP1"),
             ):
                 MergedBF16LoRABackend(4, torch.device("cpu"), self.args(**overrides))
         with (
@@ -102,6 +101,16 @@ class TestMergedBF16Configuration(unittest.TestCase):
             self.assertRaisesRegex(ValueError, "eager deterministic"),
         ):
             MergedBF16LoRABackend(4, torch.device("cpu"), self.args())
+
+    def test_tensor_parallel_configuration_is_not_rejected(self):
+        for tp_size in (1, 2, 4, 8):
+            with self.subTest(tp_size=tp_size), patch(
+                "sglang.srt.lora.backend.merged_bf16_backend.cuda_graph_fully_disabled",
+                return_value=True,
+            ):
+                MergedBF16LoRABackend(
+                    4, torch.device("cpu"), self.args(tp_size=tp_size)
+                )
 
     def test_rejects_unsupported_targets(self):
         backend = object.__new__(MergedBF16LoRABackend)

@@ -505,8 +505,10 @@ class LoRAManager:
         # routing for their adapted forwards and want all-base batches to run
         # through the plain model path.  Clear any routing retained by the
         # preceding adapted forward before inspecting CUDA-graph metadata.
-        if self.lora_backend.skip_inactive_lora_batches and not any(
-            uid is not None for uid in forward_batch.lora_ids
+        if (
+            self.lora_backend.skip_inactive_lora_batches
+            and not self.attn_dp_enabled
+            and not any(uid is not None for uid in forward_batch.lora_ids)
         ):
             self.reset_lora_batch()
             return
