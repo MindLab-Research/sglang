@@ -193,6 +193,10 @@ def main(args):
                         "case": case["id"],
                         "round": repeat,
                         "cache": cache,
+                        "cached_tokens": {
+                            side: result["meta_info"].get("cached_tokens")
+                            for side, result in results.items()
+                        },
                         "prompt_tokens": len(prompt),
                         "continuation_tokens": len(continuation),
                         "elapsed_s": time.monotonic() - started,
@@ -234,6 +238,11 @@ def main(args):
         "rounds": args.rounds,
         "decode_tokens": args.decode_tokens,
         "cache_modes": ["cold", "hot"],
+        "cache_mode_note": (
+            "hot means no explicit flush; scoring from logprob_start_len=0 "
+            "can prevent prompt prefix reuse. Check per-case cached_tokens; "
+            "this run does not establish prefix-cache restore correctness."
+        ),
         "gates": {"mean_abs_nat": 0.01, "p99_abs_nat": 0.1},
         "scores": {phase: stats(pairs) for phase, pairs in all_pairs.items()},
         "repeat_noise": {

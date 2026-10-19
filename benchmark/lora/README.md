@@ -44,6 +44,9 @@ The corpus is a JSON list of objects with unique `id` and integer `input_ids`.
 Defaults are 30 inputs, 256 continuation tokens, four rounds, cold and hot cache.
 Reduced `--limit`, `--decode-tokens` and `--rounds` runs are diagnostics, not
 completion of that matrix. Output directories must be new.
+`hot` means no explicit cache flush. Scoring every prompt token from position
+zero can prevent prefix reuse; inspect per-case `cached_tokens` and test actual
+cache restores separately.
 
 M generates a common continuation first. The processor then records unmodified
 FP32 log-softmax and argmax before forcing each common token in both servers.
@@ -58,3 +61,29 @@ logprob gates are mean absolute difference <= 0.01 nat and P99 <= 0.1 nat,
 separately for each phase. Maximum error and argmax agreement are also reported.
 A short run passing, a kernel test passing, or HF/PEFT agreement does not establish
 end-to-end acceptance. Do not relax thresholds to accommodate observed failures.
+
+## Check prefix consistency
+
+Shape-dependent arithmetic can make an unchanged causal prefix score differently
+when more tokens follow it. Isolate this within each server before attributing a
+dynamic-versus-merged difference to LoRA:
+
+```bash
+python benchmark/lora/compare_prefix.py \
+  --url http://127.0.0.1:30000 --corpus /evidence/corpus.json \
+  --output /evidence/prefix-base
+```
+
+The longest prompt is selected by default; `--case-id` selects one explicitly.
+`--positions` supplies prefix lengths. Optional `--adapter-name` and
+`--adapter-path` load and score an adapter. The script flushes before every
+request, asserts identical target token IDs, and retains full raw responses.
+It changes the experiment server's cache and adapter state; use a dedicated
+instance without concurrent benchmark clients.
+
+For a deterministic control, restart both servers with the same
+`--enable-deterministic-inference --attention-backend triton
+--linear-attn-prefill-backend triton --bf16-gemm-backend torch` configuration and
+repeat this diagnostic. Freeze the resolved configuration and measure its cost
+separately before choosing a serving configuration. Prefix consistency alone
+does not establish dynamic-versus-merged equivalence or long-context support.
