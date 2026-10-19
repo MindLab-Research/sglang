@@ -397,6 +397,7 @@ POSITIONAL_FIELD_ORDER = (
     "max_loras_per_batch",
     "lora_eviction_policy",
     "lora_backend",
+    "lora_merged_bf16_cache_size_mb",
     "max_lora_chunk_size",
     "experts_shared_outer_loras",
     "lora_use_virtual_experts",

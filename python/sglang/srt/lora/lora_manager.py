@@ -487,6 +487,9 @@ class LoRAManager:
             self._notify_lora_slots_updated(changed_slots)
 
     def _notify_lora_slots_updated(self, slot_ids: set[int]) -> None:
+        invalidate = getattr(self.lora_backend, "invalidate_weight_cache", None)
+        if callable(invalidate):
+            invalidate(slot_ids)
         for layer_modules in self.lora_modules:
             for module in layer_modules.values():
                 notify = getattr(module, "on_lora_slots_updated", None)

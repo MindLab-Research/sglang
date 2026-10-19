@@ -74,7 +74,17 @@ model and FP32 adapter factors. For each active adapter and projection, it
 computes `(W.float() + (B @ A) * scale).bfloat16()`, runs the BF16 projection,
 then releases that temporary weight. It does not retain complete merged models
 per adapter. This deliberately adds weight traffic and merge arithmetic to
-every forward; measure latency and peak memory before choosing it for serving.
+every forward by default; measure latency and peak memory before choosing it
+for serving.
+
+`--lora-merged-bf16-cache-size-mb N` optionally retains merged projection
+weights in a per-rank LRU bounded by N MiB. Zero, the default, keeps the original
+transient behavior. The full budget is reserved before KV pool sizing; it is
+not free KV capacity. Reused or unloaded adapter slots invalidate their cached
+weights, and projections larger than the budget bypass caching. Cold fills and
+evictions still execute the same FP32 merge and BF16 rounding. A warm hit reuses
+that exact tensor. This option is under validation; measure cold-fill latency,
+warm throughput, mixed-adapter eviction and actual peak memory together.
 
 Its current supported configuration is DP1/PP1, unquantized BF16 weights,
 deterministic inference, eager execution, an explicit maximum LoRA rank of

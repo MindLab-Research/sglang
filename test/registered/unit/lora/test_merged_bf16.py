@@ -2,6 +2,8 @@
 
 import argparse
 import unittest
+from collections import OrderedDict
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -17,6 +19,99 @@ register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-large")
 
 
 class TestMergedBF16Configuration(unittest.TestCase):
+    def test_projection_cache_budget_is_reserved_before_kv_sizing(self):
+        from sglang.srt.mem_cache import kv_cache_configurator as module
+
+        config = SimpleNamespace(lora_merged_bf16_cache_size_mb=0)
+        runner = SimpleNamespace(
+            device="cpu",
+            gpu_id=0,
+            mambaish_config=None,
+            post_capture_kv_active=False,
+            model_config=SimpleNamespace(is_multimodal=False),
+            server_args=config,
+        )
+        values = {
+            "get_available_gpu_memory": 80,
+            "get_parallel": SimpleNamespace(
+                launch_world_size=1, world_group=SimpleNamespace(cpu_group=None)
+            ),
+            "get_schedule": SimpleNamespace(
+                mem_fraction_static=0.5, prefill_max_requests=None
+            ),
+            "get_disagg": SimpleNamespace(disaggregation_mode="null"),
+            "get_exec": SimpleNamespace(
+                graph=SimpleNamespace(
+                    cuda_graph_config=SimpleNamespace(
+                        prefill=SimpleNamespace(full_prefill_max_req=None)
+                    )
+                )
+            ),
+            "get_mm": SimpleNamespace(mm_feature_transport=None),
+            "mm_runtime_reservation_gb": 0,
+            "resolving_view": config,
+        }
+        with ExitStack() as stack:
+            for name, value in values.items():
+                stack.enter_context(patch.object(module, name, return_value=value))
+            profile = module.KVCacheConfigurator._profile_available_bytes
+            self.assertEqual(profile(runner, 100), 30 << 30)
+            config.lora_merged_bf16_cache_size_mb = 1024
+            self.assertEqual(profile(runner, 100), 29 << 30)
+
+    def test_cache_reuses_exact_weights_and_invalidates_reused_slots(self):
+        backend = object.__new__(MergedBF16LoRABackend)
+        backend._weight_cache = OrderedDict()
+        backend._weight_cache_limit = 64
+        backend._weight_cache_bytes = 0
+        backend.max_loras_per_batch = 3
+        layer = SimpleNamespace()
+        weight = torch.arange(16).reshape(4, 4).bfloat16()
+        a, b = torch.ones(3, 2, 4), torch.ones(3, 4, 2)
+        args = (layer, weight, a, b, 1, 1, 0.5, [0, 4])
+        path = "sglang.srt.lora.backend.merged_bf16_backend.merge_bf16_weight"
+        with patch(path, wraps=merge_bf16_weight) as merge:
+            first = backend._merged_weight(*args)
+            self.assertIs(first, backend._merged_weight(*args))
+            self.assertEqual(merge.call_count, 1)
+            backend.set_layer_adapter_presence(layer, 1, True)
+            a[1].mul_(2)
+            second = backend._merged_weight(*args)
+            self.assertEqual(merge.call_count, 2)
+            self.assertFalse(torch.equal(first, second))
+            torch.testing.assert_close(
+                second,
+                merge_bf16_weight(weight, a[1], b[1], 1, 0.5, [0, 4]),
+                atol=0,
+                rtol=0,
+            )
+            backend.invalidate_weight_cache({1})
+            self.assertEqual(backend._weight_cache_bytes, 0)
+            self.assertFalse(backend._weight_cache)
+
+    def test_cache_budget_lru_and_oversized_bypass(self):
+        backend = object.__new__(MergedBF16LoRABackend)
+        backend._weight_cache = OrderedDict()
+        backend._weight_cache_limit = 64
+        backend._weight_cache_bytes = 0
+        layer = SimpleNamespace()
+        weight = torch.ones(4, 4).bfloat16()  # 32 bytes per entry
+        a, b = torch.ones(3, 2, 4), torch.ones(3, 4, 2)
+
+        def merged(slot):
+            return backend._merged_weight(layer, weight, a, b, slot, 1, 0.5, [0, 4])
+
+        first, _ = merged(0), merged(1)
+        self.assertIs(first, merged(0))  # slot 1 is now the oldest
+        merged(2)
+        self.assertEqual([key[1] for key in backend._weight_cache], [0, 2])
+        self.assertEqual(backend._weight_cache_bytes, 64)
+        backend._weight_cache_limit = 16
+        # Use a fresh empty cache, as the configured budget is immutable at runtime.
+        backend.invalidate_weight_cache({0, 2})
+        self.assertIsNot(merged(0), merged(0))
+        self.assertEqual(backend._weight_cache_bytes, 0)
+
     def test_cli_accepts_packed_and_checkpoint_gdn_targets(self):
         from sglang.srt.server_args import ServerArgs
 
@@ -104,9 +199,12 @@ class TestMergedBF16Configuration(unittest.TestCase):
 
     def test_tensor_parallel_configuration_is_not_rejected(self):
         for tp_size in (1, 2, 4, 8):
-            with self.subTest(tp_size=tp_size), patch(
-                "sglang.srt.lora.backend.merged_bf16_backend.cuda_graph_fully_disabled",
-                return_value=True,
+            with (
+                self.subTest(tp_size=tp_size),
+                patch(
+                    "sglang.srt.lora.backend.merged_bf16_backend.cuda_graph_fully_disabled",
+                    return_value=True,
+                ),
             ):
                 MergedBF16LoRABackend(
                     4, torch.device("cpu"), self.args(tp_size=tp_size)

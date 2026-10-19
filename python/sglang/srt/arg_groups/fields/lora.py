@@ -81,6 +81,10 @@ class Lora(msgspec.Struct):
             choices=["triton", "csgmv", "ascend", "torch_native", "merged_bf16"],
         ),
     ] = "csgmv"
+    lora_merged_bf16_cache_size_mb: A[
+        int,
+        "Per-rank MiB budget for cached BF16 merged projections. Only for merged_bf16; 0 disables caching. Reserved before KV sizing; trades KV capacity for avoiding repeated weight merges.",
+    ] = 0
     max_lora_chunk_size: A[
         Optional[int],
         Arg(

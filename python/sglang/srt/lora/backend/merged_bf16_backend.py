@@ -5,6 +5,7 @@ weights are immutable and adapters remain FP32 low-rank factors in the pool.
 This trades extra weight traffic for the rounding semantics of a merged model.
 """
 
+from collections import OrderedDict
 from itertools import pairwise
 from math import isfinite
 
@@ -125,8 +126,42 @@ class MergedBF16LoRABackend(TritonLoRABackend):
         self.global_merge_groups = []
         self._merge_ranks = []
         self._merge_scalings = []
+        self._weight_cache = OrderedDict()
+        self._weight_cache_limit = getattr(
+            server_args, "lora_merged_bf16_cache_size_mb", 0
+        ) * (1 << 20)
+        self._weight_cache_bytes = 0
+
+    def invalidate_weight_cache(self, slots, layer=None):
+        cache = getattr(self, "_weight_cache", {})
+        for key in list(cache):
+            if key[1] in slots and (layer is None or key[0] == id(layer)):
+                tensor = cache.pop(key)
+                self._weight_cache_bytes -= tensor.numel() * tensor.element_size()
+
+    def _merged_weight(self, layer, weight, a, b, slot, rank, scale, offsets):
+        limit = getattr(self, "_weight_cache_limit", 0)
+        size = weight.numel() * weight.element_size()
+        if not limit or size > limit:
+            return merge_bf16_weight(weight, a[slot], b[slot], rank, scale, offsets)
+        key = (id(layer), slot, rank, scale, weight.data_ptr(), weight._version)
+        cache = self._weight_cache
+        if key in cache:
+            cache.move_to_end(key)
+            return cache[key]
+        # Evict before materialization so the new entry does not temporarily
+        # coexist with entries outside the configured cache budget.
+        while self._weight_cache_bytes + size > limit:
+            _, old = cache.popitem(last=False)
+            self._weight_cache_bytes -= old.numel() * old.element_size()
+            del old
+        merged = merge_bf16_weight(weight, a[slot], b[slot], rank, scale, offsets)
+        cache[key] = merged
+        self._weight_cache_bytes += size
+        return merged
 
     def set_layer_adapter_presence(self, layer, slot, present):
+        self.invalidate_weight_cache({slot}, layer)
         # Updated by the pool on every slot load, including slot reuse. No
         # device-side reductions or tensor-value inspection in the forward.
         if not hasattr(layer, "merged_bf16_adapter_present"):
@@ -250,14 +285,16 @@ class MergedBF16LoRABackend(TritonLoRABackend):
         offsets = layer.output_offset_cpu.tolist()
         if len(groups) == 1:
             slot, rank, scale, _ = groups[0]
-            merged = merge_bf16_weight(weight, a[slot], b[slot], rank, scale, offsets)
+            merged = self._merged_weight(
+                layer, weight, a, b, slot, rank, scale, offsets
+            )
             return F.linear(x, merged, bias)
         output = torch.empty(
             (x.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device
         )
         for slot, rank, scale, rows in groups:
             merged = (
-                merge_bf16_weight(weight, a[slot], b[slot], rank, scale, offsets)
+                self._merged_weight(layer, weight, a, b, slot, rank, scale, offsets)
                 if rank
                 else weight
             )

@@ -2825,7 +2825,17 @@ class KVCacheConfigurator:
             is_multimodal=self.model_config.is_multimodal,
             mm_feature_transport=get_mm().mm_feature_transport,
         )
-        rest_memory = available_gpu_memory - slack_gb - mm_reservation_gb
+        merged_cache_gb = (
+            resolving_view(self.server_args).lora_merged_bf16_cache_size_mb / 1024
+        )
+        if merged_cache_gb:
+            logger.info(
+                "Reserving %.3f GiB per rank for merged BF16 projection cache",
+                merged_cache_gb,
+            )
+        rest_memory = (
+            available_gpu_memory - slack_gb - mm_reservation_gb - merged_cache_gb
+        )
         if self.mambaish_config is not None:
             rest_memory = self._handle_max_mamba_cache(rest_memory)
 

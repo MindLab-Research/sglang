@@ -20,6 +20,9 @@ def check_lora_server_args(server_args: Any):
     cfg = resolving_view(server_args)
 
     assert cfg.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
+    assert cfg.lora_merged_bf16_cache_size_mb >= 0, (
+        "lora_merged_bf16_cache_size_mb must be nonnegative"
+    )
 
     # Enable LoRA if any LoRA paths are provided for backward compatibility.
     if cfg.lora_paths:
@@ -32,6 +35,11 @@ def check_lora_server_args(server_args: Any):
             logger.warning(
                 "--enable-lora is set to False, any provided lora_paths will be ignored."
             )
+
+    if cfg.lora_merged_bf16_cache_size_mb:
+        assert cfg.lora_backend == "merged_bf16" and cfg.enable_lora, (
+            "merged projection caching requires --enable-lora and merged_bf16"
+        )
 
     if cfg.enable_lora:
         if cfg.enable_lora_overlap_loading is None:
