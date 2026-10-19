@@ -153,7 +153,7 @@ class CuteDSLGDNKernel(LinearAttnKernelBase):
             cu_seqlens, total_seq_len, chunk_size=64
         )
 
-        output, _ = self._extend_fn(
+        output, _, h = self._extend_fn(
             q=q_norm,
             k=k_norm,
             v=v_in,
@@ -164,11 +164,13 @@ class CuteDSLGDNKernel(LinearAttnKernelBase):
             chunk_indices=chunk_indices,
             chunk_offsets=chunk_offsets,
             initial_state_indices=ssm_cache_indices,
+            return_intermediate_states=True,
         )
 
         # Match Triton extend interface: (output, last_recurrent_state, h).
-        # The kernel already wrote state back into the pool in place.
-        return output, None, None
+        # The kernel already wrote final state back into the pool in place.
+        # Unaligned radix-cache tracking also needs its per-chunk states.
+        return output, None, h
 
     def target_verify(self, *args, **kwargs):
         raise NotImplementedError("CuteDSLGDNKernel does not support target_verify")

@@ -154,7 +154,10 @@ def chunk_gated_delta_rule_cutedsl(
     chunk_offsets: torch.Tensor,
     core_attn_out: torch.Tensor | None = None,
     initial_state_indices: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    return_intermediate_states: bool = False,
+) -> (
+    tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+):
     """Run the GDN chunk CuteDSL prefill kernels.
 
     Args:
@@ -174,12 +177,18 @@ def chunk_gated_delta_rule_cutedsl(
             the h kernel reads AND writes the pool rows in place (fused state
             gather/scatter — no ``[N, Hv, V, K]`` intermediates) and the
             returned ``final_state`` is the pool tensor itself.
+        return_intermediate_states: Also return the activation-dtype recurrent
+            state at the start of each chunk, in flattened sequence/chunk order.
+            Prefix-cache tracking needs these states for unaligned requests.
 
     Returns:
         A tuple ``(output, final_state)`` where ``output`` has shape
         ``[1, T, Hv, V]`` and ``final_state`` has shape ``[N, Hv, V, K]``.
         When ``core_attn_out`` is provided, ``output`` is an unsqueezed view of
         that buffer.
+        When ``return_intermediate_states`` is true, a third tensor with shape
+        ``[1, upper_bound_chunks, Hv, V, K]`` is returned. Only chunks described
+        by ``chunk_offsets`` are valid; the metadata allocation may be padded.
     """
     q_3d = q.squeeze(0)
     k_3d = k.squeeze(0)
@@ -259,6 +268,8 @@ def chunk_gated_delta_rule_cutedsl(
         scale,
         num_sms=num_sms,
     )
+    if return_intermediate_states:
+        return output.unsqueeze(0), final_state, h.unsqueeze(0)
     return output.unsqueeze(0), final_state
 
 

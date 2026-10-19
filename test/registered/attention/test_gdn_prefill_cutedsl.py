@@ -283,6 +283,67 @@ def test_gdn_chunk_cutedsl_pool_mode_matches_dense(state_dtype: torch.dtype):
     assert torch.equal(pool[untouched], pool_before[untouched])
 
 
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+def test_gdn_chunk_cutedsl_prefix_checkpoints(state_dtype: torch.dtype):
+    """Tracked states must represent each sequence's own causal prefix.
+
+    Use unequal, unaligned lengths so flattened chunk offsets differ from
+    token offsets. Compare checkpoints with an independent recurrent kernel,
+    including a nonzero initial state and both supported pool dtypes.
+    """
+    torch.manual_seed(20261019)
+    lengths = [193, 130]
+    cu = torch.tensor([0, 193, 323], device="cuda", dtype=torch.int32)
+    q = F.normalize(torch.randn(1, 323, 4, 128, device="cuda"), dim=-1).to(
+        torch.bfloat16
+    )
+    k = F.normalize(torch.randn_like(q).float(), dim=-1).to(q.dtype)
+    v = torch.randn(1, 323, 8, 128, device="cuda", dtype=q.dtype)
+    g = -torch.rand(1, 323, 8, device="cuda") * 0.1
+    beta = torch.sigmoid(torch.randn_like(g))
+    initial = torch.randn(2, 8, 128, 128, device="cuda", dtype=state_dtype) * 0.05
+    pool = torch.zeros(7, 8, 128, 128, device="cuda", dtype=state_dtype)
+    slots = torch.tensor([5, 2], device="cuda", dtype=torch.int32)
+    pool[slots.long()] = initial
+    indices, offsets = prepare_metadata_cutedsl(cu, sum(lengths))
+    _, final, checkpoints = chunk_gated_delta_rule_cutedsl(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        initial_state=pool,
+        cu_seqlens=cu,
+        chunk_indices=indices,
+        chunk_offsets=offsets,
+        initial_state_indices=slots,
+        return_intermediate_states=True,
+    )
+    assert final is pool
+    assert checkpoints.dtype == q.dtype
+    assert checkpoints.shape[0] == 1
+    for seq, start in enumerate([0, lengths[0]]):
+        first_chunk = int(offsets[seq].item())
+        assert torch.equal(checkpoints[0, first_chunk], initial[seq].to(q.dtype))
+        for prefix in (64, 128):
+            _, ref_state = fused_recurrent_gated_delta_rule(
+                q=q[:, start : start + prefix].contiguous(),
+                k=k[:, start : start + prefix].contiguous(),
+                v=v[:, start : start + prefix].contiguous(),
+                g=g[:, start : start + prefix].contiguous(),
+                beta=beta[:, start : start + prefix].contiguous(),
+                initial_state=initial[seq : seq + 1].float(),
+                output_final_state=True,
+                cu_seqlens=torch.tensor([0, prefix], device="cuda", dtype=torch.int64),
+                use_qk_l2norm_in_kernel=False,
+            )
+            tracked = checkpoints[0, first_chunk + prefix // 64]
+            error = (tracked.float() - ref_state[0].to(q.dtype).float()).abs()
+            # Same independent-reference bounds as the full prefill test.
+            assert error.max().item() < 2e-2
+            assert error.mean().item() < 6e-4
+
+
 if __name__ == "__main__":
     import sys
 
