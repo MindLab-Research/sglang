@@ -109,8 +109,14 @@ def main(args):
                 },
             }
             reference = call(args.merged_url, "/generate", common)
+            (args.output / f"{case['id']}-reference-response.json").write_text(
+                json.dumps(reference)
+            )
             continuation = reference["output_ids"]
-            assert len(continuation) == args.decode_tokens
+            assert len(continuation) == args.decode_tokens, (
+                f"{case['id']}: requested {args.decode_tokens} output tokens, "
+                f"got {len(continuation)}; see saved reference response"
+            )
             (args.output / f"{case['id']}-continuation.json").write_text(
                 json.dumps(
                     {

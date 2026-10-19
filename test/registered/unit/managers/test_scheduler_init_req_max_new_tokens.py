@@ -1,11 +1,13 @@
 import logging
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.srt.runtime_context import get_parallel
@@ -118,6 +120,57 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
             scheduler = self._new_scheduler()
             req = self._new_req(max_new_tokens=64)
             self.assertEqual(self._init_and_check(scheduler, req), 64)
+
+    def _scheduler_from_worker_info(self, context_len, kv_capacity):
+        scheduler = self._new_scheduler(max_total_num_tokens=kv_capacity)
+        runner = SimpleNamespace(
+            effective_logical_max_total_num_tokens=kv_capacity,
+            logical_max_total_num_tokens=kv_capacity,
+            token_to_kv_pool_allocator=scheduler.token_to_kv_pool_allocator,
+            max_running_requests=2,
+            forward_stream=None,
+            req_to_token_pool=SimpleNamespace(size=2, max_context_len=context_len + 4),
+            token_to_kv_pool=SimpleNamespace(size=kv_capacity),
+        )
+        worker = SimpleNamespace(
+            model_config=SimpleNamespace(context_len=context_len),
+            model_runner=runner,
+            dllm_algorithm=None,
+            random_seed=0,
+            device="cpu",
+        )
+        with patch(
+            "sglang.srt.managers.tp_worker.get_schedule",
+            return_value=SimpleNamespace(
+                max_prefill_tokens=8192, max_queued_requests=None
+            ),
+        ):
+            info = TpModelWorker.get_worker_info(worker)
+        scheduler.max_req_len = info[4]
+        scheduler.max_new_tokens_limit = None
+        return scheduler
+
+    def test_worker_context_boundary_allows_full_requested_output(self):
+        # Exercise the worker-to-scheduler contract, rather than assigning a
+        # hand-picked max_req_len that would hide its off-by-two error.
+        for context_len in (128, 262144, 1000000):
+            with self.subTest(context_len=context_len):
+                scheduler = self._scheduler_from_worker_info(
+                    context_len, context_len + 1024
+                )
+                req = self._new_req(max_new_tokens=64, input_len=context_len - 64)
+                self.assertEqual(self._init_and_check(scheduler, req), 64)
+                self.assertEqual(len(req.origin_input_ids) + 64, context_len)
+
+    def test_worker_context_boundary_still_clips_overflow(self):
+        scheduler = self._scheduler_from_worker_info(128, 1024)
+        req = self._new_req(max_new_tokens=65, input_len=64)
+        self.assertEqual(self._init_and_check(scheduler, req), 64)
+
+    def test_worker_kv_reserve_remains_independent_of_context(self):
+        scheduler = self._scheduler_from_worker_info(262144, 128)
+        req = self._new_req(max_new_tokens=64, input_len=64)
+        self.assertEqual(self._init_and_check(scheduler, req), 62)
 
     def test_limit_clips_explicit_request(self):
         with envs.SGLANG_MAX_NEW_TOKENS_LIMIT.override(16):

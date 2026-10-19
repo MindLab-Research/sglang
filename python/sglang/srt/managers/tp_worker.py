@@ -547,7 +547,11 @@ class TpModelWorker(BaseTpWorker):
             * page_interleave_shard_size(self.model_runner.token_to_kv_pool_allocator)
         )
         max_req_len = min(
-            self.model_config.context_len - 1,
+            # Scheduler.init_req_max_new_tokens treats max_req_len as an
+            # exclusive bound (it subtracts input_len + 1). Allow a request
+            # whose prompt plus output equals the configured context length.
+            # Keep the independent KV reserve below for overlap/admission.
+            self.model_config.context_len + 1,
             kv_capacity - 1,
         )
         max_req_input_len = max_req_len - 5
