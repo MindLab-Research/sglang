@@ -92,3 +92,26 @@ For a deterministic control, restart both servers with the same
 repeat this diagnostic. Freeze the resolved configuration and measure its cost
 separately before choosing a serving configuration. Prefix consistency alone
 does not establish dynamic-versus-merged equivalence or long-context support.
+
+## Check mixed request routing
+
+Prepare an adapters JSON list such as
+`[{"name": "A", "path": "/adapters/A"}, {"name": "B", "path": "/adapters/B"}]`,
+then run against a dedicated server with sufficient LoRA slots:
+
+```bash
+python benchmark/lora/compare_mixed.py \
+  --url http://127.0.0.1:30000 --adapters /evidence/adapters.json \
+  --corpus /evidence/corpus.json --capture-dir /evidence/mixed-captures \
+  --output /evidence/mixed
+```
+
+The tool establishes isolated base/adapter references, freezes a continuation for
+each, and compares prefill-last/decode scores in three shuffled mixed batches.
+It checks captured step/token indices, retains raw responses and per-case scores,
+and unloads its adapters afterwards. Aggregate passing does not imply every
+case passes; inspect individual failures and argmax differences. This test does
+not establish merged-model equivalence, in-flight unload safety, or cache restore
+correctness. Stateful processors must skip discarded intermediate prefill
+chunks; otherwise a long or mixed request can advance the capture counter before
+it produces its first output token.
