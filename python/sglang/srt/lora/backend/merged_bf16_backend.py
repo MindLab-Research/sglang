@@ -5,6 +5,8 @@ weights are immutable and adapters remain FP32 low-rank factors in the pool.
 This trades extra weight traffic for the rounding semantics of a merged model.
 """
 
+import json
+import logging
 from collections import OrderedDict
 from itertools import pairwise
 from math import isfinite
@@ -15,6 +17,8 @@ import triton
 import triton.language as tl
 from sglang.srt.lora.backend.triton_backend import TritonLoRABackend
 from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
+
+logger = logging.getLogger(__name__)
 
 
 @triton.jit
@@ -131,33 +135,103 @@ class MergedBF16LoRABackend(TritonLoRABackend):
             server_args, "lora_merged_bf16_cache_size_mb", 0
         ) * (1 << 20)
         self._weight_cache_bytes = 0
+        self._cache_policy = getattr(
+            server_args, "lora_merged_bf16_cache_policy", "lru"
+        )
+        self._cache_active_slots = set()
+        self._cache_transient_reserve = 0
+        self._cache_stats = {
+            "hits": 0,
+            "misses": 0,
+            "hit_bytes": 0,
+            "merged_bytes": 0,
+            "admissions": 0,
+            "bypasses": 0,
+            "evictions": 0,
+            "invalidations": 0,
+            "peak_retained_bytes": 0,
+        }
+
+    def _record_cache(self, key, value=1):
+        stats = getattr(self, "_cache_stats", None)
+        if stats is not None:
+            stats[key] += value
+
+    def _remove_cached_weight(self, key, reason):
+        tensor = self._weight_cache.pop(key)
+        self._weight_cache_bytes -= tensor.numel() * tensor.element_size()
+        self._record_cache(reason)
+        del tensor
 
     def invalidate_weight_cache(self, slots, layer=None):
         cache = getattr(self, "_weight_cache", {})
         for key in list(cache):
             if key[1] in slots and (layer is None or key[0] == id(layer)):
-                tensor = cache.pop(key)
-                self._weight_cache_bytes -= tensor.numel() * tensor.element_size()
+                self._remove_cached_weight(key, "invalidations")
+        # Emit only at slot updates, not every projection. Keep counters on
+        # the CPU: no tensor-value inspection or synchronization.
+        if layer is None and getattr(self, "_cache_stats", None) is not None:
+            logger.info(
+                "merged_bf16 projection_cache_stats=%s",
+                json.dumps(
+                    {
+                        **self._cache_stats,
+                        "policy": self._cache_policy,
+                        "retained_bytes": self._weight_cache_bytes,
+                        "budget_bytes": self._weight_cache_limit,
+                        "transient_reserve_bytes": self._cache_transient_reserve,
+                    },
+                    sort_keys=True,
+                ),
+            )
 
     def _merged_weight(self, layer, weight, a, b, slot, rank, scale, offsets):
         limit = getattr(self, "_weight_cache_limit", 0)
         size = weight.numel() * weight.element_size()
-        if not limit or size > limit:
-            return merge_bf16_weight(weight, a[slot], b[slot], rank, scale, offsets)
         key = (id(layer), slot, rank, scale, weight.data_ptr(), weight._version)
-        cache = self._weight_cache
-        if key in cache:
+        cache = getattr(self, "_weight_cache", {})
+        if limit and key in cache:
             cache.move_to_end(key)
+            self._record_cache("hits")
+            self._record_cache("hit_bytes", size)
             return cache[key]
-        # Evict before materialization so the new entry does not temporarily
-        # coexist with entries outside the configured cache budget.
-        while self._weight_cache_bytes + size > limit:
-            _, old = cache.popitem(last=False)
-            self._weight_cache_bytes -= old.numel() * old.element_size()
-            del old
+        self._record_cache("misses")
+        self._record_cache("merged_bytes", size)
+        admit = bool(limit and size <= limit)
+        if limit and getattr(self, "_cache_policy", "lru") == "active":
+            # Reserve one complete projection for a bypassed merge. Validation
+            # knows the model's largest local target weight before any forward.
+            # The max also keeps direct/unit-test calls safe without validation.
+            reserve = max(
+                getattr(self, "_cache_transient_reserve", 0), min(size, limit)
+            )
+            self._cache_transient_reserve = reserve
+            retained_limit = max(0, limit - reserve)
+            active = getattr(self, "_cache_active_slots", set()) | {slot}
+            for old_key in list(cache):
+                if old_key[1] not in active:
+                    self._remove_cached_weight(old_key, "evictions")
+            while self._weight_cache_bytes > retained_limit:
+                self._remove_cached_weight(next(iter(cache)), "evictions")
+            # A cyclic scan larger than the cache must not evict all active
+            # entries each decode step. Keep them and compute the miss uncached.
+            admit = admit and self._weight_cache_bytes + size <= retained_limit
+        elif admit:
+            # The LRU policy retains its existing admission/eviction semantics.
+            while self._weight_cache_bytes + size > limit:
+                self._remove_cached_weight(next(iter(cache)), "evictions")
+        if not admit:
+            self._record_cache("bypasses")
         merged = merge_bf16_weight(weight, a[slot], b[slot], rank, scale, offsets)
-        cache[key] = merged
-        self._weight_cache_bytes += size
+        if admit:
+            cache[key] = merged
+            self._weight_cache_bytes += size
+            stats = getattr(self, "_cache_stats", None)
+            if stats is not None:
+                stats["peak_retained_bytes"] = max(
+                    stats["peak_retained_bytes"], self._weight_cache_bytes
+                )
+            self._record_cache("admissions")
         return merged
 
     def set_layer_adapter_presence(self, layer, slot, present):
@@ -174,6 +248,7 @@ class MergedBF16LoRABackend(TritonLoRABackend):
         self.global_merge_groups = []
         self._merge_ranks = []
         self._merge_scalings = []
+        self._cache_active_slots = set()
 
     def validate_lora_targets(self, base_model, target_modules):
         from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
@@ -201,6 +276,14 @@ class MergedBF16LoRABackend(TritonLoRABackend):
                 or module.weight.dtype != torch.bfloat16
             ):
                 raise ValueError(f"merged_bf16 unsupported target: {name}")
+            if getattr(self, "_cache_policy", "lru") == "active":
+                self._cache_transient_reserve = max(
+                    self._cache_transient_reserve,
+                    min(
+                        self._weight_cache_limit,
+                        module.weight.numel() * module.weight.element_size(),
+                    ),
+                )
 
     def prepare_lora_batch(
         self,
@@ -229,6 +312,9 @@ class MergedBF16LoRABackend(TritonLoRABackend):
         self.merge_groups = self._make_merge_groups(
             weight_indices, lengths, self.batch_info.expected_tokens
         )
+        self._cache_active_slots = {
+            slot for slot, rank, _, _ in self.merge_groups if rank
+        }
 
     def _make_merge_groups(self, weight_indices, lengths, expected_tokens):
         groups = {}
@@ -264,6 +350,15 @@ class MergedBF16LoRABackend(TritonLoRABackend):
             self.global_merge_groups = self._make_merge_groups(
                 indices, [1] * len(indices), self.global_batch_info.expected_tokens
             )
+
+        # Do not filter by per-layer target presence: an adapter may only touch
+        # attention or GDN, yet its other-layer projections must remain retained.
+        # Include global DP routing even when the local attention rank is idle.
+        self._cache_active_slots = {
+            slot
+            for slot, rank, _, _ in self.merge_groups + self.global_merge_groups
+            if rank
+        }
 
     def run_merged_linear(self, layer, x, bias):
         a = getattr(layer, "A_buffer", None)

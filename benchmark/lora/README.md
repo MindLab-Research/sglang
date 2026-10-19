@@ -86,6 +86,20 @@ evictions still execute the same FP32 merge and BF16 rounding. A warm hit reuses
 that exact tensor. This option is under validation; measure cold-fill latency,
 warm throughput, mixed-adapter eviction and actual peak memory together.
 
+`--lora-merged-bf16-cache-policy active` is an experimental alternative to the
+default `lru` policy and requires a positive cache budget. It retains projections
+for adapters in the current local/global routing batch and bypasses admission
+when those entries fill the budget, instead of evicting the whole working set
+on a cyclic scan. One largest local BF16 target projection is reserved inside
+the same budget for a bypassed temporary weight; FP32 merge/GEMM workspace is
+separate. Unloaded or reused slots still invalidate their projections. CPU
+counters for hits, misses, materialized BF16 bytes, bypasses and evictions are
+logged as `projection_cache_stats` at slot updates. Byte counters describe tensor
+extents, not measured memory bandwidth. Eight admission-policy unit tests plus
+ten existing configuration/TP checks passed in the matching image; GPU accuracy,
+mixed-adapter throughput and peak-memory comparisons remain pending. Keep the
+policy opt-in until those comparisons complete.
+
 Choose this budget from the adapted projection shapes, then check the resolved
 KV and request limits after startup. On the dedicated B300 TP1 experiment,
 Qwen3.8-27B's real dense adapter changes 256 BF16 tensors totaling 35 GiB.

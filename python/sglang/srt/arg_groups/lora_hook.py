@@ -24,6 +24,10 @@ def check_lora_server_args(server_args: Any):
         "lora_merged_bf16_cache_size_mb must be nonnegative"
     )
 
+    assert cfg.lora_merged_bf16_cache_policy in {"lru", "active"}, (
+        "lora_merged_bf16_cache_policy must be lru or active"
+    )
+
     # Enable LoRA if any LoRA paths are provided for backward compatibility.
     if cfg.lora_paths:
         if cfg.enable_lora is None:
@@ -39,6 +43,11 @@ def check_lora_server_args(server_args: Any):
     if cfg.lora_merged_bf16_cache_size_mb:
         assert cfg.lora_backend == "merged_bf16" and cfg.enable_lora, (
             "merged projection caching requires --enable-lora and merged_bf16"
+        )
+
+    if cfg.lora_merged_bf16_cache_policy == "active":
+        assert cfg.lora_merged_bf16_cache_size_mb > 0, (
+            "active projection cache admission requires a positive cache budget"
         )
 
     if cfg.enable_lora:

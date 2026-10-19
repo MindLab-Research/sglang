@@ -85,6 +85,13 @@ class Lora(msgspec.Struct):
         int,
         "Per-rank MiB budget for cached BF16 merged projections. Only for merged_bf16; 0 disables caching. Reserved before KV sizing; trades KV capacity for avoiding repeated weight merges.",
     ] = 0
+    lora_merged_bf16_cache_policy: A[
+        str,
+        Arg(
+            help="Merged projection cache admission: lru evicts on a miss; active retains current-batch adapters and bypasses admission when full, reserving one projection's temporary space.",
+            choices=["lru", "active"],
+        ),
+    ] = "lru"
     max_lora_chunk_size: A[
         Optional[int],
         Arg(
