@@ -300,3 +300,46 @@ The deterministic Triton FP32 GEMM path now honors
 unless TF32 is explicitly enabled. BF16 and FP16 dot products are unaffected.
 High-precision arithmetic hooks used for diagnosis change the computation and
 must not be reported as acceptance of the native BF16 LoRA path.
+
+## Runnable lifecycle and KV-prefix diagnostics
+
+The following TP1 clients use only the Python standard library and can also be
+copied into a checkout pinned to an earlier serving commit. Run them on an
+otherwise idle, dedicated D/M experiment after creating the frozen corpus and
+independent merged model described above. Output directories must be new.
+
+```bash
+python3 benchmark/lora/check_lifecycle.py \
+  --url http://127.0.0.1:30000 \
+  --adapters /work/mol/evidence/adapters.json \
+  --corpus /work/mol/evidence/corpus.json \
+  --output /work/mol/evidence/lifecycle \
+  --cycles 100 --bad-loads 100 --aliases 12 --lru-rounds 9
+
+python3 benchmark/lora/check_cache_restore.py \
+  --dynamic-url http://127.0.0.1:30000 \
+  --merged-url http://127.0.0.1:30002 \
+  --adapter-path /work/mol/adapter-A \
+  --corpus /work/mol/evidence/corpus.json \
+  --output /work/mol/evidence/cache-restore
+```
+
+For lifecycle testing, `adapters.json` is a list of distinct adapter paths such
+as A, B and zero. `--aliases` must exceed the server's `max_loaded_loras` budget;
+12 aliases and 9 rounds produce 108 LRU requests with the example budget of 10.
+The client checks 100 alias reuse cycles, 100 rejected loads interleaved with
+healthy requests, 256-token generation overlapping unload, and rejection of new
+requests while the old generation drains. Natural output IDs and logprobs must
+match that adapter's same-service deterministic reference exactly. This does
+not establish independent merged-model precision or every malformed export's
+validation behavior. Keep all other load/unload clients stopped during this run.
+
+The cache client requires at least one corpus prompt of 128 tokens, real hot
+`cached_tokens > 0` on both D and M, and identical 16-token natural continuations.
+It checks output-token logprobs (mean <= 0.01, P99 <= 0.1 nat), plus exact
+cold/hot self-repeat equality. A divergent natural path is a failed diagnostic;
+use the forced-prefix comparison to investigate it. This single-prefix check
+does not score full prefill or establish cross-adapter cache isolation. Both
+clients write raw responses and only write `summary.json` after passing; failed
+runs remain for inspection. The CPU fake-HTTP tests validate client protocol
+and rejection paths, not GPU serving correctness.
