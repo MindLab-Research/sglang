@@ -1,0 +1,65 @@
+{
+  "scope": "Actual first completed warmup, not one of the18 measured performance requests. Identical999744 input tokens +256natural output tokens, c1, D/M/base on separate GPUs. This confirms this fixed input completed within the configured million-total context; repeated matrix and long-context quality gates remain pending. TTFT/lastSSE are diagnostic first-warm observations, not latency percentiles.",
+  "sides": {
+    "new": {
+      "raw_file": "warm-999744-c1-r0-i0-new.json",
+      "raw_sha256": "d13a82f4a007613b97e9a10bffb0f71309fb457c8b151a0ea05aff7d6a61419e",
+      "input_tokens": 999744,
+      "output_tokens": 256,
+      "total_tokens": 1000000,
+      "finish_reason": {
+        "type": "length",
+        "length": 256
+      },
+      "cached_tokens": 0,
+      "first_sse_tokens": 1,
+      "ttft_s": 2001.2277004310017,
+      "last_sse_elapsed_s": 2028.4517877649996,
+      "sse_events": 256,
+      "configured_context_length": 1000000,
+      "rope_override": "{\"text_config\": {\"rope_parameters\": {\"mrope_interleaved\": true, \"mrope_section\": [11, 11, 10], \"rope_type\": \"yarn\", \"rope_theta\": 10000000, \"partial_rotary_factor\": 0.25, \"factor\": 4.0, \"original_max_position_embeddings\": 262144}}}",
+      "context_scope": "One fixed input and first flushed warmup only; no full-prompt logprob comparison or multi-input quality claim."
+    },
+    "M": {
+      "raw_file": "warm-999744-c1-r0-i0-M.json",
+      "raw_sha256": "bae1a8b325a1c215cd808fb88c4ea1bbe41ecdaf9dbbb6a0aa00ec11ab1b34fa",
+      "input_tokens": 999744,
+      "output_tokens": 256,
+      "total_tokens": 1000000,
+      "finish_reason": {
+        "type": "length",
+        "length": 256
+      },
+      "cached_tokens": 0,
+      "first_sse_tokens": 1,
+      "ttft_s": 1993.2891451960022,
+      "last_sse_elapsed_s": 2008.0966943470048,
+      "sse_events": 256,
+      "configured_context_length": 1000000,
+      "rope_override": "{\"text_config\": {\"rope_parameters\": {\"mrope_interleaved\": true, \"mrope_section\": [11, 11, 10], \"rope_type\": \"yarn\", \"rope_theta\": 10000000, \"partial_rotary_factor\": 0.25, \"factor\": 4.0, \"original_max_position_embeddings\": 262144}}}",
+      "context_scope": "One fixed input and first flushed warmup only; no full-prompt logprob comparison or multi-input quality claim."
+    },
+    "base": {
+      "raw_file": "warm-999744-c1-r0-i0-base.json",
+      "raw_sha256": "790e7b9466281859e5336773ad0de1bf1ed169133373ea06cd9abe679b21ba6c",
+      "input_tokens": 999744,
+      "output_tokens": 256,
+      "total_tokens": 1000000,
+      "finish_reason": {
+        "type": "length",
+        "length": 256
+      },
+      "cached_tokens": 0,
+      "first_sse_tokens": 1,
+      "ttft_s": 1992.1510925849943,
+      "last_sse_elapsed_s": 2007.0018707639974,
+      "sse_events": 256,
+      "configured_context_length": 1000000,
+      "rope_override": "{\"text_config\": {\"rope_parameters\": {\"mrope_interleaved\": true, \"mrope_section\": [11, 11, 10], \"rope_type\": \"yarn\", \"rope_theta\": 10000000, \"partial_rotary_factor\": 0.25, \"factor\": 4.0, \"original_max_position_embeddings\": 262144}}}",
+      "context_scope": "One fixed input and first flushed warmup only; no full-prompt logprob comparison or multi-input quality claim."
+    }
+  },
+  "dynamic_vs_independent_merged_output_ids_equal": true,
+  "retry_client_provenance_sha256": "b6afe379eb6c3928b3d397f7b5e60f294561220536df7a52a112071c2c1e1481",
+  "recovery_audit_sha256": "df03b7579b66f8a37bcedc3fd88f4342e9bf5b4af064ad833bbc1aa8e72c038f"
+}

@@ -1,6 +1,6 @@
 {
   "status": "Partial experimental snapshot; full multi-GPU/DCP/4P4D goal is not accepted.",
-  "as_of_utc": "2026-10-19T18:25:00Z",
+  "as_of_utc": "2026-10-19T18:44:53Z",
   "model": "Qwen3.8-27B",
   "model_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
   "cache_runtime_commit": "7e6ef6016cd951b92157051723b91c4474da5400",
@@ -11,7 +11,8 @@
     "cache-threeway-comparison-r49.json": "0b4b6bc5082b558673cdb486928183353d28f8e413f6d97ab7df1fb1df287f38",
     "cache-threeway-profile-audit-r49.json": "a149614e2886da7ba32f906bd05bf2780a70bc3dbf459c3ff0ddd9520651088f",
     "tp4-kernel-audit-r48.json": "9f13c19aad112c2efb24917811a5cc582e141893aa37deb06925ad864879ec7c",
-    "tp4-independent-audit-r40.json": "3f2938d6d3dc7a2589370ac3739c2d4d0ca38ab19009d26a1ef1fa8fa5ffbe37"
+    "tp4-independent-audit-r40.json": "3f2938d6d3dc7a2589370ac3739c2d4d0ca38ab19009d26a1ef1fa8fa5ffbe37",
+    "million-first-warm-audit-r52.json": "99941f811b0dd74b5eaa3a8bef3a6ff2f2ab1c90cd6e8601cd1f976b0880e305"
   },
   "topology_runtime_image": "sha256:a2b256e2b1370dc3968977d0c4af04a7f908ed0d4dfa54f3631c13730a117288",
   "cache_external_client_commit": "2d11fdbf218fe0fe0e364002887b3fb3e64cb7d1",
@@ -19,5 +20,10 @@
   "source_manifests_sha256": {
     "source-r30.json": "e50d090de22fcaa03539ebb44690559820fd7ea9611bd3289d9d370ebcdfc684",
     "source-r34.json": "c4212e12a18d4c9c67f7af3b9656dff834491d366f7293bcae1094d09ecf3375"
-  }
+  },
+  "long_warm_runtime_commit": "21bb542f3dafe63f811c65b80dba4cf0b9275431",
+  "long_warm_runtime_image": "sha256:2878121eeb8d06dd85d8f8ad9c0d388e5602134ceb6f7022410f225f855ace32",
+  "long_warm_client_script_sha256": "14b815f413fb0dc0ac0ee179ad5a860cf7ca3c389578c4684693656078a4117f",
+  "long_warm_auditor_sha256": "fe54b62c0b4000c6819037e478fbcbf6755ac2d65421d666a29b0c72a06625c1",
+  "long_warm_scope": "First completed warmup only: one identical999744-token input and256natural output tokens perD/M/base; repeated18-request performance matrix pending, full-prompt logprob and multi-input quality are separate."
 }

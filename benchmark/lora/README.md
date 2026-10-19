@@ -132,6 +132,13 @@ it contains no prompts, output token IDs or weights. Complete raw requests and
 traces remain under the dedicated experiment's
 `qwen38-mol-multigpu-20261019` evidence root.
 
+The snapshot also records the first completed million-total-context warmup on
+R26: D, M and base each returned 256 tokens after the same 999,744-token input,
+with D/M output IDs matching. First-warm TTFT was 2,001.23 / 1,993.29 seconds
+for D/M, explaining the earlier 1,800-second client read timeout. This evidence
+covers one fixed input and its first warmup; the repeated 18-request speed
+matrix and full-prompt/multi-input long-context accuracy gates remain pending.
+
 Its current supported configuration is DP1/PP1, unquantized BF16 weights,
 deterministic inference, eager execution, an explicit maximum LoRA rank of
 1 through 64, and dense targets only:
