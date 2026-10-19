@@ -295,6 +295,13 @@ def get_normalized_target_modules(
         "unembed_tokens": "lm_head",
         "q_a_proj": "fused_qkv_a_proj_with_mqa",
         "kv_a_proj_with_mqa": "fused_qkv_a_proj_with_mqa",
+        "in_proj_qkv": "in_proj_qkvz",
+        "in_proj_q": "in_proj_qkvz",
+        "in_proj_k": "in_proj_qkvz",
+        "in_proj_v": "in_proj_qkvz",
+        "in_proj_z": "in_proj_qkvz",
+        "in_proj_b": "in_proj_ba",
+        "in_proj_a": "in_proj_ba",
         # DSA indexer projections are qualified with their parent module name
         # because the bare leaf names collide with unrelated modules in other
         # models (e.g. DeepSeek-V4 attention `wq_b`, Pixtral vision `wk`).
@@ -323,6 +330,7 @@ def get_stacked_multiply(
     stacked_rank = {
         "qkv_proj": 3,
         "in_proj_qkvz": 4,  # GDN packed input projection
+        "in_proj_ba": 2,
         "gate_up_proj": 2,
         "gate_up_proj_moe": 2,
         "gate_up_proj_shared_moe": 2,
@@ -388,6 +396,7 @@ ATTN_TP_LORA_MODULE_NAMES = frozenset(
         "wo_ud",
         "in_proj",
         "in_proj_qkvz",
+        "in_proj_ba",
     }
 )
 
@@ -402,6 +411,7 @@ _KNOWN_LORA_TARGET_MODULES = frozenset(
         "out_proj",
         "in_proj",
         "in_proj_qkvz",
+        "in_proj_ba",
         "up_proj",
         "gate_up_proj",
         "down_proj",

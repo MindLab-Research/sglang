@@ -248,6 +248,7 @@ class LoRAAdapter(nn.Module):
             self._normalize_in_proj(layer.weights)
             # Stack in_proj_q + in_proj_k + in_proj_v + in_proj_z → in_proj_qkvz for GDN layers
             self._normalize_in_proj_qkvz(layer.weights)
+            self._normalize_in_proj_ba(layer.weights)
             weight_names = list(layer.weights.keys())
             self.normalize_gate_up_proj(weight_names, layer.weights)
             weight_names = list(layer.weights.keys())
@@ -447,55 +448,115 @@ class LoRAAdapter(nn.Module):
             weights.pop(weight_name)
             weights.pop(x_name)
 
-    def _normalize_in_proj_qkvz(self, weights: Dict[str, torch.Tensor]):
-        """Normalize in_proj_qkvz weights for GDN (GatedDeltaNet) layers like
-        Qwen3.5.
+    def _normalize_gdn_projection(self, weights, packed_name, output_sizes, groups):
+        """Pack split LoRA factors without identifying independently trained A's.
 
-        Two adapter formats are handled:
-
-        1. Split: ``in_proj_q + in_proj_k + in_proj_v + in_proj_z`` are present
-           as separate weights → concatenate them into ``in_proj_qkvz``.
-
-        2. Already-merged: the adapter has a single ``in_proj_qkvz`` weight
-           (PEFT trained against SGLang's fused Linear). The stacked buffer
-           expects four per-slice ``A`` blocks, so repeat ``lora_A`` 4× along
-           the rank dim. ``lora_B`` is already full-output-dim and matches
-           the buffer directly.
+        Each runtime output slice has its own rank-r A block. A checkpoint
+        qkv factor is shared only across q/k/v; z and b/a retain their own A.
+        Missing projection deltas are represented by explicit zero blocks.
         """
-        for weight_name in list(weights.keys()):
-            if "in_proj_q." in weight_name:
-                k_name = weight_name.replace("in_proj_q", "in_proj_k")
-                v_name = weight_name.replace("in_proj_q", "in_proj_v")
-                z_name = weight_name.replace("in_proj_q", "in_proj_z")
-                if (
-                    k_name not in weights
-                    or v_name not in weights
-                    or z_name not in weights
-                ):
-                    continue
-                qkvz_name = weight_name.replace("in_proj_q", "in_proj_qkvz")
-                cat_dim = weights[weight_name].dim() - 2
-                weights[qkvz_name] = torch.cat(
-                    (
-                        weights[weight_name],
-                        weights[k_name],
-                        weights[v_name],
-                        weights[z_name],
-                    ),
-                    cat_dim,
+        prefixes = {}
+        for name in list(weights):
+            if "lora_A" not in name:
+                continue
+            for module_name in (packed_name, *groups):
+                marker = f".{module_name}."
+                if marker in name:
+                    prefix, suffix = name.split(marker, 1)
+                    prefixes[(prefix, suffix)] = None
+                    break
+        for prefix, suffix in prefixes:
+            a_name = f"{prefix}.{packed_name}.{suffix}"
+            b_suffix = suffix.replace("lora_A", "lora_B")
+            b_name = f"{prefix}.{packed_name}.{b_suffix}"
+            sources = {
+                module: (f"{prefix}.{module}.{suffix}", f"{prefix}.{module}.{b_suffix}")
+                for module in groups
+            }
+            present = [module for module, (a, _) in sources.items() if a in weights]
+            if a_name in weights:
+                if present:
+                    raise ValueError(
+                        f"LoRA adapter {self.uid!r}: mixed fused/split {packed_name} factors"
+                    )
+                weights[a_name] = weights[a_name].repeat(len(output_sizes), 1)
+                continue
+            prototype = weights[sources[present[0]][0]]
+            a_blocks = [
+                prototype.new_zeros((self.config.r, prototype.shape[1]))
+                for _ in output_sizes
+            ]
+            b_blocks = [
+                prototype.new_zeros((size, self.config.r)) for size in output_sizes
+            ]
+            assigned = set()
+            for module in present:
+                indexes = groups[module]
+                if assigned.intersection(indexes):
+                    raise ValueError(
+                        f"LoRA adapter {self.uid!r}: overlapping {packed_name} factors"
+                    )
+                assigned.update(indexes)
+                source_a, source_b = sources[module]
+                a, b = weights.pop(source_a), weights.pop(source_b)
+                sizes = [output_sizes[i] for i in indexes]
+                if b.shape != (sum(sizes), self.config.r):
+                    raise ValueError(
+                        f"LoRA tensor {source_b!r}: expected shape {(sum(sizes), self.config.r)}, got {tuple(b.shape)}"
+                    )
+                for index, block in zip(indexes, b.split(sizes, dim=0)):
+                    a_blocks[index] = a
+                    b_blocks[index] = block
+            weights[a_name] = torch.cat(a_blocks, dim=0)
+            weights[b_name] = torch.cat(b_blocks, dim=0)
+
+    def _normalize_in_proj_qkvz(self, weights: Dict[str, torch.Tensor]):
+        if not any(
+            ".in_proj_" in name
+            and any(
+                f".{module}." in name
+                for module in (
+                    "in_proj_qkvz",
+                    "in_proj_qkv",
+                    "in_proj_q",
+                    "in_proj_k",
+                    "in_proj_v",
+                    "in_proj_z",
                 )
-                weights.pop(weight_name)
-                weights.pop(k_name)
-                weights.pop(v_name)
-                weights.pop(z_name)
-            elif "in_proj_qkvz" in weight_name and "lora_A" in weight_name:
-                # Already-merged adapter: replicate the shared A across the 4
-                # stacked slots the buffer expects (q, k, v, z).
-                ndim = weights[weight_name].dim()
-                repeat_dims = [1] * ndim
-                repeat_dims[ndim - 2] = 4
-                weights[weight_name] = weights[weight_name].repeat(*repeat_dims)
-            # else (in_proj_qkvz lora_B, or unrelated): no-op.
+            )
+            for name in weights
+        ):
+            return
+        config = self.base_hf_config
+        key_dim = config.linear_key_head_dim * config.linear_num_key_heads
+        value_dim = config.linear_value_head_dim * config.linear_num_value_heads
+        self._normalize_gdn_projection(
+            weights,
+            "in_proj_qkvz",
+            (key_dim, key_dim, value_dim, value_dim),
+            {
+                "in_proj_qkv": (0, 1, 2),
+                "in_proj_q": (0,),
+                "in_proj_k": (1,),
+                "in_proj_v": (2,),
+                "in_proj_z": (3,),
+            },
+        )
+
+    def _normalize_in_proj_ba(self, weights: Dict[str, torch.Tensor]):
+        if not any(
+            f".{module}." in name
+            for name in weights
+            for module in ("in_proj_ba", "in_proj_b", "in_proj_a")
+        ):
+            return
+        num_heads = self.base_hf_config.linear_num_value_heads
+        self._normalize_gdn_projection(
+            weights,
+            "in_proj_ba",
+            (num_heads, num_heads),
+            {"in_proj_b": (0,), "in_proj_a": (1,)},
+        )
 
     def normalize_gate_up_proj(
         self, weight_names: List[str], weights: Dict[str, torch.Tensor]
