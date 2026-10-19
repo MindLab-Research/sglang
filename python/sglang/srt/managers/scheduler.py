@@ -68,6 +68,7 @@ try:
 except ImportError:
     initialize_mamba_selective_state_update_backend = None
 from sglang.srt.beam_search.coordinator import BeamCoordinator
+from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
 from sglang.srt.configs.model_config import (
     ModelConfig,
     ModelImpl,
@@ -1726,6 +1727,12 @@ class Scheduler(
         self.truncation_align_size = (
             get_int_env_var(env_var, default_size) if env_var else None
         )
+        if hybrid_gdn_config(self.model_config) is not None:
+            # Triton GDN prefill groups recurrence updates into 64-token
+            # tiles. Splitting a tile across scheduler batches changes the
+            # floating-point state update and makes results depend on peers
+            # sharing the prefill budget, even with deterministic GEMMs.
+            self.truncation_align_size = math.lcm(self.truncation_align_size or 1, 64)
 
     def init_dsa_kpool_truncation_align(self):
         """Kpool compress-write asserts chunked extends start on pool boundaries.

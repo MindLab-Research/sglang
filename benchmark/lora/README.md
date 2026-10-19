@@ -115,3 +115,15 @@ not establish merged-model equivalence, in-flight unload safety, or cache restor
 correctness. Stateful processors must skip discarded intermediate prefill
 chunks; otherwise a long or mixed request can advance the capture counter before
 it produces its first output token.
+
+Under deterministic inference, GDN scheduler chunks align to the Triton
+recurrence's 64-token tiles, combined with the attention backend's alignment.
+Splitting inside a recurrence tile can change FP32 state and later decode scores
+depending on the other requests in the batch. Keep the per-rank prefill chunk
+at least as large as this alignment; smaller chunks fail at startup. Validate
+cache-state dtype and cache restore separately when changing serving settings.
+
+Explicit adapter unload removes its automatic-reload metadata immediately and
+waits for existing requests to drain. New requests using that alias are rejected
+until an explicit load succeeds. Automatic LRU eviction retains reload metadata;
+it does not have the same lifecycle semantics as explicit unload.
