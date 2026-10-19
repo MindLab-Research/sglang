@@ -160,7 +160,9 @@ def main(a):
                             timing.setdefault("first_token", time.monotonic())
                             first.set()
                 timing["stream_done"] = time.monotonic()
-            except Exception as e:  # noqa: BLE001 - propagate thread failures to the coordinator
+            except (
+                Exception
+            ) as e:  # noqa: BLE001 - propagate thread failures to the coordinator
                 failures.append(repr(e))
                 first.set()
 
@@ -175,7 +177,9 @@ def main(a):
             try:
                 unloaded.append(ok("/unload_lora_adapter", {"lora_name": alias}))
                 timing["unload_done"] = time.monotonic()
-            except Exception as e:  # noqa: BLE001 - propagate thread failures to the coordinator
+            except (
+                Exception
+            ) as e:  # noqa: BLE001 - propagate thread failures to the coordinator
                 failures.append(repr(e))
 
         u = threading.Thread(target=drain, daemon=True)
