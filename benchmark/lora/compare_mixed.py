@@ -181,6 +181,11 @@ def main(args):
             "cases": cases,
         }
         (args.output / "summary.json").write_text(json.dumps(summary, indent=2))
+        assert all(
+            row[phase]["passes_logprob_gate"]
+            for row in cases
+            for phase in pairs
+        ), summary
     finally:
         for name in reversed(loaded):
             call(args.url, "/unload_lora_adapter", {"lora_name": name})
