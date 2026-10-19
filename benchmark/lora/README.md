@@ -106,6 +106,30 @@ in cached, uncached and merged speed controls; 32 requests of 2,048 input plus
 256 output tokens exceed a 65,536-row pool and can queue despite a request
 limit of 32.
 
+The subsequent cached/uncached/independent-merge natural SSE controls each
+completed 636 requests at 16 points on the same GPU2, R34 runtime, 65,536-row
+KV pool and 256 Mamba slots. All 636 outputs matched across the three controls.
+After two warmup batches, three cold and hot repetitions gave these cold,
+concurrency-32 observations:
+
+| Input / output tokens | Uncached tok/s | Cached tok/s | Merged tok/s | Cached P95 / merged P95, seconds |
+| --- | ---: | ---: | ---: | ---: |
+| 128 / 128 | 353.29 | 555.59 | 570.94 | 7.40 / 7.26 |
+| 2048 / 256 | 166.88 | 260.35 | 265.08 | 31.46 / 30.88 |
+
+Cached throughput was 97.31% and 98.22% of the merged controls respectively.
+Other experiments ran concurrently, so these are observed ratios; dedicated
+machine repeats in both cache-control orders remain pending. The short profiles
+contained 16,399 / 8,719 / 8,537 CUDA kernel events for uncached / cached / merged.
+The cached trace had no repeated FP32 weight-merge or rounding kernels, versus
+2,560 of each in the uncached trace. All three retained 4,340 activation GEMM
+and 1,056 GDN/convolution events. Trace duration sums are not end-to-end wall-time
+shares. These warmed measurements do not cover first projection fill, multiple
+active adapters, actual KV-prefix restoration or their lifecycle acceptance.
+Raw requests, resolved settings and trace hashes are audited in
+`cache-threeway-comparison-r49.json` and `cache-threeway-profile-audit-r49.json`
+under the dedicated experiment's `qwen38-mol-multigpu-20261019` evidence root.
+
 Its current supported configuration is DP1/PP1, unquantized BF16 weights,
 deterministic inference, eager execution, an explicit maximum LoRA rank of
 1 through 64, and dense targets only:
@@ -152,8 +176,15 @@ pinned, and the supported layout has `--attn-dp-size` equal to `--tp-size`.
 For Qwen3.8-27B, TP2 and TP2/attention-DP2 each passed the same-topology
 30-input, 256-token, four-round cold/hot comparison: 240 pairs and 111,184
 scores, with zero differences in all three phases. This covers the real dense
-adapter under deterministic eager BF16 execution. Larger TP/attention-DP
-layouts, adapted GDN targets in those layouts, DCP and PD require their own
+adapter under deterministic eager BF16 execution. TP4 also passed the same
+240-pair / 111,184-score main comparison, plus eight pairs / 3,508 scores for
+the fused GDN adapter, all with zero differences and matching argmax. Its D/M
+natural performance controls each completed 636 requests with identical output
+tokens. Four dynamic rank traces contained 70,380 CUDA kernel events; each rank
+had 2,560 FP32 weight merges, 2,560 rounding kernels and 1,290 NCCL BF16 tree
+all-reduces. This short profile does not establish a wall-time bottleneck or a
+TP speedup. TP4's pure-base performance control remains pending. Larger
+TP/attention-DP layouts, other adapted GDN layouts, DCP and PD require their own
 acceptance results; accepting a configuration at startup is not such a result.
 
 ## Compare sequential instances on the same GPUs
