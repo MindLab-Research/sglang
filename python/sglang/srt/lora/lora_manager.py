@@ -341,6 +341,25 @@ class LoRAManager:
                 f"Failed to load {lora_ref.lora_name} because LoRA serving currently doesn't support DoRA adapters"
             )
 
+        # The runtime uses one alpha/r scaling and plain A/B factors. Reject
+        # PEFT variants rather than silently applying the wrong mathematics.
+        for feature in (
+            "use_rslora",
+            "rank_pattern",
+            "alpha_pattern",
+            "fan_in_fan_out",
+            "lora_bias",
+            "modules_to_save",
+            "layer_replication",
+            "target_parameters",
+            "alora_invocation_tokens",
+            "trainable_token_indices",
+        ):
+            if lora_config.hf_config.get(feature):
+                raise ValueError(f"LoRA serving does not support {feature}")
+        if lora_config.hf_config.get("bias", "none") != "none":
+            raise ValueError("LoRA serving only supports bias='none'")
+
         # Check if this LoRA adapter is already loaded
         for existing_lora_ref in self.lora_refs.values():
             if lora_ref.lora_name == existing_lora_ref.lora_name:

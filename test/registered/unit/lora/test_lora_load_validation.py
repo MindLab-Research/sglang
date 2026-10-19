@@ -174,6 +174,27 @@ class TestLoRALoadValidation(unittest.TestCase):
                 self.assertEqual(manager.lora_refs, {"resident-id": resident})
                 self.assertEqual(manager.num_pinned_loras, 1)
 
+    def test_unsupported_peft_math_is_rejected_before_registration(self):
+        manager = LoRAManager.__new__(LoRAManager)
+        manager.attn_dp_enabled = False
+        ref = SimpleNamespace(lora_name="unsupported")
+        cases = {
+            "use_rslora": True,
+            "rank_pattern": {"q_proj": 4},
+            "alpha_pattern": {"q_proj": 16},
+            "fan_in_fan_out": True,
+            "lora_bias": True,
+            "modules_to_save": ["lm_head"],
+            "bias": "all",
+        }
+        for feature, value in cases.items():
+            with self.subTest(feature=feature):
+                config = SimpleNamespace(
+                    lora_added_tokens_size=0, use_dora=False, hf_config={feature: value}
+                )
+                with self.assertRaisesRegex(ValueError, feature):
+                    manager.validate_new_adapter(config, ref)
+
 
 if __name__ == "__main__":
     unittest.main()
