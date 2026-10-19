@@ -12,7 +12,10 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.constrained.base_grammar_backend import GrammarMask
-from sglang.srt.sampling.custom_logit_processor import DisallowedTokensLogitsProcessor
+from sglang.srt.sampling.custom_logit_processor import (
+    CustomLogitProcessor,
+    DisallowedTokensLogitsProcessor,
+)
 from sglang.srt.sampling.sampling_batch_info import (
     ProcessorEntry,
     SamplingBatchInfo,
@@ -23,6 +26,14 @@ from sglang.test.test_utils import CustomTestCase
 
 VOCAB_SIZE = 32
 DEVICE = "cpu"
+
+
+class CountingLogitProcessor(CustomLogitProcessor):
+    def __call__(self, logits, custom_param_list=None):
+        for row, params in zip(logits, custom_param_list, strict=True):
+            params["calls"] += 1
+            row.add_(params["calls"])
+        return logits
 
 
 # Helper: construct a minimal SamplingBatchInfo
@@ -727,6 +738,8 @@ class TestFromScheduleBatch(CustomTestCase):
         req.sampling_params.stop_token_ids = stop_ids
         req.sampling_params.custom_params = None
         req.custom_logit_processor = None
+        req.extend_end = 1
+        req.full_untruncated_fill_ids = [1]
         req.tokenizer.additional_stop_token_ids = None
         req.tokenizer.eos_token_id = eos_id
         return req
@@ -886,6 +899,57 @@ class TestFromScheduleBatch(CustomTestCase):
         self.assertEqual(entry.indices.dtype, torch.long)
         # custom_params should be collected for all reqs
         self.assertEqual(len(info.custom_params), 2)
+
+    def _counting_batch(self, ends, *, is_extend=True):
+        self._exec_ns.features.enable_custom_logit_processor = True
+        reqs = [self._make_req() for _ in ends]
+        for req, end in zip(reqs, ends):
+            req.custom_logit_processor = CountingLogitProcessor.to_str()
+            req.sampling_params.custom_params = {"calls": 0}
+            req.extend_end = end
+            req.full_untruncated_fill_ids = list(range(8))
+        return MagicMock(
+            reqs=reqs,
+            device=DEVICE,
+            forward_mode=SimpleNamespace(is_extend=lambda: is_extend),
+            overlap_stream_context=None,
+        )
+
+    def test_middle_chunks_do_not_construct_processor_entries(self):
+        # Includes replay after retraction: full fill ids may include old output.
+        batch = self._counting_batch([2, 4])
+        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+        self.assertFalse(info.has_custom_logit_processor)
+        self.assertIsNone(info.custom_logit_processor)
+        self.assertIsNone(info.custom_params)
+
+    def test_chunk_membership_is_snapshotted_before_overlap_advances_request(self):
+        from sglang.srt.layers.sampler import apply_custom_logit_processor
+
+        batch = self._counting_batch([2, 8])
+        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+        # Emulate the next scheduling iteration racing ahead of this sampler.
+        batch.reqs[0].extend_end = 8
+        logits = torch.zeros(2, VOCAB_SIZE)
+        apply_custom_logit_processor(logits, info)
+        self.assertEqual(
+            [r.sampling_params.custom_params["calls"] for r in batch.reqs], [0, 1]
+        )
+        self.assertTrue(torch.equal(logits[0], torch.zeros(VOCAB_SIZE)))
+        self.assertTrue(torch.equal(logits[1], torch.ones(VOCAB_SIZE)))
+        final = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+        apply_custom_logit_processor(torch.zeros_like(logits), final)
+        self.assertEqual(
+            [r.sampling_params.custom_params["calls"] for r in batch.reqs], [1, 2]
+        )
+
+    def test_decode_does_not_use_stale_extend_boundaries(self):
+        from sglang.srt.layers.sampler import apply_custom_logit_processor
+
+        batch = self._counting_batch([2], is_extend=False)
+        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+        apply_custom_logit_processor(torch.zeros(1, VOCAB_SIZE), info)
+        self.assertEqual(batch.reqs[0].sampling_params.custom_params["calls"], 1)
 
 
 if __name__ == "__main__":

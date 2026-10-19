@@ -195,11 +195,21 @@ class SamplingBatchInfo:
                     device, non_blocking=True
                 )
 
-        # Check if any request has custom logit processor
-        has_custom_logit_processor = (
-            get_exec().features.enable_custom_logit_processor
-            and any(r.custom_logit_processor for r in reqs)  # check the flag first.
-        )  # then check the requests.
+        processor_dict = {}
+        if get_exec().features.enable_custom_logit_processor:
+            for i, r in enumerate(reqs):
+                if r.custom_logit_processor is None:
+                    continue
+                # Middle prefill chunks sample a discarded pseudo token. Do
+                # not advance stateful processors until the final chunk. Take
+                # this snapshot here: overlap scheduling can advance the Req
+                # before the sampler consumes this batch's processor entries.
+                if batch.forward_mode.is_extend() and r.extend_end < len(
+                    r.full_untruncated_fill_ids
+                ):
+                    continue
+                processor_dict.setdefault(r.custom_logit_processor, []).append(i)
+        has_custom_logit_processor = bool(processor_dict)
         return_sampling_masks = [r.return_sampling_mask for r in reqs]
         return_sampling_support_logprobs = [
             r.return_sampling_mask and r.sampling_logprobs_mode == "support"
@@ -244,15 +254,6 @@ class SamplingBatchInfo:
 
         if has_custom_logit_processor:
             # Merge the same type of custom logit processors together
-            processor_dict = {}
-            for i, r in enumerate(reqs):
-                if r.custom_logit_processor is None:
-                    continue
-                processor_str = r.custom_logit_processor
-                if processor_str not in processor_dict:
-                    processor_dict[processor_str] = []
-                processor_dict[processor_str].append(i)
-
             merged_custom_logit_processor = {
                 hash(processor_str): ProcessorEntry(
                     processor=CustomLogitProcessor.from_str(processor_str),
