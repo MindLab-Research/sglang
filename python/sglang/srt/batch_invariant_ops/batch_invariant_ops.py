@@ -100,6 +100,7 @@ def matmul_kernel_persistent(
     B_LARGE: tl.constexpr,
     C_LARGE: tl.constexpr,
     HAS_BIAS: tl.constexpr,
+    INPUT_PRECISION: tl.constexpr,
 ):
     start_pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
@@ -146,7 +147,7 @@ def matmul_kernel_persistent(
             b = tl.load(
                 b_ptrs, mask=offs_k_for_mask[:, None] < K - ki * BLOCK_SIZE_K, other=0.0
             )
-            accumulator = tl.dot(a, b, accumulator)
+            accumulator = tl.dot(a, b, accumulator, input_precision=INPUT_PRECISION)
 
         offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -244,6 +245,9 @@ def _matmul_persistent_triton(
         B_LARGE=b.numel() > 2**31,
         C_LARGE=c.numel() > 2**31,
         HAS_BIAS=bias is not None,
+        # Triton otherwise defaults FP32 dot products to TF32, independently
+        # of PyTorch's precision setting. Respect the server's TF32 opt-in.
+        INPUT_PRECISION="tf32" if torch.backends.cuda.matmul.allow_tf32 else "ieee",
         **configs[a.dtype],
     )
     return c
@@ -653,6 +657,7 @@ def bmm_kernel_persistent(
     A_LARGE: tl.constexpr,
     B_LARGE: tl.constexpr,
     C_LARGE: tl.constexpr,
+    INPUT_PRECISION: tl.constexpr,
 ):
     """
     Batched matrix multiplication kernel that processes batches in parallel.
@@ -720,7 +725,7 @@ def bmm_kernel_persistent(
             b = tl.load(
                 b_ptrs, mask=offs_k_for_mask[:, None] < K - ki * BLOCK_SIZE_K, other=0.0
             )
-            accumulator = tl.dot(a, b, accumulator)
+            accumulator = tl.dot(a, b, accumulator, input_precision=INPUT_PRECISION)
 
         offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -832,6 +837,7 @@ def bmm_batch_invariant(a, b, *, out=None):
             A_LARGE=a.numel() > 2**31,
             B_LARGE=b.numel() > 2**31,
             C_LARGE=c.numel() > 2**31,
+            INPUT_PRECISION="tf32" if torch.backends.cuda.matmul.allow_tf32 else "ieee",
             **config,
         )
 

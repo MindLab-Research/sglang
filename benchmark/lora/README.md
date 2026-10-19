@@ -127,3 +127,9 @@ Explicit adapter unload removes its automatic-reload metadata immediately and
 waits for existing requests to drain. New requests using that alias are rejected
 until an explicit load succeeds. Automatic LRU eviction retains reload metadata;
 it does not have the same lifecycle semantics as explicit unload.
+
+The deterministic Triton FP32 GEMM path now honors
+`torch.backends.cuda.matmul.allow_tf32`: FP32 dot products use IEEE precision
+unless TF32 is explicitly enabled. BF16 and FP16 dot products are unaffected.
+High-precision arithmetic hooks used for diagnosis change the computation and
+must not be reported as acceptance of the native BF16 LoRA path.
