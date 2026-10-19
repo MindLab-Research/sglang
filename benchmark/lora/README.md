@@ -86,6 +86,26 @@ evictions still execute the same FP32 merge and BF16 rounding. A warm hit reuses
 that exact tensor. This option is under validation; measure cold-fill latency,
 warm throughput, mixed-adapter eviction and actual peak memory together.
 
+Choose this budget from the adapted projection shapes, then check the resolved
+KV and request limits after startup. On the dedicated B300 TP1 experiment,
+Qwen3.8-27B's real dense adapter changes 256 BF16 tensors totaling 35 GiB.
+`--lora-merged-bf16-cache-size-mb 36864 --max-total-tokens 65536` retained a
+65,536-row KV pool with 256 Mamba slots at static memory fraction 0.5. The first
+40 GiB attempt left only 1,565 KV rows and rejected a 1,630-token test input;
+that attempt is a capacity failure, not a passing comparison. These numbers
+describe this model, adapter and GPU configuration, not a general default.
+
+The 36 GiB retry passed the independent-merge comparison: 240 pairs and
+111,184 scores for the real adapter, plus eight pairs and 3,508 scores for the
+fused GDN adapter, all with zero logprob differences and matching argmax.
+Mixed routing and 108 LRU reload requests also passed their consistency checks.
+Those checks do not establish actual KV-prefix restoration or a speedup. Measure
+multiple adapters too: a budget that holds one adapter can evict weights during
+every forward when several active adapters exceed it. Keep the KV pool equal
+in cached, uncached and merged speed controls; 32 requests of 2,048 input plus
+256 output tokens exceed a 65,536-row pool and can queue despite a request
+limit of 32.
+
 Its current supported configuration is DP1/PP1, unquantized BF16 weights,
 deterministic inference, eager execution, an explicit maximum LoRA rank of
 1 through 64, and dense targets only:
