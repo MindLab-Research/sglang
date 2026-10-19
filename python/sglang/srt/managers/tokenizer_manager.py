@@ -3505,11 +3505,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     pyspy_dump_schedulers(scheduler_only=True)
 
                 if should_dump_cuda_coredump:
-                    trigger_cuda_user_coredump(scheduler_only=True)
+                    dump_triggered = trigger_cuda_user_coredump(scheduler_only=True)
                     cuda_coredump_wait_secs = (
                         envs.SGLANG_CUDA_COREDUMP_BEFORE_CRASH_WAIT_SECS.get()
                     )
-                    if cuda_coredump_wait_secs > 0:
+                    if dump_triggered and cuda_coredump_wait_secs > 0:
                         logger.info(
                             "Waiting %.1f seconds for CUDA coredumps before exiting.",
                             cuda_coredump_wait_secs,

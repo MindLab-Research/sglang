@@ -146,21 +146,21 @@ class WatchdogRaw:
                     watchdog_last_time = current
             time.sleep(self.watchdog_timeout / 2)
 
-        if self.dump_info is not None and (info_msg := self.dump_info()):
-            logger.error(f"{self.debug_name} debug info:\n{info_msg}")
-
-        pyspy_dump_schedulers()
         logger.error(
             f"{self.debug_name} watchdog timeout "
             f"({self.watchdog_timeout=}, {self.soft=})"
         )
+        if not self.soft:
+            # Notify first: diagnostic callbacks may themselves block on a
+            # stuck CUDA operation. The parent owns bounded crash cleanup.
+            self.parent_process.send_signal(signal.SIGQUIT)
+
+        if self.dump_info is not None and (info_msg := self.dump_info()):
+            logger.error(f"{self.debug_name} debug info:\n{info_msg}")
+
+        pyspy_dump_schedulers()
         print(file=sys.stderr, flush=True)
         print(file=sys.stdout, flush=True)
-
-        if not self.soft:
-            # Wait for some time so that the parent process can print the error.
-            time.sleep(5)
-            self.parent_process.send_signal(signal.SIGQUIT)
 
 
 class SubprocessWatchdog:

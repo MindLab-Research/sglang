@@ -67,8 +67,12 @@ def collect_scheduler_processes() -> List[psutil.Process]:
     ]
 
 
-def pyspy_dump_schedulers(scheduler_only=False):
-    """py-spy dump on all scheduler in a local node."""
+def pyspy_dump_schedulers(scheduler_only=False, timeout=10.0):
+    """Dump local scheduler stacks within a shared deadline.
+
+    Crash handling must eventually exit even if ptrace/py-spy is stuck. Run
+    py-spy directly so subprocess.run can kill and reap the actual debugger.
+    """
     if scheduler_only:
         procs = collect_scheduler_processes()
         if not procs:
@@ -77,43 +81,64 @@ def pyspy_dump_schedulers(scheduler_only=False):
         pids = [proc.pid for proc in procs]
     else:
         pids = [psutil.Process().pid]
+    deadline = time.monotonic() + timeout
     for pid in pids:
         for attempt, native_flag in enumerate(["--native", ""]):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.error("Pyspy dump deadline exceeded; continuing crash cleanup.")
+                return
+            cmd = ["py-spy", "dump"]
+            if native_flag:
+                cmd.append(native_flag)
+            cmd.extend(["--pid", str(pid)])
             try:
-                cmd = f"py-spy dump {native_flag} --pid {pid}".strip()
                 result = subprocess.run(
-                    cmd, shell=True, capture_output=True, text=True, check=True
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    timeout=min(5.0, remaining),
                 )
                 logger.error(f"Pyspy dump for PID {pid} ({cmd}):\n{result.stdout}")
                 break
-            except subprocess.CalledProcessError as e:
-                logger.error(f"Pyspy failed ({cmd}). Error: {e.stderr}")
+            except (
+                subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
+                OSError,
+            ) as e:
+                logger.error(
+                    f"Pyspy failed ({cmd}). Error: {getattr(e, 'stderr', None) or e}"
+                )
                 if attempt == 1:
                     logger.error(f"All pyspy dump attempts failed for PID {pid}.")
 
 
-def trigger_cuda_user_coredump(scheduler_only=False):
-    """Trigger CUDA user-induced GPU core dumps by writing to coredump pipes."""
+def trigger_cuda_user_coredump(scheduler_only=False) -> bool:
+    """Return whether any CUDA dump pipe was successfully triggered."""
     if os.environ.get("CUDA_ENABLE_USER_TRIGGERED_COREDUMP") != "1":
         logger.error(
             "CUDA user-triggered coredump is not enabled. Set "
             "CUDA_ENABLE_USER_TRIGGERED_COREDUMP=1 before CUDA initialization."
         )
+        return False
 
     if scheduler_only:
         procs = collect_scheduler_processes()
         if not procs:
             logger.error("No sglang scheduler processes found for CUDA coredump.")
-            return
+            return False
     else:
         procs = [psutil.Process()]
 
+    triggered = False
     for proc in procs:
         pipe_path = _resolve_cuda_coredump_pipe_path(proc)
         try:
             fd = os.open(pipe_path, os.O_WRONLY | os.O_NONBLOCK)
             try:
                 os.write(fd, b"1")
+                triggered = True
             finally:
                 os.close(fd)
             logger.error(
@@ -142,3 +167,4 @@ def trigger_cuda_user_coredump(scheduler_only=False):
                     proc.pid,
                     pipe_path,
                 )
+    return triggered
