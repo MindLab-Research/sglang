@@ -64,6 +64,8 @@ def quantile(values, fraction):
 
 
 def stats(pairs):
+    if not pairs:
+        return {"count": 0, "passes_logprob_gate": None, "status": "not_measured"}
     errors = [abs(a[0] - b[0]) for a, b in pairs]
     assert errors and all(math.isfinite(x) for x in errors)
     return {
@@ -133,9 +135,6 @@ def main(args):
                             raise ValueError(f"Capture file already exists: {path}")
                         captures[side] = path
                         req = common | {
-                            "return_logprob": True,
-                            "logprob_start_len": 0,
-                            "top_logprobs_num": 1,
                             "custom_logit_processor": processor,
                             "sampling_params": common["sampling_params"]
                             | {
@@ -145,6 +144,12 @@ def main(args):
                                 }
                             },
                         }
+                        if not args.skip_prefill_logprobs:
+                            req.update(
+                                return_logprob=True,
+                                logprob_start_len=0,
+                                top_logprobs_num=1,
+                            )
                         if side == "D":
                             req["lora_path"] = args.adapter_name
                         futures[side] = executor.submit(call, url, "/generate", req)
@@ -167,23 +172,24 @@ def main(args):
                         records[side] = rows
                     case_pairs = {"prefill": [], "prefill_last": [], "decode": []}
                     d_meta, m_meta = (results[s]["meta_info"] for s in ("D", "M"))
-                    d_lp, m_lp = (
-                        d_meta["input_token_logprobs"],
-                        m_meta["input_token_logprobs"],
-                    )
-                    assert len(d_lp) == len(m_lp) == len(prompt)
-                    d_top, m_top = (
-                        d_meta["input_top_logprobs"],
-                        m_meta["input_top_logprobs"],
-                    )
-                    for pos in range(1, len(prompt)):
-                        assert d_lp[pos][1] == m_lp[pos][1] == prompt[pos]
-                        case_pairs["prefill"].append(
-                            (
-                                (d_lp[pos][0], d_top[pos][0][1]),
-                                (m_lp[pos][0], m_top[pos][0][1]),
-                            )
+                    if not args.skip_prefill_logprobs:
+                        d_lp, m_lp = (
+                            d_meta["input_token_logprobs"],
+                            m_meta["input_token_logprobs"],
                         )
+                        assert len(d_lp) == len(m_lp) == len(prompt)
+                        d_top, m_top = (
+                            d_meta["input_top_logprobs"],
+                            m_meta["input_top_logprobs"],
+                        )
+                        for pos in range(1, len(prompt)):
+                            assert d_lp[pos][1] == m_lp[pos][1] == prompt[pos]
+                            case_pairs["prefill"].append(
+                                (
+                                    (d_lp[pos][0], d_top[pos][0][1]),
+                                    (m_lp[pos][0], m_top[pos][0][1]),
+                                )
+                            )
                     for d, m in zip(records["D"], records["M"]):
                         phase = d["phase"]
                         case_pairs[phase].append(
@@ -204,6 +210,8 @@ def main(args):
                     for phase, pairs in case_pairs.items():
                         all_pairs[phase].extend(pairs)
                         row[phase] = stats(pairs)
+                        if not pairs:
+                            continue
                         row[phase]["worst_positions"] = sorted(
                             (
                                 {
@@ -237,6 +245,7 @@ def main(args):
         "cases": len(corpus),
         "rounds": args.rounds,
         "decode_tokens": args.decode_tokens,
+        "prefill_logprobs_measured": not args.skip_prefill_logprobs,
         "cache_modes": ["cold", "hot"],
         "cache_mode_note": (
             "hot means no explicit flush; scoring from logprob_start_len=0 "
@@ -266,4 +275,12 @@ if __name__ == "__main__":
     parser.add_argument("--limit", type=int, default=30)
     parser.add_argument("--decode-tokens", type=int, default=256)
     parser.add_argument("--rounds", type=int, default=4)
+    parser.add_argument(
+        "--skip-prefill-logprobs",
+        action="store_true",
+        help=(
+            "Only score prefill-last and cached decode. Avoids full-prompt logits "
+            "for long-context diagnostics; prompt-token equivalence is not measured."
+        ),
+    )
     main(parser.parse_args())

@@ -44,6 +44,11 @@ The corpus is a JSON list of objects with unique `id` and integer `input_ids`.
 Defaults are 30 inputs, 256 continuation tokens, four rounds, cold and hot cache.
 Reduced `--limit`, `--decode-tokens` and `--rounds` runs are diagnostics, not
 completion of that matrix. Output directories must be new.
+For long-context diagnostics, `--skip-prefill-logprobs` avoids materializing
+full-prompt vocabulary logits and scores only `prefill_last` and cached decode.
+The omitted `prefill` phase is recorded as `not_measured` with a null gate result;
+it cannot count as prompt-token equivalence passing. Keep the default full
+prompt scoring for the primary short-input acceptance matrix.
 `hot` means no explicit cache flush. Scoring every prompt token from position
 zero can prevent prefix reuse; inspect per-case `cached_tokens` and test actual
 cache restores separately.
