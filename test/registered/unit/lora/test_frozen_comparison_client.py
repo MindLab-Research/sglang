@@ -18,6 +18,25 @@ from pd_native import NativePDClient
 
 
 class TestFrozenClient(unittest.TestCase):
+    def test_unused_overlap_sample_does_not_change_logits_or_extend_scores(self):
+        with tempfile.TemporaryDirectory() as d:
+            params = {
+                "capture_file": str(Path(d) / "scores"),
+                "capture_start_step": 1,
+                "continuation": [0, 2],
+            }
+            with patch("torch.distributed.get_rank", return_value=0):
+                CaptureAndForce()(torch.tensor([[1.0, 2.0, 3.0]]), [params])
+                x = torch.tensor([[3.0, 1.0, 2.0]])
+                original = x.clone()
+                CaptureAndForce()(x, [params])
+            self.assertTrue(torch.equal(x, original))
+            rows = Path(params["capture_file"] + ".rank-0").read_text().splitlines()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(json.loads(rows[0])["step"], 1)
+            unused = Path(params["capture_file"] + ".unused.rank-0").read_text()
+            self.assertEqual(json.loads(unused), {"step": 2})
+
     def test_original_scores_and_decode_start(self):
         with tempfile.TemporaryDirectory() as d:
             params = {

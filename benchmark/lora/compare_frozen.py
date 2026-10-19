@@ -25,6 +25,15 @@ class CaptureAndForce(CustomLogitProcessor):
         for i, params in enumerate(custom_param_list):
             step = params.get("_capture_step", params.get("capture_start_step", 0))
             params["_capture_step"] = step + 1
+            if step >= len(params["continuation"]):
+                # Overlap decoding can sample an already-completed row once
+                # more before filtering it from the next batch. The response
+                # and capture reader still require the exact continuation.
+                # Keep the unused logits unchanged and record this separately.
+                path = params["capture_file"] + f".unused.rank-{dist.get_rank()}"
+                with open(path, "a") as f:
+                    f.write(json.dumps({"step": step}) + "\n")
+                continue
             token = params["continuation"][step]
             original = logits[i].float()
             row = {
