@@ -42,6 +42,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
 
     supports_packed_decode: bool = not is_cpu() and not is_npu()
     supports_strided_target_verify_qkv: bool = True
+    supports_track_state_snapshot: bool = not (is_cpu() or is_npu() or is_xpu())
 
     def packed_decode(
         self,
@@ -183,6 +184,16 @@ class TritonGDNKernel(LinearAttnKernelBase):
         recurrent_state = ssm_states
         recurrent_state_indices_args = {"initial_state_indices": cache_indices}
         inplace_update_args = {"inplace_update": inplace_update}
+        snapshot_args = {}
+        if kwargs.get("track_state") is not None:
+            if not self.supports_track_state_snapshot:
+                raise NotImplementedError(
+                    "GDN FP32 snapshots require the Triton kernel"
+                )
+            snapshot_args = {
+                "track_state": kwargs["track_state"],
+                "track_chunk_idx": kwargs["track_chunk_idx"],
+            }
         if is_cpu():
             if not inplace_update:
                 raise NotImplementedError(
@@ -212,6 +223,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             use_qk_l2norm_in_kernel=True,
             **recurrent_state_indices_args,
             **inplace_update_args,
+            **snapshot_args,
         )
 
     def target_verify(
