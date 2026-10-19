@@ -1154,6 +1154,15 @@ class LoRAMemoryPool:
                 # the new slot) and the wrapped layer module will read it.
                 active_target_modules.add(target_module)
 
+                backend = getattr(module, "lora_backend", None)
+                if not validate_only and getattr(backend, "merges_weights", False):
+                    backend.set_layer_adapter_presence(
+                        module,
+                        buffer_id,
+                        temp_A_buffer[target_module] is not None
+                        and temp_B_buffer[target_module] is not None,
+                    )
+
                 if temp_A_buffer[target_module] is None:
                     # Skip weight slicing if the weight is not present in the adapter
                     continue

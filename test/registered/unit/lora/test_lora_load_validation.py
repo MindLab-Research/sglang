@@ -102,6 +102,38 @@ class TestLoRALoadValidation(unittest.TestCase):
     def test_valid_preflight_is_read_only(self):
         self.check_preflight()
 
+    def test_merge_target_presence_tracks_each_layer_and_slot_reuse(self):
+        from sglang.srt.lora.backend.merged_bf16_backend import MergedBF16LoRABackend
+
+        pool, adapter, modules = self.make_pool_and_adapter()
+        backend = object.__new__(MergedBF16LoRABackend)
+        backend.max_loras_per_batch = 2
+        for layer in modules:
+            layer["out_proj"].lora_backend = backend
+        pool.validate_lora_weights("candidate", adapter, modules, None, None)
+        self.assertTrue(
+            all(
+                not hasattr(layer["out_proj"], "merged_bf16_adapter_present")
+                for layer in modules
+            )
+        )
+        pool._get_maybe_cached_weight_for_transfer = Mock(
+            side_effect=lambda weights, key, tensor: tensor
+        )
+        original = adapter.layers[1].weights
+        for present in (True, False, True):
+            adapter.layers[1].weights = original if present else {}
+            with patch("sglang.srt.lora.mem_pool.copy_weight_into_buffer"):
+                pool.load_lora_weight_to_buffer(
+                    "candidate", 0, adapter, modules, None, None
+                )
+            self.assertEqual(
+                modules[0]["out_proj"].merged_bf16_adapter_present, [True, True]
+            )
+            self.assertEqual(
+                modules[1]["out_proj"].merged_bf16_adapter_present, [present, True]
+            )
+
     def test_late_bad_shape_leaves_all_buffers_unchanged(self):
         def mutate(pool, adapter):
             adapter.layers[1].weights["model.layers.1.out_proj.lora_B.weight"] = (

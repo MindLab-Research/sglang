@@ -100,6 +100,18 @@ operator overrides; the BF16 activation GEMM remains deterministic. Equality wit
 the independent reference must still be established by the full comparison
 matrix above, including real adapters, mixed routing and long contexts.
 
+The pool records target presence per layer and slot on every adapter load;
+projections absent from that adapter use the unchanged base weight. Unknown
+metadata keeps the merge path. A single-adapter batch avoids routing copies.
+On CUDA, scaling, adding the base and BF16 writeback share one kernel with FMA
+disabled, preserving the separate FP32 multiply/add rounding. The native FP32
+merge GEMM and transient-weight lifetime remain unchanged.
+
+For GDN models, check the resolved request limit in startup logs as well as
+`--max-running-requests`: the Mamba state pool can cap it below the requested
+value. Reserve enough state slots for the concurrent requests and cache
+snapshots, and report observed GPU batch sizes separately from HTTP concurrency.
+
 ## Check prefix consistency
 
 Shape-dependent arithmetic can make an unchanged causal prefix score differently

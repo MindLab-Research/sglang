@@ -10,8 +10,21 @@ from math import isfinite
 
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 from sglang.srt.lora.backend.triton_backend import TritonLoRABackend
 from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
+
+
+@triton.jit
+def _round_merged_weight(delta, base, output, size, scale, BLOCK: tl.constexpr):
+    index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = index < size
+    update = tl.load(delta + index, mask, other=0)
+    weight = tl.load(base + index, mask, other=0).to(tl.float32)
+    # The launch disables contraction: preserve separate FP32 mul/add rounding.
+    value = update * scale + weight
+    tl.store(output + index, value, mask)
 
 
 def merge_bf16_weight(weight, a, b, rank, scaling, offsets):
@@ -63,9 +76,20 @@ def merge_bf16_weight(weight, a, b, rank, scaling, offsets):
             a[i * rank : (i + 1) * rank],
             out=delta,
         )
-        delta.mul_(scaling)
-        delta.add_(weight[start:end])
-        result[start:end].copy_(delta)
+        if weight.is_cuda:
+            _round_merged_weight[(triton.cdiv(delta.numel(), 4096),)](
+                delta,
+                weight[start:end],
+                result[start:end],
+                delta.numel(),
+                scaling,
+                BLOCK=4096,
+                enable_fp_fusion=False,
+            )
+        else:
+            delta.mul_(scaling)
+            delta.add_(weight[start:end])
+            result[start:end].copy_(delta)
         del delta
     return result
 
@@ -99,6 +123,13 @@ class MergedBF16LoRABackend(TritonLoRABackend):
             )
         super().__init__(max_loras_per_batch, device, **kwargs)
         self.merge_groups = []
+
+    def set_layer_adapter_presence(self, layer, slot, present):
+        # Updated by the pool on every slot load, including slot reuse. No
+        # device-side reductions or tensor-value inspection in the forward.
+        if not hasattr(layer, "merged_bf16_adapter_present"):
+            layer.merged_bf16_adapter_present = [True] * self.max_loras_per_batch
+        layer.merged_bf16_adapter_present[slot] = present
 
     def reset_batch_state(self):
         super().reset_batch_state()
@@ -176,11 +207,22 @@ class MergedBF16LoRABackend(TritonLoRABackend):
         if a is None:
             a, b = layer.A_buffer_qkv, layer.B_buffer_qkv
         weight = layer.base_layer.weight
+        present = getattr(layer, "merged_bf16_adapter_present", None)
+        groups = [
+            (slot, rank if present is None or present[slot] else 0, scale, rows)
+            for slot, rank, scale, rows in self.merge_groups
+        ]
+        if not any(rank for _, rank, _, _ in groups):
+            return F.linear(x, weight, bias)
         offsets = layer.output_offset_cpu.tolist()
+        if len(groups) == 1:
+            slot, rank, scale, _ = groups[0]
+            merged = merge_bf16_weight(weight, a[slot], b[slot], rank, scale, offsets)
+            return F.linear(x, merged, bias)
         output = torch.empty(
             (x.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device
         )
-        for slot, rank, scale, rows in self.merge_groups:
+        for slot, rank, scale, rows in groups:
             merged = (
                 merge_bf16_weight(weight, a[slot], b[slot], rank, scale, offsets)
                 if rank

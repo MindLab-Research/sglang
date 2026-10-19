@@ -8,6 +8,7 @@ from unittest.mock import patch
 import torch
 from sglang.srt.lora.backend.merged_bf16_backend import (
     MergedBF16LoRABackend,
+    _round_merged_weight,
     merge_bf16_weight,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -132,6 +133,72 @@ class TestMergedBF16Configuration(unittest.TestCase):
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
 class TestMergedBF16(unittest.TestCase):
+    def test_fused_rounding_matches_separate_fp32_operations_at_bf16_ties(self):
+        import triton
+
+        torch.manual_seed(41)
+        # Probe both sides of BF16 rounding boundaries, cancellation, and
+        # tiny FP32 values. Disabling FMA is necessary at these boundaries.
+        base = torch.randn(131071, device="cuda").bfloat16()
+        for scale in (1.7, 2.0, -0.3, 0.0, 1e-20):
+            with self.subTest(scale=scale):
+                delta = torch.randn(base.numel(), device="cuda") * 0.01
+                if scale:
+                    target = base.float() * (1 + 1 / 256)
+                    delta[:65536] = ((target - base.float()) / scale)[:65536]
+                delta[65536:65540] = torch.tensor(
+                    [0, 1e-40, -1e-40, torch.finfo(torch.float32).tiny],
+                    device="cuda",
+                )
+                expected = delta.mul(scale).add(base).bfloat16()
+                actual = torch.empty_like(base)
+                _round_merged_weight[(triton.cdiv(delta.numel(), 4096),)](
+                    delta,
+                    base,
+                    actual,
+                    delta.numel(),
+                    scale,
+                    BLOCK=4096,
+                    enable_fp_fusion=False,
+                )
+                torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+    def test_absent_projection_bypass_and_slot_reuse(self):
+        torch.manual_seed(43)
+        backend = object.__new__(MergedBF16LoRABackend)
+        backend.max_loras_per_batch = 3
+        backend.merge_groups = [(1, 8, 1.7, torch.arange(5, device="cuda"))]
+        weight = torch.randn(64, 128, device="cuda").bfloat16()
+        layer = SimpleNamespace(
+            base_layer=SimpleNamespace(weight=weight),
+            A_buffer=torch.randn(3, 16, 128, device="cuda") * 0.01,
+            B_buffer=torch.randn(3, 64, 16, device="cuda") * 0.01,
+            output_offset_cpu=torch.tensor([0, 64]),
+        )
+        x = torch.randn(5, 128, device="cuda").bfloat16()
+        bias = torch.randn(64, device="cuda").bfloat16()
+        path = "sglang.srt.lora.backend.merged_bf16_backend.merge_bf16_weight"
+        for present in (True, False, True):
+            backend.set_layer_adapter_presence(layer, 1, present)
+            with patch(path, wraps=merge_bf16_weight) as merge:
+                actual = backend.run_merged_linear(layer, x, bias)
+                self.assertEqual(merge.call_count, int(present))
+            expected_weight = (
+                merge_bf16_weight(
+                    weight, layer.A_buffer[1], layer.B_buffer[1], 8, 1.7, [0, 64]
+                )
+                if present
+                else weight
+            )
+            torch.testing.assert_close(
+                actual,
+                torch.nn.functional.linear(x, expected_weight, bias),
+                atol=0,
+                rtol=0,
+            )
+        # Unknown slots remain conservative, even after another slot is known.
+        self.assertEqual(layer.merged_bf16_adapter_present, [True, True, True])
+
     def test_native_merge_matches_export_under_batch_invariant_mode(self):
         from sglang.srt.batch_invariant_ops.batch_invariant_ops import (
             disable_batch_invariant_mode,
@@ -201,7 +268,22 @@ class TestMergedBF16(unittest.TestCase):
             B_buffer=b.cuda(),
             output_offset_cpu=torch.tensor([0, 64]),
         )
-        actual = backend.run_merged_linear(layer, x.cuda(), None)
+        with patch(
+            "sglang.srt.lora.backend.merged_bf16_backend.merge_bf16_weight",
+            wraps=merge_bf16_weight,
+        ) as merge:
+            conservative = backend.run_merged_linear(layer, x.cuda(), None)
+            self.assertEqual(merge.call_count, 2)
+        # Slot 2 has no target on this layer. Its buffers need not be scanned
+        # during inference, and only slot 1 should materialize a merged weight.
+        layer.merged_bf16_adapter_present = [False, True, False]
+        with patch(
+            "sglang.srt.lora.backend.merged_bf16_backend.merge_bf16_weight",
+            wraps=merge_bf16_weight,
+        ) as merge:
+            actual = backend.run_merged_linear(layer, x.cuda(), None)
+            self.assertEqual(merge.call_count, 1)
+        torch.testing.assert_close(actual, conservative, atol=0, rtol=0)
         # CPU and GPU BF16 GEMMs need not use the same accumulation tree.
         torch.testing.assert_close(actual.cpu(), expected, atol=1e-3, rtol=1e-2)
         torch.testing.assert_close(layer.base_layer.weight.cpu(), w, atol=0, rtol=0)
