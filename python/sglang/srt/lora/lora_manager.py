@@ -315,6 +315,8 @@ class LoRAManager:
             self.lora_refs[lora_ref.lora_id] = lora_ref
             self.num_pinned_loras += int(lora_ref.pinned)
         except Exception as e:
+            self.configs.pop(lora_ref.lora_id, None)
+            self.loras.pop(lora_ref.lora_id, None)
             return self.create_lora_update_result(
                 success=False,
                 error_message=str(e),
@@ -897,6 +899,19 @@ class LoRAManager:
                 )
             self.lora_added_tokens_size = inferred_extra_vocab_size
 
+    def validate_loaded_adapter(self, lora_adapter: LoRAAdapter):
+        # Startup adapters are read before the pool exists. Validate those in
+        # init_memory_pool, before any adapter is made resident.
+        memory_pool = getattr(self, "memory_pool", None)
+        if memory_pool is not None:
+            memory_pool.validate_lora_weights(
+                lora_adapter.uid,
+                lora_adapter,
+                self.lora_modules,
+                self.embed_tokens_module,
+                self.lm_head_module,
+            )
+
     def load_lora_weights(self, lora_ref: LoRARef):
         """
         Load the weights of a LoRA adapter to CPU memory and conducts post-loading validation.
@@ -917,6 +932,7 @@ class LoRAManager:
             speculative_algorithm=self.speculative_algorithm,
         )
 
+        self.validate_loaded_adapter(lora_adapter)
         self.loras[lora_ref.lora_id] = lora_adapter
 
     def load_lora_weights_from_tensors(
@@ -940,6 +956,7 @@ class LoRAManager:
             embedding_layer_names=lora_adapter.embedding_layers.keys(),
             speculative_algorithm=self.speculative_algorithm,
         )
+        self.validate_loaded_adapter(lora_adapter)
         self.loras[lora_ref.lora_id] = lora_adapter
 
     def load_lora_adapter_from_tensors(
@@ -987,6 +1004,8 @@ class LoRAManager:
             self.lora_refs[lora_ref.lora_id] = lora_ref
             self.num_pinned_loras += int(lora_ref.pinned)
         except Exception as e:
+            self.configs.pop(lora_ref.lora_id, None)
+            self.loras.pop(lora_ref.lora_id, None)
             return self.create_lora_update_result(
                 success=False,
                 error_message=str(e),
@@ -1009,6 +1028,9 @@ class LoRAManager:
             strict_loading=self.lora_strict_loading,
             enable_lora_overlap_loading=self.enable_lora_overlap_loading,
         )
+
+        for lora_adapter in self.loras.values():
+            self.validate_loaded_adapter(lora_adapter)
 
         # Initializing memory pool with base model
         self.fetch_new_loras({None})

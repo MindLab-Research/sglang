@@ -890,6 +890,29 @@ class LoRAMemoryPool:
         self.eviction_policy.remove(uid)
         return buffer_id
 
+    def validate_lora_weights(
+        self,
+        uid: str,
+        lora_adapter: LoRAAdapter,
+        lora_modules: List[Dict[str, torch.nn.Module]],
+        lora_embed_tokens_module: Optional[BaseLayerWithLoRA],
+        lora_lm_head_module: Optional[BaseLayerWithLoRA],
+    ) -> None:
+        """Validate local shapes without touching resident adapters or LRU state.
+
+        Slot zero is used only for its shapes, including for malformed late
+        layers and embeddings. CPU slicing matches the actual transfer path.
+        """
+        self.load_lora_weight_to_buffer(
+            uid,
+            0,
+            lora_adapter,
+            lora_modules,
+            lora_embed_tokens_module,
+            lora_lm_head_module,
+            validate_only=True,
+        )
+
     def load_lora_weight_to_buffer(
         self,
         uid: str,
@@ -898,22 +921,40 @@ class LoRAMemoryPool:
         lora_modules: List[Dict[str, torch.nn.Module]],
         lora_embed_tokens_module: Optional[BaseLayerWithLoRA],
         lora_lm_head_module: Optional[BaseLayerWithLoRA],
+        *,
+        validate_only: bool = False,
     ):
+        # Use the exact transfer layout for validation, without changing slots
+        # or creating pinned-memory cache entries.
+        def zero_buffer(buffer_view: torch.Tensor):
+            if not validate_only:
+                buffer_view.zero_()
+
+        def prepare_weight(pinned_store, cache_key, weight):
+            if validate_only:
+                return weight
+            return self._get_maybe_cached_weight_for_transfer(
+                pinned_store, cache_key, weight
+            )
+
         def load_lora_weight_tensor(
             buffer_view: torch.Tensor, weight: Optional[torch.Tensor]
         ):
             if weight is None:
-                # If the particular weight is not present in the adapter, we initialize the buffer to zero
-                # to avoid contamination from the residual weight of the evicted adapters.
-                buffer_view.zero_()
+                zero_buffer(buffer_view)
             else:
-                assert buffer_view.shape == weight.shape, (
-                    f"LoRA buffer shape {buffer_view.shape} does not match weight shape {weight.shape}."
-                )
-                copy_weight_into_buffer(buffer_view, weight)
+                if buffer_view.shape != weight.shape:
+                    raise ValueError(
+                        f"LoRA adapter {uid!r}, layer {layer_id}, module {name!r}: "
+                        f"buffer shape {tuple(buffer_view.shape)} does not match "
+                        f"weight shape {tuple(weight.shape)}."
+                    )
+                if not validate_only:
+                    copy_weight_into_buffer(buffer_view, weight)
 
         if uid is None:
-            self._clear_buffer_slot_for_base(buffer_id)
+            if not validate_only:
+                self._clear_buffer_slot_for_base(buffer_id)
             return
 
         assert lora_adapter is not None
@@ -935,7 +976,7 @@ class LoRAMemoryPool:
                 matched_modules.add(target_module)
             except ValueError:
                 skipped_weight_names.add(name)
-        if matched_modules:
+        if matched_modules and not validate_only:
             logger.info(
                 "LoRA adapter '%s': loaded weights for target modules %s.",
                 uid,
@@ -1168,7 +1209,7 @@ class LoRAMemoryPool:
                                     f"{weights.shape[0]} (expected 1)."
                                 )
                             assert isinstance(weights_cache_key, str)
-                            weights = self._get_maybe_cached_weight_for_transfer(
+                            weights = prepare_weight(
                                 pinned_layer_weights,
                                 weights_cache_key,
                                 weights,
@@ -1184,7 +1225,7 @@ class LoRAMemoryPool:
                             rep = next(iter(weights.values()))
                             assert isinstance(weights_cache_key, dict)
                             rep_cache_key = next(iter(weights_cache_key.values()))
-                            rep = self._get_maybe_cached_weight_for_transfer(
+                            rep = prepare_weight(
                                 pinned_layer_weights, rep_cache_key, rep
                             )
                             representative_weight = rep
@@ -1205,7 +1246,7 @@ class LoRAMemoryPool:
                         # Place each stacked component at max_rank-spaced
                         # positions so the kernel's [:max_r] / [max_r:2*max_r]
                         # slicing is correct.
-                        target_buffer[buffer_id, 0].zero_()
+                        zero_buffer(target_buffer[buffer_id, 0])
                         if representative_weight is not None:
                             for ci in range(c):
                                 buffer_view = target_buffer[
@@ -1218,14 +1259,14 @@ class LoRAMemoryPool:
                                     ],
                                 )
                     elif weights is None:
-                        target_buffer[buffer_id].zero_()
+                        zero_buffer(target_buffer[buffer_id])
                     elif isinstance(weights, (torch.Tensor, dict)):
                         # Zero first so any local-expert slot the adapter
                         # doesn't fill (e.g. out-of-rank under EP) is clean;
                         # then load owned slots at max_rank-spaced offsets so
                         # the MoE kernel's [:max_r] / [max_r:2*max_r] slicing
                         # is correct.
-                        target_buffer[buffer_id].zero_()
+                        zero_buffer(target_buffer[buffer_id])
                         assert isinstance(weights_cache_key, (str, dict))
                         for (
                             local_eid,
@@ -1238,7 +1279,7 @@ class LoRAMemoryPool:
                         ):
                             if expert_weight is None:
                                 continue
-                            expert_weight = self._get_maybe_cached_weight_for_transfer(
+                            expert_weight = prepare_weight(
                                 pinned_layer_weights,
                                 expert_cache_key,
                                 expert_weight,
@@ -1260,7 +1301,7 @@ class LoRAMemoryPool:
                     buffer_view = target_buffer[buffer_id, : lora_rank * c, :]
                     if weights is not None:
                         assert isinstance(weights_cache_key, str)
-                        weights = self._get_maybe_cached_weight_for_transfer(
+                        weights = prepare_weight(
                             pinned_layer_weights,
                             weights_cache_key,
                             weights,
@@ -1300,7 +1341,7 @@ class LoRAMemoryPool:
                             assert isinstance(weights_cache_key, str)
                             if w is not None:
                                 w = w * lora_adapter.scaling
-                                w = self._get_maybe_cached_weight_for_transfer(
+                                w = prepare_weight(
                                     pinned_layer_weights,
                                     append_cache_key_suffix(
                                         weights_cache_key, "expert0"
@@ -1321,7 +1362,7 @@ class LoRAMemoryPool:
                             buffer_view = target_buffer[buffer_id, 0, :, :lora_rank]
                             if rep is not None:
                                 rep = rep * lora_adapter.scaling
-                                rep = self._get_maybe_cached_weight_for_transfer(
+                                rep = prepare_weight(
                                     pinned_layer_weights,
                                     rep_cache_key,
                                     rep,
@@ -1334,14 +1375,14 @@ class LoRAMemoryPool:
                                 f"shape={weights.shape if isinstance(weights, torch.Tensor) else 'N/A'}"
                             )
                         # Zero beyond loaded rank — MoE kernel reads full max_rank.
-                        target_buffer[buffer_id, 0, :, lora_rank:].zero_()
+                        zero_buffer(target_buffer[buffer_id, 0, :, lora_rank:])
                     elif weights is None:
-                        target_buffer[buffer_id].zero_()
+                        zero_buffer(target_buffer[buffer_id])
                     elif isinstance(weights, (torch.Tensor, dict)):
                         # Zero out slots this rank owns but the adapter
                         # doesn't fill (padded-out / out-of-rank experts);
                         # then scale+load the ones it does.
-                        target_buffer[buffer_id].zero_()
+                        zero_buffer(target_buffer[buffer_id])
                         assert isinstance(weights_cache_key, (str, dict))
                         for (
                             local_eid,
@@ -1354,7 +1395,7 @@ class LoRAMemoryPool:
                         ):
                             if w is not None:
                                 w = w * lora_adapter.scaling
-                                w = self._get_maybe_cached_weight_for_transfer(
+                                w = prepare_weight(
                                     pinned_layer_weights,
                                     w_cache_key,
                                     w,
@@ -1367,7 +1408,7 @@ class LoRAMemoryPool:
                     buffer_view = target_buffer[buffer_id, :, :lora_rank]
                     if weights is not None:
                         assert isinstance(weights_cache_key, str)
-                        weights = self._get_maybe_cached_weight_for_transfer(
+                        weights = prepare_weight(
                             pinned_layer_weights,
                             weights_cache_key,
                             weights,
@@ -1376,7 +1417,7 @@ class LoRAMemoryPool:
                     if _SGLANG_EXPERIMENTAL_LORA_OPTI:
                         # Zero beyond loaded rank: the experimental dense LoRA-B kernel
                         # contracts over the full padded max_rank, so the tail must be clean.
-                        target_buffer[buffer_id, :, lora_rank:].zero_()
+                        zero_buffer(target_buffer[buffer_id, :, lora_rank:])
 
         if lora_adapter.embedding_layers:
             org_vocab_size = self.base_hf_config.vocab_size
@@ -1391,7 +1432,7 @@ class LoRAMemoryPool:
                         buffer_view = self.new_embeddings_buffer["input_embeddings"][
                             buffer_id, :lora_added_tokens_size
                         ]
-                        weights = self._get_maybe_cached_weight_for_transfer(
+                        weights = prepare_weight(
                             pinned_added_tokens_embeddings,
                             name,
                             weights,
@@ -1411,7 +1452,7 @@ class LoRAMemoryPool:
                         :lora_rank,
                         : (org_vocab_size + lora_added_tokens_size),
                     ]
-                    weights = self._get_maybe_cached_weight_for_transfer(
+                    weights = prepare_weight(
                         pinned_embedding_layers,
                         name,
                         weights,
@@ -1429,7 +1470,7 @@ class LoRAMemoryPool:
                     buffer_view = self.embedding_B_buffer[target_module][
                         buffer_id, :, :lora_rank
                     ]
-                    lora_b_weights = self._get_maybe_cached_weight_for_transfer(
+                    lora_b_weights = prepare_weight(
                         pinned_embedding_layers,
                         name,
                         lora_b_weights,
@@ -1448,7 +1489,7 @@ class LoRAMemoryPool:
                         :lora_rank,
                         :,
                     ]
-                    weights = self._get_maybe_cached_weight_for_transfer(
+                    weights = prepare_weight(
                         pinned_embedding_layers,
                         name,
                         weights,
@@ -1476,7 +1517,7 @@ class LoRAMemoryPool:
                         : lora_b_weights.shape[0],
                         :lora_rank,
                     ]
-                    lora_b_weights = self._get_maybe_cached_weight_for_transfer(
+                    lora_b_weights = prepare_weight(
                         pinned_embedding_layers,
                         cache_key,
                         lora_b_weights,
@@ -1507,18 +1548,18 @@ class LoRAMemoryPool:
             # Zero out embedding/lm_head buffers for adapters without embedding LoRA
             # to avoid using garbage values from uninitialized memory
             for k in self.embedding_A_buffer.keys():
-                self.embedding_A_buffer[k][buffer_id].zero_()
+                zero_buffer(self.embedding_A_buffer[k][buffer_id])
             for k in self.embedding_B_buffer.keys():
-                self.embedding_B_buffer[k][buffer_id].zero_()
+                zero_buffer(self.embedding_B_buffer[k][buffer_id])
             for k in self.lm_head_A_buffer.keys():
-                self.lm_head_A_buffer[k][buffer_id].zero_()
+                zero_buffer(self.lm_head_A_buffer[k][buffer_id])
             for k in self.lm_head_B_buffer.keys():
-                self.lm_head_B_buffer[k][buffer_id].zero_()
+                zero_buffer(self.lm_head_B_buffer[k][buffer_id])
             if (
                 self.lora_added_tokens_size > 0
                 and "input_embeddings" in self.new_embeddings_buffer
             ):
-                self.new_embeddings_buffer["input_embeddings"][buffer_id].zero_()
+                zero_buffer(self.new_embeddings_buffer["input_embeddings"][buffer_id])
 
     def get_embedding_tensor(
         self, target_module: str, lora_type: LoRAType

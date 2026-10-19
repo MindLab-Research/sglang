@@ -199,7 +199,45 @@ class LoRAAdapter(nn.Module):
                 f"but the loaded weight '{name}' has shape {loaded_weight.shape[0]} in first dimension"
             )
 
+    def _validate_weight_pairs(self):
+        """Reject malformed CPU tensors before normalization can hide a missing pair."""
+        for weights in [
+            *(layer.weights for layer in self.layers),
+            self.embedding_layers,
+        ]:
+            for name, weight in weights.items():
+                if "lora_embedding_A" in name or "lora_embedding_B" in name:
+                    a_key, b_key = "lora_embedding_A", "lora_embedding_B"
+                elif "lora_A" in name or "lora_B" in name:
+                    a_key, b_key = "lora_A", "lora_B"
+                else:
+                    continue
+                is_a = a_key in name
+                pair = (
+                    name.replace(a_key, b_key) if is_a else name.replace(b_key, a_key)
+                )
+                if pair not in weights:
+                    raise ValueError(
+                        f"LoRA adapter {self.uid!r}: missing paired tensor {pair!r}"
+                    )
+                if weight.ndim not in (2, 3) or not weight.is_floating_point():
+                    raise ValueError(
+                        f"LoRA adapter {self.uid!r}, tensor {name!r}: expected a floating "
+                        f"2D/3D tensor, got shape {tuple(weight.shape)}, dtype {weight.dtype}"
+                    )
+                rank = weight.shape[-2 if is_a else -1]
+                if rank != self.config.r:
+                    raise ValueError(
+                        f"LoRA adapter {self.uid!r}, tensor {name!r}: "
+                        f"rank {rank} does not match configured rank {self.config.r}"
+                    )
+                if not torch.isfinite(weight).all().item():
+                    raise ValueError(
+                        f"LoRA adapter {self.uid!r}, tensor {name!r}: non-finite values"
+                    )
+
     def _normalize_weights(self):
+        self._validate_weight_pairs()
         for layer in self.layers:
             weight_names = list(layer.weights.keys())
             self.normalize_qkv_proj(weight_names, layer.weights)
