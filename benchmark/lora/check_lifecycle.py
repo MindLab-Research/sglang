@@ -6,6 +6,7 @@ precision acceptance. Never run against a shared production service.
 
 import argparse
 import json
+import math
 import threading
 import time
 from pathlib import Path
@@ -102,6 +103,7 @@ def main(a):
         x, y = [z["meta_info"]["output_token_logprobs"] for z in (body, ref)]
         assert len(x) == len(y) == count
         assert [z[1] for z in x] == [z[1] for z in y] == body["output_ids"]
+        assert all(math.isfinite(z[0]) for z in x + y), "nonfinite logprob"
         assert all(p[0] == q[0] for p, q in zip(x, y)), "repeat logprob drift"
 
     alias = a.alias_prefix + "reuse"
@@ -134,6 +136,7 @@ def main(a):
             compare(ok("/generate", request(alias)), refs[adapters[0]["path"]])
         ok("/flush_cache", {})
         reference = ok("/generate", request(alias, 256))
+        (a.output / "inflight-reference.json").write_text(json.dumps(reference))
         assert len(reference["output_ids"]) == 256
         ok("/flush_cache", {})
         first = threading.Event()
@@ -156,6 +159,8 @@ def main(a):
                             break
                         row = json.loads(payload)
                         events.append(row)
+                        with (a.output / "inflight-events.jsonl").open("a") as f:
+                            f.write(json.dumps(row) + "\n")
                         if row.get("output_ids"):
                             timing.setdefault("first_token", time.monotonic())
                             first.set()

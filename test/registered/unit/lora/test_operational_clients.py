@@ -39,6 +39,7 @@ class OperationalClients(unittest.TestCase):
         self.streaming = threading.Event()
         self.stream_done = threading.Event()
         self.zero_hit, self.drift, self.different_tokens = False, False, False
+        self.nonfinite = False
         self.owner = self
         owner = self
 
@@ -131,7 +132,12 @@ class OperationalClients(unittest.TestCase):
                     owner.streaming.clear()
                     owner.stream_done.set()
                     return
-                self.send(body(n))
+                result = body(n)
+                if owner.nonfinite:
+                    result["meta_info"]["output_token_logprobs"] = [
+                        [float("inf"), value, None]
+                    ] * n
+                self.send(result)
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         t = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -169,6 +175,26 @@ class OperationalClients(unittest.TestCase):
         self.assertTrue(summary["passed"])
         self.assertEqual(summary["serial_cycles"], 100)
         self.assertEqual(summary["lru_requests"], 108)
+        self.assertFalse(self.loaded)
+
+    def test_nonfinite_lifecycle_reference_cannot_pass(self):
+        self.nonfinite = True
+        args = SimpleNamespace(
+            url=self.url,
+            corpus=self.corpus,
+            adapters=self.adapters,
+            output=self.root / "life-nonfinite",
+            timeout=5,
+            aliases=3,
+            cycles=2,
+            bad_loads=1,
+            lru_rounds=1,
+            alias_prefix="test_",
+            missing_adapter="/does-not-exist",
+        )
+        with self.assertRaises(AssertionError):
+            load("check_lifecycle").main(args)
+        self.assertFalse((args.output / "summary.json").exists())
         self.assertFalse(self.loaded)
 
     def test_actual_cache_hit_success(self):
