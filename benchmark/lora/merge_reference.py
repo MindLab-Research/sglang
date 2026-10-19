@@ -24,7 +24,7 @@ def sha256(path):
     return h.hexdigest()
 
 
-def merge(base, adapter, output, device):
+def merge(base, adapter, output, device, export_dtype="bfloat16"):
     if output.exists():
         raise ValueError(f"Refusing to overwrite {output}")
     cfg = json.loads((adapter / "adapter_config.json").read_text())
@@ -98,7 +98,8 @@ def merge(base, adapter, output, device):
     torch.set_float32_matmul_precision("highest")
     output.mkdir(parents=True)
     manifest = {
-        "formula": "BF16(FP32(W) + (alpha/r) * FP32(B) @ FP32(A))",
+        "formula": f"{export_dtype}(FP32(W) + (alpha/r) * FP32(B) @ FP32(A))",
+        "export_dtype": export_dtype,
         "base": str(base),
         "adapter": str(adapter),
         "config": cfg,
@@ -126,7 +127,7 @@ def merge(base, adapter, output, device):
                     @ a.to(device=device, dtype=torch.float32)
                 ) * scale
                 exact = w + delta
-                rounded = exact.to(torch.bfloat16)
+                rounded = exact.to(getattr(torch, export_dtype))
                 error = rounded.float() - exact
                 manifest["tensors"].append(
                     {
@@ -158,7 +159,7 @@ def merge(base, adapter, output, device):
         if src.is_file() and src.suffix != ".safetensors":
             os.link(src, output / src.name)
     (output / "merge-manifest.json").write_text(json.dumps(manifest, indent=2))
-    (output / "MERGE_COMPLETE").write_text("FP32 merge, BF16 export\n")
+    (output / "MERGE_COMPLETE").write_text(f"FP32 merge, {export_dtype} export\n")
 
 
 if __name__ == "__main__":
@@ -167,5 +168,8 @@ if __name__ == "__main__":
     parser.add_argument("--adapter", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--export-dtype", choices=("bfloat16", "float32"), default="bfloat16"
+    )
     args = parser.parse_args()
-    merge(args.base, args.adapter, args.output, args.device)
+    merge(args.base, args.adapter, args.output, args.device, args.export_dtype)

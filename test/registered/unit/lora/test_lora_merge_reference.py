@@ -100,6 +100,27 @@ class TestMergeReference(unittest.TestCase):
             )
         )
 
+    def test_fp32_export_does_not_round_updated_weights_to_bf16(self):
+        w = torch.ones(2, 3, dtype=torch.bfloat16)
+        a = torch.full((2, 3), 0.01, dtype=torch.bfloat16)
+        b = torch.full((2, 2), 0.01, dtype=torch.bfloat16)
+        self.fixture(
+            {"model.proj.weight": w},
+            {
+                "base_model.model.model.proj.lora_A.weight": a,
+                "base_model.model.model.proj.lora_B.weight": b,
+            },
+        )
+        self.merger.merge(
+            self.base, self.adapter, self.root / "merged", "cpu", "float32"
+        )
+        merged = load_file(str(self.root / "merged/model-1.safetensors"))[
+            "model.proj.weight"
+        ]
+        self.assertEqual(merged.dtype, torch.float32)
+        self.assertTrue(torch.equal(merged, w.float() + 2 * (b.float() @ a.float())))
+        self.assertFalse(torch.equal(merged, merged.bfloat16().float()))
+
     def test_unsupported_peft_options_fail_before_creating_output(self):
         self.config["use_rslora"] = True
         self.fixture({}, {})
