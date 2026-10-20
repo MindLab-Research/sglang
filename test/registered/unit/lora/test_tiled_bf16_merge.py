@@ -263,6 +263,127 @@ class TestTiledBF16Merge(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "original FP32"):
             tiled_bf16_linear(x, x, x, x, 1, 1.0)
 
+    def test_grouped_ragged_presence_update_and_bias(self):
+        from sglang.srt.batch_invariant_ops import batch_invariant_ops as invariant
+        from sglang.srt.lora.backend.tiled_bf16_backend import TiledBF16LoRABackend
+
+        offsets, m, k, pool = [0, 65, 82, 99], 97, 129, 16
+        n = offsets[-1] + 5
+        w = (torch.randint(-16, 16, (n, k), device="cuda") / 1024).bfloat16()
+        x = (torch.randint(-8, 8, (m, k), device="cuda") / 16).bfloat16()
+        bias = (torch.randint(-8, 8, (n,), device="cuda") / 8192).bfloat16()
+        a = torch.randint(-16, 16, (4, 3 * pool, k), device="cuda").float() / 4096
+        b = torch.randint(-16, 16, (4, n, pool), device="cuda").float() / 4096
+        layer = SimpleNamespace(
+            base_layer=SimpleNamespace(weight=w),
+            A_buffer=a,
+            B_buffer=b,
+            output_offset_cpu=torch.tensor(offsets),
+            merged_bf16_adapter_present=[False, True, True, True],
+        )
+        backend = object.__new__(TiledBF16LoRABackend)
+        backend.device, backend.max_loras_per_batch = "cuda", 4
+        backend.global_batch_info = None
+        backend.merge_groups = [
+            (i, rank, scale, torch.arange(i, m, 4, device="cuda"))
+            for i, (rank, scale) in enumerate([(16, 2), (8, 2), (16, -0.5), (0, 0)])
+        ]
+        for unload_slot in [None, 2]:
+            if unload_slot is not None:
+                backend.set_layer_adapter_presence(layer, unload_slot, False)
+            expected = torch.empty(m, n, dtype=torch.bfloat16, device="cuda")
+            with (
+                patch.object(invariant, "_ENABLE_MM_DEEPGEMM", False),
+                invariant.set_batch_invariant_mode(),
+            ):
+                for slot, rank, scale, rr in backend.merge_groups:
+                    merged = w.cpu().clone()
+                    if rank and layer.merged_bf16_adapter_present[slot]:
+                        for i, (lo, hi) in enumerate(pairwise(offsets)):
+                            delta = (
+                                b[slot, lo:hi, :rank].cpu()
+                                @ a[slot, i * rank : (i + 1) * rank].cpu()
+                            )
+                            merged[lo:hi] = (
+                                merged[lo:hi].float() + delta * scale
+                            ).bfloat16()
+                    expected[rr] = F.linear(x[rr], merged.cuda(), bias)
+                actual = backend.run_merged_linear(layer, x, bias)
+            self.results.append(
+                {
+                    "grouped_ragged_rows": m,
+                    "slots": 4,
+                    "packed_offsets": offsets,
+                    "presence_updated_slot": unload_slot,
+                    "bias": True,
+                    "bitwise_equal": int((actual == expected).sum()),
+                    "elements": actual.numel(),
+                    "max_abs": (actual.float() - expected.float()).abs().max().item(),
+                }
+            )
+            self.assertTrue(torch.equal(actual, expected), self.results[-1])
+
+    def test_grouped_16_slots_and_pool_rank_stride(self):
+        from sglang.srt.batch_invariant_ops import batch_invariant_ops as invariant
+        from sglang.srt.lora.backend.tiled_bf16_backend import TiledBF16LoRABackend
+
+        k, n, pool = 256, 128, 32
+        w = (torch.randint(-16, 16, (n, k), device="cuda") / 1024).bfloat16()
+        a = torch.randint(-16, 16, (16, 2 * pool, k), device="cuda").float() / 4096
+        b = torch.randint(-16, 16, (16, n, pool), device="cuda").float() / 4096
+        layer = SimpleNamespace(
+            base_layer=SimpleNamespace(weight=w),
+            A_buffer=a,
+            B_buffer=b,
+            output_offset_cpu=torch.tensor([0, 64, 128]),
+            merged_bf16_adapter_present=[True] * 16,
+        )
+        for per_slot in [1, 17]:
+            x = (
+                torch.randint(-8, 8, (16 * per_slot, k), device="cuda") / 16
+            ).bfloat16()
+            backend = object.__new__(TiledBF16LoRABackend)
+            backend.global_batch_info = None
+            backend.merge_groups = [
+                (
+                    i,
+                    [0, 7, 16, 32][i % 4],
+                    [0, 0.5, 2, -1][i % 4],
+                    torch.arange(i * per_slot, (i + 1) * per_slot, device="cuda"),
+                )
+                for i in range(16)
+            ]
+            expected = torch.empty(x.shape[0], n, dtype=torch.bfloat16, device="cuda")
+            with (
+                patch.object(invariant, "_ENABLE_MM_DEEPGEMM", False),
+                invariant.set_batch_invariant_mode(),
+            ):
+                for slot, rank, scale, rr in backend.merge_groups:
+                    merged = w.cpu().clone()
+                    if rank:
+                        for i, (lo, hi) in enumerate([(0, 64), (64, 128)]):
+                            delta = (
+                                b[slot, lo:hi, :rank].cpu()
+                                @ a[slot, i * rank : (i + 1) * rank].cpu()
+                            )
+                            merged[lo:hi] = (
+                                merged[lo:hi].float() + delta * scale
+                            ).bfloat16()
+                    expected[rr] = F.linear(x[rr], merged.cuda())
+                actual = backend.run_merged_linear(layer, x, None)
+            self.results.append(
+                {
+                    "grouped_slots": 16,
+                    "rows_per_slot": per_slot,
+                    "pool_rank": pool,
+                    "active_ranks": [0, 7, 16, 32],
+                    "bitwise_equal": int((actual == expected).sum()),
+                    "elements": actual.numel(),
+                    "max_abs": (actual.float() - expected.float()).abs().max().item(),
+                }
+            )
+            self.assertTrue(torch.equal(actual, expected), self.results[-1])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
