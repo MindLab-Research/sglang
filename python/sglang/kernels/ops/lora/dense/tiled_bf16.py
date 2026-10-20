@@ -112,7 +112,13 @@ def tiled_bf16_linear(
     output = torch.empty((m, n), dtype=x.dtype, device=x.device)
     if m == 0 or n == 0:
         return output
-    _tiled_bf16_linear[(triton.cdiv(m, 16), triton.cdiv(n, 64))](
+    # Reuse each reconstructed weight tile across more prefill rows. The
+    # rank-16 IEEE path was profiled against independent CPU-merged weights;
+    # other ranks and experimental arithmetic retain the original launch.
+    block_m, warps = (
+        (128, 8) if rank == 16 and m >= 128 and delta_precision == "ieee" else (16, 4)
+    )
+    _tiled_bf16_linear[(triton.cdiv(m, block_m), triton.cdiv(n, 64))](
         x,
         weight,
         a,
@@ -127,11 +133,11 @@ def tiled_bf16_linear(
         scaling,
         bias is not None,
         delta_precision,
-        BM=16,
+        BM=block_m,
         BN=64,
         BK=64,
         BR=max(16, triton.next_power_of_2(rank)),
-        num_warps=4,
+        num_warps=warps,
         num_stages=1,
         enable_fp_fusion=False,
     )
