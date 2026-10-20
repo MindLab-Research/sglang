@@ -772,6 +772,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         lora_backend: BaseLoRABackend,
     ) -> None:
         super().__init__(base_layer, lora_backend)
+        self.deferred_row_fp32_a = envs.SGLANG_LORA_DEFERRED_ROW_FP32_A.get()
 
     def set_lora_info(self, A_buffer: torch.Tensor, B_buffer: torch.Tensor):
         self.set_lora = True
@@ -872,6 +873,33 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
                 output_offset_cpu=self.output_offset_cpu,
                 base_output=output_,
             )
+        elif (
+            lora_active
+            and not merged_lora
+            and self.deferred_row_fp32_a
+            and self.lora_backend.supports_fp32_lora_a_output
+            and not self.base_layer.reduce_results
+            and tp_size > 1
+            and not skip_all_reduce
+            and not should_skip_mlp_all_reduce()
+        ):
+            # The boundary still owns the base-output sum. Complete only the
+            # small A activation here; put B(Ax) on one group rank so that the
+            # later sum includes the adapter exactly once. Reducing the base
+            # here would break that contract and multiply it at the boundary.
+            lora_a_output = self.lora_backend.run_lora_a_sgemm(
+                input_parallel, self.A_buffer, output_dtype=torch.float32
+            )
+            lora_a_output = all_reduce(lora_a_output).to(input_parallel.dtype)
+            if tp_rank == 0:
+                output_parallel = self.lora_backend.run_lora_b_sgemm(
+                    x=lora_a_output,
+                    weights=self.B_buffer,
+                    output_offset=self.output_offset,
+                    output_offset_cpu=self.output_offset_cpu,
+                    base_output=output_parallel,
+                )
+            output_ = output_parallel
         else:
             if lora_active and not merged_lora:
                 output_parallel = self.apply_lora(output_parallel, input_parallel)
