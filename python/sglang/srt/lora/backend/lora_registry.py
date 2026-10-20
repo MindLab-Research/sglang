@@ -66,3 +66,10 @@ def create_merged_bf16_backend():
     from sglang.srt.lora.backend.merged_bf16_backend import MergedBF16LoRABackend
 
     return MergedBF16LoRABackend
+
+
+@register_lora_backend("tiled_bf16")
+def create_tiled_bf16_backend():
+    from sglang.srt.lora.backend.tiled_bf16_backend import TiledBF16LoRABackend
+
+    return TiledBF16LoRABackend

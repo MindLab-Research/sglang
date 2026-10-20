@@ -78,7 +78,14 @@ class Lora(msgspec.Struct):
         str,
         Arg(
             help="Choose the kernel backend for multi-LoRA serving.",
-            choices=["triton", "csgmv", "ascend", "torch_native", "merged_bf16"],
+            choices=[
+                "triton",
+                "csgmv",
+                "ascend",
+                "torch_native",
+                "merged_bf16",
+                "tiled_bf16",
+            ],
         ),
     ] = "csgmv"
     lora_merged_bf16_cache_size_mb: A[
