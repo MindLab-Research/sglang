@@ -475,6 +475,8 @@ class Envs:
     SGLANG_ENABLE_METRICS_DP_ATTENTION = EnvBool(False)
     SGLANG_TRACE_LOGITS_E2E = EnvBool(False)
     SGLANG_TRACE_LOGITS_E2E_SYNC = EnvBool(False)
+    # CPU-only per-request prefill spans; no token contents or GPU reads.
+    SGLANG_TRACE_PREFILL_BATCH = EnvBool(False)
     SGLANG_TRACE_SAMPLER_E2E = EnvBool(False)
     SGLANG_TRACE_QWEN_MOE_DEEPEP_E2E = EnvBool(False)
     SGLANG_DEEPEP_V2_TRACE_CONTIG = EnvBool(False)
