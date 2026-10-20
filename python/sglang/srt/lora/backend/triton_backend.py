@@ -205,6 +205,7 @@ def gather_dp_attention_lora_batch_info(
 
 
 class TritonLoRABackend(BaseLoRABackend):
+    supports_fp32_lora_a_output = True
     name = "triton"
     supports_dp_attention = True
     supports_prefill_cuda_graph = True
@@ -287,7 +288,8 @@ class TritonLoRABackend(BaseLoRABackend):
         **kwargs,
     ) -> torch.Tensor:
         return sgemm_lora_a_fwd(
-            x, weights, self._sgemm_info(pruned_batch_info), stack_num=stack_num
+            x, weights, self._sgemm_info(pruned_batch_info), stack_num=stack_num,
+            output_dtype=kwargs.get("output_dtype"),
         )
 
     def run_lora_b_sgemm(

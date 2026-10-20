@@ -26,6 +26,7 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
     """
 
     supports_lora_a_overlap = False
+    supports_fp32_lora_a_output = False
     skip_inactive_lora_batches = False
 
     # Supporting backends implement init_prefill_cuda_graph_batch_info() and

@@ -853,11 +853,18 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         # update before projection. Reduce that result once; the factorized
         # path below would add the adapter a second time under TP.
         if lora_active and should_reduce and not merged_lora:
+            # Row-sharded A must sum its FP32 partial dot products before
+            # rounding the complete low-rank activation. Rounding each shard
+            # first can erase small residuals when the partials cancel.
+            fp32_a = self.lora_backend.supports_fp32_lora_a_output
             lora_a_output = self.lora_backend.run_lora_a_sgemm(
-                input_parallel, self.A_buffer
+                input_parallel, self.A_buffer,
+                **({"output_dtype": torch.float32} if fp32_a else {}),
             )
             output_ = all_reduce(output_parallel)
             lora_a_output = all_reduce(lora_a_output)
+            if fp32_a:
+                lora_a_output = lora_a_output.to(input_parallel.dtype)
             output_ = self.lora_backend.run_lora_b_sgemm(
                 x=lora_a_output,
                 weights=self.B_buffer,

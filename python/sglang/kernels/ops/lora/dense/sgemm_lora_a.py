@@ -111,7 +111,7 @@ def _sgemm_lora_a_kernel(
         w_ptrs += BLOCK_K * w_stride_2
 
     # Store result to output matrix
-    partial_sum = partial_sum.to(x.dtype.element_ty)
+    partial_sum = partial_sum.to(output.dtype.element_ty)
     output_mask = (s_offset[:, None] < seg_len) & (n_offset[None, :] < N)
     output_ptr = output + (
         s_physical[:, None] * output_stride_0 + n_offset[None, :] * output_stride_1
@@ -124,6 +124,7 @@ def sgemm_lora_a_fwd(
     weights: torch.Tensor,
     batch_info: LoRABatchInfo,
     stack_num: int = 1,
+    output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     # x: (s, input_dim)
     # weights: (num_lora, stack_num * r, input_dim)
@@ -154,7 +155,9 @@ def sgemm_lora_a_fwd(
 
     sorted_by_adapter = batch_info.permutation is not None
 
-    output = torch.empty((S, R), device=x.device, dtype=x.dtype)
+    if output_dtype is not None and output_dtype not in (x.dtype, torch.float32):
+        raise ValueError("LoRA A output must preserve input dtype or FP32 accumulation")
+    output = torch.empty((S, R), device=x.device, dtype=output_dtype or x.dtype)
     _sgemm_lora_a_kernel[grid](
         x,
         weights,
