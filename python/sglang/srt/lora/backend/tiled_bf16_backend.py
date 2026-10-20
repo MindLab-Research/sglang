@@ -84,7 +84,9 @@ class TiledBF16LoRABackend(MergedBF16LoRABackend):
         output = torch.empty(
             (x.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device
         )
-        if len(groups) > 1:
+        # Grouping reduces launch overhead for decode/small batches. For larger
+        # groups the scalar schedule reuses weight tiles better (B300 profile).
+        if len(groups) > 1 and max(rows.numel() for _, _, _, rows in groups) <= 32:
             rows, tiles, scales = self._tile_routing(routing)
             presence = getattr(layer, "tiled_bf16_adapter_present", None)
             if presence is None and present is not None:

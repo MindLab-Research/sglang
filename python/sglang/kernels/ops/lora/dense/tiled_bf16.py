@@ -172,7 +172,7 @@ def _grouped_tiled_bf16_linear(
     row_count = tl.load(Tiles + tile * 4 + 3)
     scale = tl.load(Scales + tile)
     if HAS_PRESENCE:
-        rank = tl.where(tl.load(Present + slot), rank, 0)
+        rank = tl.where(tl.load(Present + slot) != 0, rank, 0)
     mi = tl.arange(0, BM)
     rows = tl.load(Rows + row_start + mi, mi < row_count, other=0)
     ni = tl.program_id(1) * BN + tl.arange(0, BN)
