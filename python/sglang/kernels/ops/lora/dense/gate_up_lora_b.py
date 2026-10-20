@@ -126,7 +126,8 @@ def _gate_up_lora_b_kernel(
 
     # Store result to output matrix
     partial_sum *= scaling
-    partial_sum = partial_sum.to(x.dtype.element_ty)
+    # Keep the scaled delta in FP32 through the base-output addition.
+    # Rounding the delta first loses small residuals under cancellation.
     output_ptr = (
         output
         + n_start * output_stride_1

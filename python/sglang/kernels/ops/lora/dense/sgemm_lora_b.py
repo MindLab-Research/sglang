@@ -115,7 +115,8 @@ def _sgemm_lora_b_kernel(
 
     # Store result to output matrix
     partial_sum *= scaling
-    partial_sum = partial_sum.to(x.dtype.element_ty)
+    # Keep the scaled delta in FP32 through the base-output addition.
+    # Rounding the delta first loses small residuals under cancellation.
     output_ptr = output + (
         s_physical[:, None] * output_stride_0 + n_offset[None, :] * output_stride_1
     )
