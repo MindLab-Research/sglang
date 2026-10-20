@@ -152,6 +152,76 @@ class TestTiledBF16Merge(unittest.TestCase):
                 }
             )
 
+    def test_wide_prefill_boundary_matches_cpu_merge_and_original(self):
+        from sglang.srt.batch_invariant_ops.batch_invariant_ops import (
+            _matmul_persistent_triton,
+        )
+
+        rank, pool, n, k = 16, 32, 257, 513
+        for m in [127, 128, 129, 257]:
+            with self.subTest(rows=m):
+                x = (torch.randint(-16, 16, (m, k)) / 64).bfloat16().cuda()
+                w = (torch.randint(-16, 16, (n, k)) / 512).bfloat16().cuda()
+                a = (torch.randint(-8, 8, (rank, k)) / 4096).float().cuda()
+                b = (torch.randint(-8, 8, (n, pool)) / 4096).float().cuda()
+                bias = (torch.randint(-8, 8, (n,)) / 8192).bfloat16().cuda()
+                merged = (
+                    (w.cpu().float() + (b[:, :rank].cpu() @ a.cpu()) * 2)
+                    .bfloat16()
+                    .cuda()
+                )
+                expected = _matmul_persistent_triton(x, merged.T, torch.bfloat16, bias)
+                original = torch.empty_like(expected)
+                module._tiled_bf16_linear[
+                    (module.triton.cdiv(m, 16), module.triton.cdiv(n, 64))
+                ](
+                    x,
+                    w,
+                    a,
+                    b,
+                    original,
+                    bias,
+                    m,
+                    n,
+                    k,
+                    rank,
+                    pool,
+                    2.0,
+                    True,
+                    "ieee",
+                    BM=16,
+                    BN=64,
+                    BK=64,
+                    BR=16,
+                    num_warps=4,
+                    num_stages=1,
+                    enable_fp_fusion=False,
+                )
+                versions = [t._version for t in (x, w, a, b, bias)]
+                warm = tiled_bf16_linear(x, w, a, b, rank, 2.0, bias)
+                del warm
+                torch.cuda.synchronize()
+                before = torch.cuda.memory_allocated()
+                torch.cuda.reset_peak_memory_stats()
+                actual = tiled_bf16_linear(x, w, a, b, rank, 2.0, bias)
+                torch.cuda.synchronize()
+                extra = torch.cuda.max_memory_allocated() - before
+                self.assertTrue(torch.equal(actual, expected))
+                self.assertTrue(torch.equal(actual, original))
+                self.assertEqual(versions, [t._version for t in (x, w, a, b, bias)])
+                self.assertLessEqual(
+                    extra, actual.numel() * actual.element_size() + 512
+                )
+                self.results.append(
+                    {
+                        "wide_prefill_boundary": [m, n, k, rank, pool],
+                        "CPU_merge_and_original_BM16_bitwise_equal": actual.numel(),
+                        "elements": actual.numel(),
+                        "peak_extra_torch_bytes": extra,
+                        "output_bytes": actual.numel() * actual.element_size(),
+                    }
+                )
+
     def test_rounding_is_applied_before_activation_gemm(self):
         x = torch.ones(1, 2, dtype=torch.bfloat16, device="cuda")
         w = torch.tensor([[1.0, -1.0]], dtype=torch.bfloat16, device="cuda")
