@@ -886,6 +886,42 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder.can_run_list, [])
         self.assertIsNone(req.extend_end)
 
+    def test_ignore_eos_preserves_deterministic_chunk_alignment(self):
+        # The 32K code regression first diverged after a ragged first chunk.
+        # Exercise admission through the public path with radix disabled.
+        for alignment, remaining, length, expected in [
+            (64, 8165, 32768, 8128),
+            (4096, 8165, 32768, 4096),
+            (4096, 8192, 32768, 8192),
+            (None, 8165, 32768, 8165),
+            (64, 48, 32768, None),
+            (64, 48, 31, 31),
+            (4096, 8192, 8165, 8165),
+        ]:
+            with self.subTest(alignment=alignment, remaining=remaining, length=length):
+                self.mock_tree_cache.disable = True
+                self.mock_tree_cache.supports_mamba.return_value = False
+                self.mock_token_allocator.available_size.return_value = 1_000_000
+                adder = self.create_adder(
+                    self.create_running_batch(), rem_chunk_tokens=remaining
+                )
+                req = self._create_delayer_req(length, max_new_tokens=32)
+                req.sampling_params.ignore_eos = True
+                req.origin_input_ids = req.full_untruncated_fill_ids
+                result = adder.add_one_req(
+                    req, has_chunked_req=False, truncation_align_size=alignment
+                )
+                self.assertEqual(req.extend_end, expected)
+                if expected is None:
+                    self.assertEqual(result, AddReqResult.OTHER)
+                    self.assertEqual(adder.can_run_list, [])
+                    self.assertIsNone(adder.new_chunked_req)
+                    self.assertEqual(adder.rem_chunk_tokens, remaining)
+                else:
+                    self.assertEqual(adder.can_run_list, [req])
+                    self.assertEqual(adder.rem_chunk_tokens, remaining - expected)
+                    self.assertEqual(adder.new_chunked_req is req, expected < length)
+
     def create_sharded_adder(
         self,
         *,
